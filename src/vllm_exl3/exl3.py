@@ -769,17 +769,17 @@ def _native_moe_dimensions_supported(
     inners: list[dict[str, Any]],
     limit: float | None = None,
 ) -> bool:
-    """The current native fused kernel is specialized to the DSV4/GLM5 tile."""
-    if limit is not None:
+    """Supported decode geometry; extension ABI support is checked separately."""
+    if x2d.dim() != 2 or not x2d.is_cuda:
+        return False
+    if limit is not None and (not math.isfinite(limit) or limit < 0):
         return False
     hidden_meta = int(getattr(layer, "_exl3_hidden_size", x2d.shape[1]))
     inter_meta = int(getattr(layer, "_exl3_intermediate_local", 2048))
     return (
-        x2d.is_cuda
-        and x2d.dim() == 2
-        and 1 <= int(x2d.shape[0]) <= 8
+        1 <= int(x2d.shape[0]) <= 8
         and int(x2d.shape[1]) == hidden_meta == 4096
-        and inter_meta == 2048
+        and inter_meta in (1024, 2048)
         and int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", -1)))
         in (2, 3, 4)
         and len(inners) > 0
@@ -805,12 +805,23 @@ def _apply_native_fused_moe(
     routing weight, preventing an out-of-bounds read while preserving fallback
     semantics.
     """
-    if limit is not None:
-        return None
     module = _load_native_exl3_ext()
     if module is None or not _native_moe_dimensions_supported(
         x2d, layer, inners, limit
     ):
+        return None
+    intermediate = int(getattr(layer, "_exl3_intermediate_local", 2048))
+    clamp_limit = float(limit) if limit is not None else 0.0
+    extended_abi = getattr(module, "P2B_MOE_ABI_VERSION", 1) >= 2
+    if not extended_abi and (intermediate != 2048 or clamp_limit > 0):
+        # A stale .so still accepts the legacy arguments but would interpret TP2
+        # pointer tables as 2048-wide weights or silently omit required clipping.
+        reason = "local intermediate width/clipping requires native MoE ABI 2; rebuild vllm_exl3_c"
+        layer._exl3_native_error = reason
+        getattr(logger, "warning_once", logger.warning)(
+            "Native EXL3 MoE fallback: %s (intermediate=%s, limit=%s)",
+            reason, intermediate, clamp_limit,
+        )
         return None
     ptrs = getattr(layer, "_exl3_ptrs", None)
     if not isinstance(ptrs, dict):
@@ -848,6 +859,7 @@ def _apply_native_fused_moe(
     native_out = torch.empty_like(xh)
     k = int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", 4)))
     fn = module.p2b_fused_moe
+    extra_args = (intermediate, clamp_limit) if extended_abi else ()
     for row in range(int(x2d.shape[0])):
         result = fn(
             xh[row : row + 1],
@@ -867,6 +879,7 @@ def _apply_native_fused_moe(
             k,
             k,
             True,
+            *extra_args,
         )
         # pybind returns the same output tensor, while lightweight test doubles
         # may return a fresh tensor.  Accommodate both without synchronizing.
@@ -1261,30 +1274,21 @@ def apply_exl3_experts(
     # ExLlamaV3/Python implementations below.
     backend = get_moe_kernel_backend()
     if backend == "native" and (fused is not False):
-        if limit is not None:
-            warn_once = getattr(logger, "warning_once", logger.warning)
-            warn_once(
-                "Native EXL3 MoE kernel does not support SwiGLU clamping "
-                "(limit=%s); falling back to %s",
-                limit,
-                "ExLlamaV3" if _exllamav3_moe_available() else "Python loop",
+        try:
+            native_out = _apply_native_fused_moe(
+                x2d, ids, weights, layer, inners, expert_map, limit
             )
-        else:
-            try:
-                native_out = _apply_native_fused_moe(
-                    x2d, ids, weights, layer, inners, expert_map, limit
-                )
-            except Exception as exc:
-                native_out = None
-                layer._exl3_native_error = repr(exc)
-                logger.warning_once(
-                    "Native EXL3 MoE dispatch failed; falling back to %s: %s",
-                    "ExLlamaV3" if _exllamav3_moe_available() else "Python loop",
-                    exc,
-                )
-            if native_out is not None:
-                layer._exl3_last_apply = "native"
-                return native_out.to(dtype=x.dtype)
+        except Exception as exc:
+            native_out = None
+            layer._exl3_native_error = repr(exc)
+            getattr(logger, "warning_once", logger.warning)(
+                "Native EXL3 MoE dispatch failed; falling back to %s: %s",
+                "ExLlamaV3" if _exllamav3_moe_available() else "Python loop",
+                exc,
+            )
+        if native_out is not None:
+            layer._exl3_last_apply = "native"
+            return native_out.to(dtype=x.dtype)
 
     have_ptrs = bool(getattr(layer, "_exl3_ptrs", None))
     if fused is True and not have_ptrs:

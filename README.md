@@ -83,7 +83,20 @@ Version `0.3.0` introduced custom native CUDA kernels (`csrc/`) replacing the st
 * **Dense & Batched GEMV (`csrc/exl3_gemv.cu`, `csrc/p2b_batched.cu`)**: Active-expert batched GEMV saturating 99.2% of the physical memory bandwidth floor (73.3 $\mu\text{s}$).
 * **4-Phase Cooperative MoE Decode (`csrc/p2b_moe.cu`)**: End-to-end fused MoE decode reducing per-layer latency from $497\ \mu\text{s} \to 287.8\ \mu\text{s}$ ($1.73\times$).
 * **Power-of-Two Chunked Prefill GEMM (`csrc/exl3_gemm.cu`)**: Tiled matrix multiplication delivering 7.85 TFLOPS ($13.0\times$ faster than legacy prefill).
-* **vLLM Dispatch Control**: Environmental toggle `VLLM_EXL3_MOE_KERNEL=native` (default) with zero-cost fallback to `exllamav3`.
+* **vLLM Dispatch Control**: `VLLM_EXL3_MOE_KERNEL=auto` (default) selects an available backend; `native` and `exllamav3` request a specific backend. Unsupported native cases fall back to ExLlamaV3 or the Python loop.
+
+The unreleased native MoE ABI 2 adds local expert widths of 1024 and 2048 at
+hidden width 4096, with optional SwiGLU input clipping. This covers ordinary TP2
+and TP1 expert geometry while retaining K2/K3/K4 and model-provided routing.
+The wrapper still supports 1–8 decode rows through one native call per row.
+Rebuild the extension with `pip install -e . --no-build-isolation`; the loaded
+`vllm_exl3_c.P2B_MOE_ABI_VERSION` should be `2`. Older binaries fall back for
+clipped or 1024-wide requests instead of interpreting incompatible pointers.
+No speculative-depth default changes are included. Run
+`python -m pytest -q tests/test_native_moe_contract.py` on the CUDA host before
+qualifying the new path; its GPU checks cover independent CPU weight
+reconstruction, clipping, and graph replay. Full-model correctness and speed
+still need validation on the intended TP1/TP2 deployment.
 
 ### Live Head-to-Head Benchmark Receipts
 

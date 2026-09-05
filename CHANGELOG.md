@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Extend the native fused MoE ABI with local intermediate width (1024 or 2048)
+  and optional input-clipped SwiGLU. Clamp the gate before SiLU and the up
+  projection symmetrically; zero keeps plain SwiGLU. Preserve K2/K3/K4 support.
+- Keep legacy native calls compatible and fall back when an older extension
+  cannot implement the requested width or clipping. Rebuild `vllm_exl3_c` to
+  obtain `P2B_MOE_ABI_VERSION=2`.
+- Add CPU dispatch/compatibility tests and CUDA numerical/graph-replay fixtures.
+  Spark performance and full-model TP1/TP2 qualification remain required; no
+  new throughput result is claimed.
+
 ## 0.3.1
 
 - **Super Fat GEMM Prefill Kernel Suite (`csrc/exl3_fat_gemm.cu`, `csrc/exl3_fat_gemm.cuh`)**:

@@ -81,19 +81,28 @@ def test_nonpositive_limit_keeps_plain_swiglu() -> None:
         )
 
 
-def test_native_dispatch_is_bypassed_when_clamping(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize("intermediate,limit", [(2048, 10.0), (1024, 10.0), (1024, None)])
+def test_old_native_binary_falls_back_for_clipping_or_tp2(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    intermediate: int,
+    limit: float | None,
 ) -> None:
     calls: list[object] = []
 
     def fail_if_called(*args, **kwargs):
         calls.append((args, kwargs))
-        raise AssertionError("native dispatch must be gated for clamped SwiGLU")
+        raise AssertionError("an old native binary must not receive clipping or TP2 pointers")
 
     monkeypatch.setattr(exl3, "get_moe_kernel_backend", lambda: "native")
-    monkeypatch.setattr(exl3, "_apply_native_fused_moe", fail_if_called)
+    monkeypatch.setattr(exl3, "_native_moe_dimensions_supported", lambda *args: True)
+    monkeypatch.setattr(
+        exl3, "_load_native_exl3_ext",
+        lambda: SimpleNamespace(p2b_fused_moe=fail_if_called),
+    )
     monkeypatch.setattr(exl3, "_exllamav3_moe_available", lambda: False)
     layer = SimpleNamespace(
+        _exl3_intermediate_local=intermediate,
         _exl3_inners=[
             {
                 "gate": _FixedProjection(20.0),
@@ -108,13 +117,33 @@ def test_native_dispatch_is_bypassed_when_clamping(
         torch.tensor([[0]], dtype=torch.long),
         torch.tensor([[1.0]]),
         layer,
-        limit=10.0,
+        limit=limit,
     )
 
     assert calls == []
-    torch.testing.assert_close(output, torch.tensor([[99.9954605]]), atol=0.01, rtol=0)
-    assert "does not support SwiGLU clamping" in caplog.text
-    assert "limit=10.0" in caplog.text
+    torch.testing.assert_close(output, _run_activation(20.0, 20.0, limit), atol=0.01, rtol=0)
+    assert layer._exl3_last_apply == "loop"
+    assert "requires native MoE ABI 2" in caplog.text
+    assert f"intermediate={intermediate}" in caplog.text
+
+
+def test_clipping_request_reaches_native_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    def native(x, ids, weights, layer, inners, expert_map, limit):
+        calls.append(limit)
+        return torch.full_like(x, 3.0)
+
+    monkeypatch.setattr(exl3, "get_moe_kernel_backend", lambda: "native")
+    monkeypatch.setattr(exl3, "_apply_native_fused_moe", native)
+    layer = SimpleNamespace(_exl3_inners=[{}])
+    result = exl3.apply_exl3_experts(
+        torch.zeros(1, 1), torch.zeros(1, 1, dtype=torch.long),
+        torch.ones(1, 1), layer, limit=10.0,
+    )
+    assert calls == [10.0]
+    assert layer._exl3_last_apply == "native"
+    torch.testing.assert_close(result, torch.tensor([[3.0]]))
 
 
 @pytest.mark.parametrize(

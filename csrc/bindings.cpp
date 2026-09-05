@@ -160,8 +160,10 @@ at::Tensor p2b_fused_moe(const at::Tensor& x, at::Tensor& out,
                          const at::Tensor& ut, const at::Tensor& uu, const at::Tensor& uv,
                          const at::Tensor& dt, const at::Tensor& du, const at::Tensor& dv,
                          const at::Tensor& ids, const at::Tensor& rw,
-                         int64_t kg, int64_t ku, int64_t kd, bool mcg) {
-    return p2b_fused_moe_cuda(x, out, gt, gu, gv, ut, uu, uv, dt, du, dv, ids, rw, kg, ku, kd, mcg);
+                         int64_t kg, int64_t ku, int64_t kd, bool mcg,
+                         int64_t intermediate_size, float swiglu_limit) {
+    return p2b_fused_moe_cuda(x, out, gt, gu, gv, ut, uu, uv, dt, du, dv,
+                            ids, rw, kg, ku, kd, mcg, intermediate_size, swiglu_limit);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -185,7 +187,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("up_trellis_ptrs"), py::arg("up_suh_ptrs"), py::arg("up_svh_ptrs"),
           py::arg("down_trellis_ptrs"), py::arg("down_suh_ptrs"), py::arg("down_svh_ptrs"),
           py::arg("expert_indices"), py::arg("routing_weights"), py::arg("K_gate"),
-          py::arg("K_up"), py::arg("K_down"), py::arg("mcg"));
+          py::arg("K_up"), py::arg("K_down"), py::arg("mcg"),
+          py::arg("intermediate_size") = 2048, py::arg("swiglu_limit") = 0.0f);
+    // Python must not pass TP2 pointers or a clipping request to an older binary.
+    m.attr("P2B_MOE_ABI_VERSION") = 2;
     m.def("exl3_fat_gemm", &exl3_fat_gemm, "Native EXL3 fat GEMM for large prefill rows",
           py::arg("a"), py::arg("packed"), py::arg("out"), py::arg("svh"),
           py::arg("K"), py::arg("mcg"), py::arg("mul1"));

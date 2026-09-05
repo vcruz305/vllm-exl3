@@ -1,7 +1,9 @@
 #include <cuda_fp16.h>
 #include <torch/extension.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cooperative_groups.h>
+#include <cmath>
 
 #include "util.h"
 #include "util.cuh"
@@ -187,7 +189,8 @@ void p2b_moe_batched_kernel(
     int experts,
     int m,
     int hidden,
-    int inter)
+    int inter,
+    float swiglu_limit)
 {
     auto grid = cg::this_grid();
     const int warp = threadIdx.x / 32;
@@ -274,11 +277,15 @@ void p2b_moe_batched_kernel(
 
     // Phase 3: SwiGLU activation + Down input Hadamard across all active experts
     {
-        // First compute SwiGLU: had_down[e, j] = silu(gate[e, j]) * up[e, j]
+        // Match vLLM's input-clipped SwiGLU. Zero preserves the plain activation.
         int total_elements = experts * inter;
         for (int j = tid; j < total_elements; j += total_threads) {
             float g = __half2float(gate[j]);
             float u = __half2float(up[j]);
+            if (swiglu_limit > 0.0f) {
+                g = fminf(g, swiglu_limit);
+                u = fminf(fmaxf(u, -swiglu_limit), swiglu_limit);
+            }
             float s = g / (1.0f + expf(-g));
             had_down[j] = __float2half(s * u);
         }
@@ -362,7 +369,7 @@ static void launch_moe_batched(
     const at::Tensor& dv, const at::Tensor& ids, const at::Tensor& rw,
     at::Tensor& out, at::Tensor& gate, at::Tensor& up, at::Tensor& down,
     at::Tensor& had_gate, at::Tensor& had_up, at::Tensor& had_down,
-    at::Tensor& accum, int e, int m, int hidden, int inter)
+    at::Tensor& accum, int e, int m, int hidden, int inter, float swiglu_limit)
 {
     int dev = 0, sms = 0, resident = 0;
     cudaGetDevice(&dev);
@@ -401,7 +408,7 @@ static void launch_moe_batched(
         (void*)&idp, (void*)&rwp,
         (void*)&gp, (void*)&up_p, (void*)&dp, (void*)&op,
         (void*)&hg_p, (void*)&hu_p, (void*)&hd_p, (void*)&accp,
-        (void*)&e, (void*)&m, (void*)&hidden, (void*)&inter
+        (void*)&e, (void*)&m, (void*)&hidden, (void*)&inter, (void*)&swiglu_limit
     };
 
     cuda_check(cudaLaunchCooperativeKernel(kernel, dim3(grid), dim3(512), args, 0, stream));
@@ -413,13 +420,37 @@ at::Tensor p2b_fused_moe_cuda(const at::Tensor& x, at::Tensor& out,
     const at::Tensor& ut, const at::Tensor& uu, const at::Tensor& uv,
     const at::Tensor& dt, const at::Tensor& du, const at::Tensor& dv,
     const at::Tensor& ids, const at::Tensor& rw, int64_t kg, int64_t ku,
-    int64_t kd, bool mcg) {
+    int64_t kd, bool mcg, int64_t intermediate_size, float swiglu_limit) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf, "fused MoE requires CUDA fp16 input");
     TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kHalf, "fused MoE output must be CUDA fp16");
+    TORCH_CHECK(x.dim() == 2 && x.size(0) == 1 && x.size(1) == 4096,
+                "fused MoE requires one input row with hidden width 4096");
+    TORCH_CHECK(out.sizes() == x.sizes(), "fused MoE output shape must match input");
+    TORCH_CHECK(intermediate_size == 1024 || intermediate_size == 2048,
+                "fused MoE local intermediate width must be 1024 or 2048");
+    TORCH_CHECK(std::isfinite(swiglu_limit) && swiglu_limit >= 0.0f,
+                "fused MoE SwiGLU limit must be finite and nonnegative (0 disables clipping)");
     TORCH_CHECK(mcg && kg == ku && ku == kd && (kg == 2 || kg == 3 || kg == 4), "unsupported fused MoE K");
+    TORCH_CHECK(ids.dim() == 1 && ids.scalar_type() == at::kInt && ids.numel() > 0,
+                "fused MoE expert indices must be a nonempty int32 routing vector");
+    TORCH_CHECK(rw.scalar_type() == at::kHalf && rw.numel() == ids.numel(),
+                "fused MoE requires one fp16 routing weight per expert index");
+    // Pointer tables describe already-loaded tensors. Their pointee shapes and
+    // expert IDs are validated/prepared by the Python caller, without a host sync.
+    const at::Tensor* tensors[] = {&x, &out, &ids, &rw, &gt, &gu, &gv, &ut, &uu, &uv, &dt, &du, &dv};
+    for (const auto* tensor : tensors) {
+        TORCH_CHECK(tensor->device() == x.device() && tensor->is_contiguous(),
+                    "fused MoE tensors must be contiguous and on the input CUDA device");
+    }
+    for (const auto* ptrs : {&gt, &gu, &gv, &ut, &uu, &uv, &dt, &du, &dv}) {
+        TORCH_CHECK(ptrs->dim() == 1 && ptrs->scalar_type() == at::kLong &&
+                    ptrs->numel() == gt.numel() && ptrs->numel() > 0,
+                    "fused MoE pointer tables must be equally sized nonempty int64 vectors");
+    }
+    const c10::cuda::CUDAGuard device_guard(x.device());
     const int e = static_cast<int>(ids.numel());
-    const int m = static_cast<int>(x.numel() / x.size(-1));
-    constexpr int hidden = 4096, inter = 2048;
+    constexpr int m = 1, hidden = 4096;
+    const int inter = static_cast<int>(intermediate_size);
 
     auto gate = at::empty({e, m, inter}, x.options());
     auto up = at::empty({e, m, inter}, x.options());
@@ -429,9 +460,9 @@ at::Tensor p2b_fused_moe_cuda(const at::Tensor& x, at::Tensor& out,
     auto had_down = at::empty({e, m, inter}, x.options());
     auto accum = at::zeros({m, hidden}, x.options().dtype(at::kFloat));
 
-    if (kg == 2) launch_moe_batched<2>(x, gt, gu, gv, ut, uu, uv, dt, du, dv, ids, rw, out, gate, up, down, had_gate, had_up, had_down, accum, e, m, hidden, inter);
-    else if (kg == 3) launch_moe_batched<3>(x, gt, gu, gv, ut, uu, uv, dt, du, dv, ids, rw, out, gate, up, down, had_gate, had_up, had_down, accum, e, m, hidden, inter);
-    else if (kg == 4) launch_moe_batched<4>(x, gt, gu, gv, ut, uu, uv, dt, du, dv, ids, rw, out, gate, up, down, had_gate, had_up, had_down, accum, e, m, hidden, inter);
+    if (kg == 2) launch_moe_batched<2>(x, gt, gu, gv, ut, uu, uv, dt, du, dv, ids, rw, out, gate, up, down, had_gate, had_up, had_down, accum, e, m, hidden, inter, swiglu_limit);
+    else if (kg == 3) launch_moe_batched<3>(x, gt, gu, gv, ut, uu, uv, dt, du, dv, ids, rw, out, gate, up, down, had_gate, had_up, had_down, accum, e, m, hidden, inter, swiglu_limit);
+    else if (kg == 4) launch_moe_batched<4>(x, gt, gu, gv, ut, uu, uv, dt, du, dv, ids, rw, out, gate, up, down, had_gate, had_up, had_down, accum, e, m, hidden, inter, swiglu_limit);
 
     return out;
 }

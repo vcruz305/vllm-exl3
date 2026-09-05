@@ -12,8 +12,10 @@ import vllm_exl3.exl3 as exl3
 class _RecordingNativeExtension:
     """Small CPU stand-in for the native ABI used by the routing wrapper."""
 
-    def __init__(self) -> None:
+    def __init__(self, abi_version: int = 1) -> None:
+        self.P2B_MOE_ABI_VERSION = abi_version
         self.calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+        self.options: list[tuple] = []
 
     def p2b_fused_moe(
         self,
@@ -24,6 +26,7 @@ class _RecordingNativeExtension:
         # The routing arguments are the final four ABI values before the
         # activation flags: expert IDs, routing weights, and three K values.
         ids, weights = args[9], args[10]
+        self.options.append(args[11:])
         self.calls.append((ids.detach().clone(), weights.detach().clone()))
         assert ids.ndim == 1
         assert weights.ndim == 1
@@ -34,14 +37,23 @@ class _RecordingNativeExtension:
 
 
 @pytest.mark.parametrize("tokens", [1, 2, 4, 8])
-@pytest.mark.parametrize("top_k", [1, 2, 3, 8])
+@pytest.mark.parametrize("top_k", [1, 2, 3, 6, 8])
+@pytest.mark.parametrize(
+    "intermediate,limit,bits,abi_version",
+    [(2048, None, 4, 1), (2048, None, 2, 2), (2048, 10.0, 3, 2),
+     (1024, None, 4, 2), (1024, 10.0, 4, 2)],
+)
 def test_native_routing_preserves_topk_and_all_contributions(
     monkeypatch: pytest.MonkeyPatch,
     tokens: int,
     top_k: int,
+    intermediate: int,
+    limit: float | None,
+    bits: int,
+    abi_version: int,
 ) -> None:
     """Every decode row receives all K routes and their weighted sum."""
-    extension = _RecordingNativeExtension()
+    extension = _RecordingNativeExtension(abi_version)
     monkeypatch.setattr(exl3, "_load_native_exl3_ext", lambda: extension)
     monkeypatch.setattr(exl3, "_native_moe_dimensions_supported", lambda *args: True)
 
@@ -70,14 +82,19 @@ def test_native_routing_preserves_topk_and_all_contributions(
                 "down_svh",
             )
         },
-        _exl3_k=4,
+        _exl3_k=bits,
+        _exl3_intermediate_local=intermediate,
     )
     inners = [{} for _ in range(n_experts)]
 
-    output = exl3._apply_native_fused_moe(x, ids, weights, layer, inners, None)
+    output = exl3._apply_native_fused_moe(x, ids, weights, layer, inners, None, limit)
 
     assert output is not None
     assert len(extension.calls) == tokens
+    expected_options = (bits, bits, bits, True)
+    if abi_version >= 2:
+        expected_options += (intermediate, limit or 0.0)
+    assert extension.options == [expected_options] * tokens
     for row, (recorded_ids, recorded_weights) in enumerate(extension.calls):
         assert recorded_ids.shape == (top_k,)
         assert recorded_weights.shape == (top_k,)
