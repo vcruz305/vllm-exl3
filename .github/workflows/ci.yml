@@ -115,6 +115,7 @@ jobs:
       - name: Clone Canonical ExLlamaV3
         run: |
           git clone --depth 1 https://github.com/turboderp-org/exllamav3.git /tmp/exllamav3_test
+          git -C /tmp/exllamav3_test rev-parse HEAD
 
       - name: Execute patch_exllamav3_aarch64.py
         run: |
@@ -122,31 +123,7 @@ jobs:
 
       - name: Assert x86 Intrinsics Guarded & Yield Replaced
         run: |
-          EXT_DIR="/tmp/exllamav3_test/exllamav3/exllamav3_ext"
-          
-          # Check moe_handoff.cu
-          if grep -q "#ifdef __linux__" "$EXT_DIR/cpu/moe_handoff.cu"; then
-            echo "FAILED: unpatched #ifdef __linux__ still present in cpu/moe_handoff.cu!" >&2
-            exit 1
-          fi
-          if ! grep -q "std::this_thread::yield" "$EXT_DIR/cpu/moe_handoff.cu"; then
-            echo "FAILED: std::this_thread::yield not found in cpu/moe_handoff.cu!" >&2
-            exit 1
-          fi
-
-          # Check all_reduce_cpu.cu
-          if grep -q "#ifdef __linux__" "$EXT_DIR/parallel/all_reduce_cpu.cu"; then
-            echo "FAILED: unpatched #ifdef __linux__ still present in parallel/all_reduce_cpu.cu!" >&2
-            exit 1
-          fi
-
-          # Check AVX stubs
-          if ! grep -q "bool is_avx2_supported() { return false; }" "$EXT_DIR/avx2_target.cpp"; then
-            echo "FAILED: avx2_target.cpp stub missing!" >&2
-            exit 1
-          fi
-
-          echo "SUCCESS: ExLlamaV3 aarch64 patcher verified against upstream repository."
+          python tools/verify_exllamav3_aarch64.py /tmp/exllamav3_test/exllamav3/exllamav3_ext
 
   packaging-check:
     name: Pure-Python Wheel & SDist Build Check
