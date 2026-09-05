@@ -10,6 +10,17 @@
 template <int, bool, int, int, int, bool>
 __device__ void exl3_gemv_kernel(EXL3_GEMM_ARGS);
 
+// Make the vendor GEMV body device-callable before the fast worklist uses its
+// fragment types and decode helpers.
+#define P2B_GLOBAL __global__
+#define __global__ __device__
+#define __launch_bounds__(...)
+#include "quant/exl3_gemv_kernel.cuh"
+#undef __launch_bounds__
+#undef __global__
+#define __launch_bounds__(...) __annotate__(launch_bounds(__VA_ARGS__))
+#define __global__ __location__(global)
+
 // The standalone QTIP GEMV body is intentionally cooperative and performs one
 // full expert at a time.  For the common MoE decode case (m == 1), use the
 // same tile math as the fused MoE path but distribute expert/column work over
@@ -115,7 +126,7 @@ __device__ __forceinline__ void p2b_run_gemv_tile_2(
     __syncthreads();
 }
 
-__global__ __launch_bounds__(512)
+P2B_GLOBAL __launch_bounds__(512)
 void p2b_fast_worklist_kernel(
     const half* A, const int64_t* tptrs, const int64_t* suptrs,
     const int64_t* svptrs, const int32_t* ids, half* C, half* A_had,
@@ -180,7 +191,7 @@ void p2b_fast_worklist_kernel(
     (void)total_threads;
 }
 
-__global__ __launch_bounds__(256)
+P2B_GLOBAL __launch_bounds__(256)
 void p2b_input_hadamard_kernel(const half* A, const int64_t* suptrs,
                                const int32_t* ids, half* A_had,
                                int experts, int size_k) {
@@ -198,7 +209,7 @@ void p2b_input_hadamard_kernel(const half* A, const int64_t* suptrs,
         0.088388347648f);
 }
 
-__global__ __launch_bounds__(256)
+P2B_GLOBAL __launch_bounds__(256)
 void p2b_output_hadamard_kernel(const int64_t* svptrs, const int32_t* ids,
                                 half* C, int experts, int size_n) {
     const int warp = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
@@ -214,7 +225,7 @@ void p2b_output_hadamard_kernel(const int64_t* svptrs, const int32_t* ids,
         0.088388347648f);
 }
 
-__global__ __launch_bounds__(512)
+P2B_GLOBAL __launch_bounds__(512)
 void p2b_parallel_worklist_kernel(
     const int64_t* tptrs, const int32_t* ids, half* C, const half* A_had,
     int experts, int size_k, int size_n) {
@@ -235,7 +246,7 @@ void p2b_parallel_worklist_kernel(
 }
 
 template <int BITS, int CB>
-__global__ __launch_bounds__(512)
+P2B_GLOBAL __launch_bounds__(512)
 void p2b_worklist_kernel(const half* A, const uint16_t** tptrs,
                         const half** suptrs, const half** svptrs,
                         const int32_t* ids, half* C, half* A_had, int* locks,
@@ -260,13 +271,6 @@ void p2b_worklist_kernel(const half* A, const uint16_t** tptrs,
             locks + e * (1 << 20), su, ah, sv);
     }
 }
-
-// Instantiate the proven QTIP body as a device-callable template.
-#define __global__ __device__
-#define __launch_bounds__(...)
-#include "quant/exl3_gemv_kernel.cuh"
-#undef __launch_bounds__
-#undef __global__
 
 template <int BITS, int CB>
 void launch_batched(const at::Tensor& x, const at::Tensor& tp,
