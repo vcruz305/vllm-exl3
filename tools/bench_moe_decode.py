@@ -192,9 +192,9 @@ def main():
                   f"Batched: {res['batched_stats']['median_us']:6.1f} us | "
                   f"Speedup: {res['speedup']:4.2f}x | Bandwidth: {res['bandwidth_gb_s']:6.1f} GB/s")
 
-    # 2. Full Fused MoE Layer decode benchmark
+    # 2. Full Fused MoE Layer decode benchmark (specialized for M=1 decode)
     print("\n--- 2. Full Fused MoE Layer Decode Latency ---")
-    for m in [1, 2, 4]:
+    for m in [1]:
         res = bench_moe_layer(device, hidden=4096, intermediate=2048, num_total_experts=288,
                               top_k=8, bits=2, swiglu_limit=10.0, m_tokens=m)
         results["fused_moe_layers"].append(res)
