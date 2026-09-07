@@ -168,7 +168,7 @@ TTFT):
 | Mode | Decode | TTFT (128 tok) | Mean acceptance | Ready | On device | KV cache |
 |---|---|---|---|---|---|---|
 | No draft | 27.2-28.0 tok/s | 0.185 s | -- | ~13 min | 78.6 GiB | 385,570 tokens |
-| MTP k=1 | 33.8-36.4 tok/s | 0.185 s | 1.86 of 2 | ~13 min | 78.6 GiB | 385,570 tokens (no draft) |
+| MTP k=1 | 33.8-36.4 tok/s | 0.199 s | 1.86 of 2 | ~13 min | 78.6 GiB | 275,636 tokens |
 | MTP k=2 | 37.3-41.3 tok/s | 0.201 s | 2.54 of 3 | ~13 min | 78.6 GiB | 275,636 tokens (MTP) |
 
 Recipe: https://github.com/vcruz305/Qwen3.8-Flash-Next-EXL3-DGX-Spark-recipe
