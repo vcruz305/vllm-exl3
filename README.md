@@ -172,6 +172,12 @@ TTFT):
 | MTP k=2 | 37.3-41.3 tok/s | 0.201 s | 2.54 of 3 | ~12 min | 78.6 GiB | 235,412 tokens |
 | MTP k=3 | 34.4-38.2 tok/s | 0.21 s | 2.95 of 4 | ~11 min | 78.6 GiB | 224,694 tokens |
 
+Long context (same pack, no draft): at `--max-model-len 262144` the KV cache is 546,503 tokens
+(util 0.80, 2 sequences, about 19 GiB free) or 759,773 tokens (util 0.85, 4 sequences, 11.5 GiB
+free); a 122,902-token prompt prefills in about 107 s and decode stays at 26-27 tok/s. With MTP
+k=2 at 262k the KV cache is 402,630 tokens and long-prompt decode is about 43 tok/s. 262144 is the
+model's `max_position_embeddings`.
+
 Recipe: https://github.com/vcruz305/Qwen3.8-Flash-Next-EXL3-DGX-Spark-recipe
 
 ## Config contract
