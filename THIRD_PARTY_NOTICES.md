@@ -63,6 +63,15 @@ The CUDA sources in `csrc/` build against ExLlamaV3's extension headers, includi
 `ptx.cuh`, and the GEMV and batched kernels reuse its kernel body. The EXL3 trellis format, the MCG
 codebook and the quantization method itself are ExLlamaV3's work.
 
+### ExLlamaV3 n-gram embedding codec
+
+`ngram_dequant_rows_torch` and `ngram_mul1_codebook` in `src/vllm_exl3/exl3.py` reimplement, as a
+pure-Python/CPU fallback, the row layout and mul1 codebook arithmetic of ExLlamaV3's
+`exllamav3/modules/quant/exl3_lib/ngram_codec.py` and its `ngram_dequant` CUDA kernel. The serving
+path itself calls ExLlamaV3's own `ngram_dequant` kernel through `exllamav3_ext`; the torch
+reimplementation exists for correctness cross-checking and for environments without the compiled
+kernel.
+
 ```
 MIT License
 
@@ -86,3 +95,15 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+
+---
+
+## vLLM
+
+Author: the vLLM project ([vllm-project/vllm](https://github.com/vllm-project/vllm)).
+
+`_exl3_routed_experts_loader` in `src/vllm_exl3/exl3.py` mirrors the checkpoint-name resolution of
+vLLM's `RoutedExperts.load_weights`, adapted to load one EXL3 tensor per expert instead of taking
+vLLM's fused (3-D) branch. This plugin's custom ops are also registered through vLLM's
+`direct_register_custom_op`. Apache-2.0.

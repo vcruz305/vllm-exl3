@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+- Native fused-MoE decode-row cap measured on GB10 (K2: 8 rows, K3/K4: 1) ships as an opt-in
+  (`VLLM_EXL3_NATIVE_MOE_MEASURED_CAP=1`, or `VLLM_EXL3_NATIVE_MOE_MAX_ROWS=<n>`); the default keeps
+  the dispatch contract of up to 8 rows. Receipt: `tools/receipts/ab_moe_gb10.json`.
+- Add `Exl3EmbeddingMethod` for row-wise n-gram embedding tables
+  (`ngram_embedding`), decoded through the compiled
+  `exllamav3_ext.ngram_dequant` kernel or a pure-torch fallback
+  (`VLLM_EXL3_NGRAM_KERNEL=ext|torch`).
+- Add the `ngram_embedding` config spec (`bits`, `num_shards`,
+  `rows_per_shard`, `num_heads`, `modules`) and its checkpoint layout
+  (`shard_<i>.trellis`, `head_bias`, `head_offsets`, `head_vocab_sizes`,
+  `layer_multipliers`); tensor parallel size 1 only.
+- Extend `get_quant_method` with branches for `ParallelLMHead` and
+  `VocabParallelEmbedding`, so EXL3 `lm_head` and n-gram tables resolve
+  once a model passes `quant_config=` through to those layers.
+- Accept tuple and `None` shard-id spans in the dense linear weight
+  loader, for fused modules with more than one contiguous shard and for
+  full-tensor (non-sharded) loads.
+- Generalize `_check_moe_codebook_markers` to validate `mul1` markers
+  for routed experts alongside `mcg`.
+- Add `_exl3_routed_experts_loader`, a per-expert `load_weights` path for
+  routed-experts layers that mirrors vLLM's own checkpoint-name
+  resolution for one-tensor-per-expert EXL3 checkpoints.
+- Pad dense EXL3 linear geometry to multiples of 128 so trellis tiles
+  never spill past the real matrix dimension.
+- Thread per-tensor codebook flags (mcg/mul1) through the fused
+  `exl3_moe` launch arguments.
+- Register the EXL3 custom ops so they trace opaquely under
+  `torch.compile(fullgraph=True)` instead of breaking graph capture.
+- Restore the CUDA-graph-safe fat-expert-sync guard (skip the device
+  sync entirely when the row count cannot produce a fat expert) and the
+  MTP/draft-expert quant-method delegate (prefer MXFP4, matching DSV4's
+  own fp4 draft experts, before falling back to the non-routed delegate).
+- Add `tools/patch_vllm_qwen4_exp` (vLLM quant_config plumbing for
+  `Qwen4ExpForConditionalGeneration`), `tools/exl3_pack_tools`
+  (pack scanning, config rewriting, and
+  `regenerate_safetensors_index.py`), and `tools/verify_native_pack`
+  (four pre-boot GPU correctness gates).
+- Add attribution notices for ExLlamaV3's n-gram embedding codec and for
+  vLLM's routed-experts loader / custom-op registration; thank
+  turboderp for the Qwen3.8-Flash-Next-exl3 pack used to validate this
+  release.
+
 - Extend the native fused MoE ABI with local intermediate width (1024 or 2048)
   and optional input-clipped SwiGLU. Clamp the gate before SiLU and the up
   projection symmetrically; zero keeps plain SwiGLU. Preserve K2/K3/K4 support.

@@ -10,16 +10,17 @@ work, Copyright (c) 2025 Turboderp, MIT. See THIRD_PARTY_NOTICES.md.
 """
 
 # SPDX-License-Identifier: Apache-2.0
-# EXL3/MCG trellis quantization for GLM-5.3-Flash routed experts.
+# EXL3 trellis quantization for routed experts, dense linears
+# (non_routed_exl3), lm_head (ParallelLMHead) and row-wise n-gram embedding
+# tables (ngram_embedding).
 #
-# Checkpoint ABI used by this pack:
-#   quant_method=exl3, codebook=mcg, scope=glm53_routed_experts_only
-#   per expert matrix: trellis (int16) + suh/svh (fp16) + mcg (int32 marker)
+# Codebooks are mcg or mul1. Per-tensor K comes from layer_bits and
+# non_routed_exl3.layers; matrices are padded to multiples of 128.
+# Non-routed tensors without a spec stay native (UnquantizedLinearMethod).
 #
-# Non-routed tensors stay native (UnquantizedLinearMethod). Experts never
-# expand to a persistent BF16 weight; LinearEXL3 / exllamav3_ext runs the
-# trellis GEMM. TP=2 shards gate/up column-wise and down row-wise; the MoE
-# runner all-reduces the combined output.
+# Experts never expand to a persistent BF16 weight; LinearEXL3 /
+# exllamav3_ext runs the trellis GEMM. TP=2 shards gate/up column-wise and
+# down row-wise; the MoE runner all-reduces the combined output.
 
 from __future__ import annotations
 
@@ -51,7 +52,10 @@ try:
         LinearMethodBase,
         UnquantizedLinearMethod,
     )
-    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizationConfig,
+        QuantizeMethodBase,
+    )
     from vllm.model_executor.layers.quantization import register_quantization_config
     from vllm.model_executor.utils import set_weight_attrs
     _VLLM_AVAILABLE = True
@@ -79,6 +83,9 @@ except ImportError:
         pass
 
     class QuantizationConfig:  # type: ignore[no-redef]
+        pass
+
+    class QuantizeMethodBase:  # type: ignore[no-redef]
         pass
 
     def register_quantization_config(name: str):  # type: ignore[no-redef]
@@ -776,14 +783,50 @@ def _native_moe_dimensions_supported(
         return False
     hidden_meta = int(getattr(layer, "_exl3_hidden_size", x2d.shape[1]))
     inter_meta = int(getattr(layer, "_exl3_intermediate_local", 2048))
-    return (
-        1 <= int(x2d.shape[0]) <= 8
+    rows = int(x2d.shape[0])
+    bits = int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", -1)))
+    if not (
+        rows >= 1
         and int(x2d.shape[1]) == hidden_meta == 4096
         and inter_meta in (1024, 2048)
-        and int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", -1)))
-        in (2, 3, 4)
+        and bits in (2, 3, 4)
         and len(inners) > 0
-    )
+    ):
+        return False
+    return rows <= _native_moe_max_rows(bits)
+
+
+# Measured on one GB10 (sm_121) against exllamav3 exl3_moe in the same process, identical
+# experts and routing, 288 experts, top-8, hidden 4096, intermediate 2048. Speedup of
+# p2b_fused_moe over exl3_moe, median of 50 launches with fresh routing per launch:
+#
+#   K=2:  m=1 1.69x   m=2 1.21x   m=4 1.23x   m=8 1.06x
+#   K=3:  m=1 1.27x   m=2 0.95x   m=4 0.96x   m=8 0.82x
+#   K=4:  m=1 1.28x   m=2 1.00x   m=4 1.01x   m=8 0.89x
+#
+# The native ABI takes one row per launch, so cost grows linearly with rows while exl3_moe
+# batches them in a single launch. Those measurements predate the current native kernels,
+# so the per-bit cap is opt-in (VLLM_EXL3_NATIVE_MOE_MEASURED_CAP=1) and the default keeps
+# the dispatch contract of up to 8 decode rows. Receipt: tools/receipts/ab_moe_gb10.json.
+_NATIVE_MOE_MAX_ROWS = {2: 8, 3: 1, 4: 1}
+_NATIVE_MOE_CONTRACT_ROWS = 8
+
+
+def _native_moe_max_rows(bits: int) -> int:
+    """Decode row cap for native dispatch: env override, measured cap when opted in, else 8."""
+    override = os.environ.get("VLLM_EXL3_NATIVE_MOE_MAX_ROWS")
+    if override:
+        try:
+            value = int(override)
+        except ValueError:
+            logger.warning(
+                "Ignoring non-integer VLLM_EXL3_NATIVE_MOE_MAX_ROWS=%r", override
+            )
+        else:
+            return max(0, value)
+    if os.environ.get("VLLM_EXL3_NATIVE_MOE_MEASURED_CAP", "0") == "1":
+        return _NATIVE_MOE_MAX_ROWS.get(int(bits), _NATIVE_MOE_CONTRACT_ROWS)
+    return _NATIVE_MOE_CONTRACT_ROWS
 
 
 def _apply_native_fused_moe(
@@ -1171,8 +1214,12 @@ def apply_exl3_fused_moe(
         return out
 
     fat = counts > FAT_EXPERT_THRESHOLD
+    # counts[e] cannot exceed the row count, so with no more rows than the
+    # threshold no expert can be fat. Testing that Python-side first keeps the
+    # device sync below off the decode path, where graph capture forbids it.
+    fat_possible = tokens > FAT_EXPERT_THRESHOLD
     fat_route = torch.zeros_like(local, dtype=torch.bool)
-    if bool(fat.any().item()):
+    if fat_possible and bool(fat.any().item()):
         safe_local = local.clamp(min=0, max=max(n_exp - 1, 0))
         fat_route = (local < n_exp) & fat.index_select(0, safe_local)
 
@@ -1220,12 +1267,7 @@ def apply_exl3_fused_moe(
         ptrs["down_trellis"],
         ptrs["down_suh"],
         ptrs["down_svh"],
-        True,
-        False,
-        True,
-        False,
-        True,
-        False,
+        *getattr(layer, "_exl3_codebook_flags", (True, False, True, False, True, False)),
         float(limit) if (limit is not None and limit > 0) else 0.0,
     )
     if n_active_host is not None:
@@ -1233,7 +1275,7 @@ def apply_exl3_fused_moe(
     else:
         fn(*args)
 
-    if bool(fat.any().item()):
+    if fat_possible and bool(fat.any().item()):
         fat_order = local.argsort()
         apply_exl3_batched_fat(
             xh,
@@ -1318,6 +1360,11 @@ def _suffix_from_mapped_name(weight_name: str) -> str:
     raise ValueError(f"not an EXL3 packed name: {weight_name}")
 
 
+def _exl3_pad128(n: int) -> int:
+    """EXL3 stores matrices padded to multiples of 128 on both dims."""
+    return (int(n) + 127) // 128 * 128
+
+
 def _prefix_has_suffix(prefix: str, suffix: str) -> bool:
     """Module-path suffix match: "self_attn.o_proj" matches
     "model.layers.3.self_attn.o_proj" but not "...cross_attn.o_proj_x"."""
@@ -1385,6 +1432,19 @@ class Exl3Config(QuantizationConfig):
             raise ValueError(
                 f"unsupported non_routed_exl3 codebook={nr_codebook!r}; must be 'mcg' or 'mul1'"
             )
+        # Optional row-wise trellis embedding table in exllamav3's n-gram format
+        # (Qwen3.8-Flash-Next PLE), e.g. {"bits": 5, "num_shards": 128,
+        # "rows_per_shard": 2500012, "num_heads": 16, "modules": ["ngram_embedding"]}.
+        raw_ngram = kwargs.pop("ngram_embedding", None) or {}
+        self.ngram_embedding: dict[str, Any] = dict(raw_ngram) if raw_ngram else {}
+        if self.ngram_embedding:
+            for key in ("bits", "num_shards", "rows_per_shard", "num_heads"):
+                if int(self.ngram_embedding.get(key, 0) or 0) <= 0:
+                    raise ValueError(f"ngram_embedding.{key} must be a positive integer")
+            if int(self.ngram_embedding["bits"]) not in range(1, 9):
+                raise ValueError(
+                    f"unsupported ngram_embedding bits={self.ngram_embedding['bits']}"
+                )
         self.raw_config = dict(kwargs)
         if self.codebook not in ("mcg", "mul1"):
             raise ValueError(
@@ -1392,6 +1452,37 @@ class Exl3Config(QuantizationConfig):
             )
         if self.bits not in (2, 3, 4, 5, 6):
             raise ValueError(f"unsupported EXL3 bits={self.bits}")
+
+
+    def _mtp_expert_method(self, layer, prefix):
+        """Quant method for draft/MTP experts, which stay in the base format.
+
+        These are the model's own experts, fp4 for DSV4: packed weights with
+        E8M0 block scales, which vLLM loads by looking up w13_weight_scale. The
+        non-routed delegate describes fp8 block quantization for the attention
+        and dense layers and creates w13_weight_scale_inv instead, so it cannot
+        serve these. Prefer MXFP4, whose MoE method creates the expected names,
+        and keep the non-routed delegate as the fallback for packs that are not
+        fp4. Returns (method, description).
+        """
+        if str(getattr(self, "mtp_expert_dtype", "fp4")) == "fp4":
+            try:
+                from vllm.model_executor.layers.quantization.mxfp4 import (
+                    Mxfp4Config,
+                )
+
+                method = Mxfp4Config().get_quant_method(layer, prefix)
+                if method is not None:
+                    return method, "mxfp4"
+            except Exception as exc:  # pragma: no cover - depends on vLLM build
+                if os.environ.get("VLLM_EXL3_LOG_MOE_ROUTING"):
+                    print(f"[exl3-routing] mxfp4 delegate unusable: {exc}", flush=True)
+        delegate = self._non_routed_delegate()
+        if delegate is not None:
+            method = delegate.get_quant_method(layer, prefix)
+            if method is not None:
+                return method, "non_routed"
+        return None, "none"
 
     def get_name(self) -> str:
         return "exl3"
@@ -1516,6 +1607,17 @@ class Exl3Config(QuantizationConfig):
             return "exl3"
         return None
 
+    def _ngram_embedding_spec(self, prefix: str) -> dict[str, Any] | None:
+        """The n-gram table spec if ``prefix`` names one of its modules, else None."""
+        spec = getattr(self, "ngram_embedding", None) or {}
+        if not spec:
+            return None
+        modules = list(spec.get("modules") or ["ngram_embedding"])
+        for m in modules:
+            if prefix == m or prefix.endswith("." + m):
+                return spec
+        return None
+
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
@@ -1526,12 +1628,21 @@ class Exl3Config(QuantizationConfig):
             if getattr(self, "mtp_experts", "exl3") == "source":
                 _start = getattr(self, "mtp_experts_start_layer", None)
                 _lm = re.search(r"layers\.(\d+)\.", prefix)
-                if _start is not None and _lm and int(_lm.group(1)) >= int(_start):
-                    d = self._non_routed_delegate()
-                    if d is not None:
-                        dm = d.get_quant_method(layer, prefix)
-                        if dm is not None:
-                            return dm
+                _by_index = bool(
+                    _start is not None and _lm and int(_lm.group(1)) >= int(_start)
+                )
+                if _by_index:
+                    dm, how = self._mtp_expert_method(layer, prefix)
+                    if dm is not None:
+                        if os.environ.get("VLLM_EXL3_LOG_MOE_ROUTING"):
+                            print(
+                                f"[exl3-routing] MoE {prefix} -> source via {how} "
+                                f"(by_index={_by_index})",
+                                flush=True,
+                            )
+                        return dm
+            if os.environ.get("VLLM_EXL3_LOG_MOE_ROUTING"):
+                print(f"[exl3-routing] MoE {prefix} -> exl3", flush=True)
             return Exl3MoEMethod(
                 layer.moe_config, self, bits=self.bits_for_prefix(prefix)
             )
@@ -1539,6 +1650,7 @@ class Exl3Config(QuantizationConfig):
             # Check if this LinearBase should use non_routed_exl3
             if self._matches_non_routed_exl3(prefix):
                 bits = self._bits_for_non_routed(prefix)
+                layer._exl3_prefix = prefix
                 return Exl3LinearMethod(self, bits=bits)
             if getattr(self, "non_routed_dtype_policy", "") == "bf16_as_stored":
                 return UnquantizedLinearMethod()
@@ -1548,6 +1660,28 @@ class Exl3Config(QuantizationConfig):
                 if m is not None:
                     return m
             return UnquantizedLinearMethod()
+        # Embedding-family layers. vLLM only consults quant_config for these when
+        # the model passes it (qwen4_exp needs quant_config= on ParallelLMHead and
+        # on the PLE table). lm_head is an ordinary trellis linear; the PLE n-gram
+        # table is the row-wise exllamav3 format served by Exl3EmbeddingMethod.
+        try:
+            from vllm.model_executor.layers.vocab_parallel_embedding import (
+                ParallelLMHead,
+                VocabParallelEmbedding,
+            )
+        except ImportError:  # pragma: no cover
+            return None
+        if isinstance(layer, ParallelLMHead):
+            if self._matches_non_routed_exl3(prefix):
+                layer._exl3_prefix = prefix
+                return Exl3LinearMethod(self, bits=self._bits_for_non_routed(prefix))
+            return None
+        if isinstance(layer, VocabParallelEmbedding):
+            spec = self._ngram_embedding_spec(prefix)
+            if spec is not None:
+                layer._exl3_prefix = prefix
+                return Exl3EmbeddingMethod(self, spec)
+            return None
         return None
 
     def _non_routed_delegate(self):
@@ -1584,6 +1718,80 @@ class Exl3Config(QuantizationConfig):
                         f"quant_method={name!r} config={nrq!r}"
                     ) from exc
         return self._nr_delegate_cached
+
+
+# Mirrors the checkpoint-name resolution of vLLM's RoutedExperts.load_weights
+# (vllm-project/vllm, Apache-2.0); see THIRD_PARTY_NOTICES.md.
+def _exl3_routed_experts_loader(layer: torch.nn.Module):
+    """Per-expert ``load_weights`` for a RoutedExperts layer holding EXL3 tensors.
+
+    Mirrors vLLM's ``RoutedExperts.load_weights`` name resolution but never takes its
+    fused (3-D) branch: an EXL3 checkpoint always stores one tensor per expert.
+    """
+
+    def load_weights(weights):
+        try:
+            mapping = layer.get_expert_mapping(include_fused=True)
+        except TypeError:
+            mapping = layer.get_expert_mapping()
+        layer_name = str(getattr(layer, "layer_name", ""))
+        for expert_name, loaded_weight in weights:
+            qual_name = f"{layer_name}.{expert_name}" if layer_name else expert_name
+            for param_name, weight_name, expert_id, shard_id in mapping:
+                if weight_name not in qual_name:
+                    continue
+                full_name = qual_name.replace(weight_name, param_name)
+                local_name = full_name.removeprefix(f"{layer_name}.")
+                param = getattr(layer, local_name, None)
+                if param is None:
+                    if local_name.endswith(("w13_bias", "w2_bias")):
+                        break
+                    raise AttributeError(
+                        f"EXL3 routed experts {layer_name!r} has no parameter "
+                        f"{local_name!r} for checkpoint weight {qual_name!r}"
+                    )
+                ok = param.weight_loader(
+                    param=param,
+                    loaded_weight=loaded_weight,
+                    weight_name=full_name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                    return_success=True,
+                )
+                if ok:
+                    yield local_name
+                break
+
+    return load_weights
+
+
+def _moe_marker_or_none(marker: torch.Tensor):
+    """A codebook marker tensor if it was loaded (non-zero), else None."""
+    return marker if int(marker.reshape(-1)[0].item()) != 0 else None
+
+
+def _check_moe_codebook_markers(mcg: torch.Tensor, mul1: torch.Tensor, what: str) -> None:
+    """Every expert tensor carries exactly one codebook marker with the known value."""
+    mcg_v = mcg.reshape(-1)
+    mul1_v = mul1.reshape(-1)
+    mcg_set = mcg_v != 0
+    mul1_set = mul1_v != 0
+    if bool((mcg_set & mul1_set).any()):
+        raise RuntimeError(f"EXL3 {what}: an expert tensor has both mcg and mul1 markers")
+    if bool((~mcg_set & ~mul1_set).any()):
+        raise RuntimeError(
+            f"EXL3 {what}: an expert tensor has no codebook marker (mcg or mul1 never loaded)"
+        )
+    if bool((mcg_v[mcg_set] != MCG_MARKER_SIGNED_INT32).any()):
+        raise RuntimeError(
+            f"EXL3 {what}: mcg marker is not the MCG int32 {MCG_MARKER_SIGNED_INT32}; "
+            "packed ABI mismatch"
+        )
+    if bool((mul1_v[mul1_set] != MUL1_MARKER_SIGNED_INT32).any()):
+        raise RuntimeError(
+            f"EXL3 {what}: mul1 marker is not the mul1 int32 {MUL1_MARKER_SIGNED_INT32}; "
+            "packed ABI mismatch"
+        )
 
 
 class Exl3MoEMethod(FusedMoEMethodBase):
@@ -1641,7 +1849,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
         w13_mcg = Parameter(
-            torch.empty(num_experts, 2, 1, dtype=torch.int32),
+            torch.zeros(num_experts, 2, 1, dtype=torch.int32),
+            requires_grad=False,
+        )
+        w13_mul1 = Parameter(
+            torch.zeros(num_experts, 2, 1, dtype=torch.int32),
             requires_grad=False,
         )
         w2_trellis = Parameter(
@@ -1661,7 +1873,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
         w2_mcg = Parameter(
-            torch.empty(num_experts, 1, dtype=torch.int32),
+            torch.zeros(num_experts, 1, dtype=torch.int32),
+            requires_grad=False,
+        )
+        w2_mul1 = Parameter(
+            torch.zeros(num_experts, 1, dtype=torch.int32),
             requires_grad=False,
         )
 
@@ -1670,10 +1886,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             "w13_suh": w13_suh,
             "w13_svh": w13_svh,
             "w13_mcg": w13_mcg,
+            "w13_mul1": w13_mul1,
             "w2_trellis": w2_trellis,
             "w2_suh": w2_suh,
             "w2_svh": w2_svh,
             "w2_mcg": w2_mcg,
+            "w2_mul1": w2_mul1,
         }
         for name, param in packed.items():
             layer.register_parameter(name, param)
@@ -1687,6 +1905,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         layer._exl3_intermediate_local = intermediate_size_per_partition
         layer._exl3_k_words = k_words
         layer._exl3_bits = self.bits
+        # vLLM's generic RoutedExperts.load_weights treats any 3-D checkpoint
+        # tensor as fused stacked experts and unbinds it per expert; an EXL3
+        # per-expert trellis is 3-D by construction. Route this layer's tensors
+        # through a per-expert loader instead (instance attribute shadows the
+        # class method for AutoWeightsLoader; direct-calling models are unaffected).
+        layer.load_weights = _exl3_routed_experts_loader(layer)
 
     def _load_exl3(
         self,
@@ -1712,7 +1936,17 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         tp_rank, tp_size = _resolve_tp_geometry(owner, layer)
         suffix = _suffix_from_mapped_name(weight_name)
         loaded = loaded_weight.detach().contiguous()
-
+        if suffix in ("mcg", "mul1"):
+            # Codebook markers are scalars ([] or [1]); keep the value per expert
+            # tensor so process_weights_after_loading can pick the codebook.
+            if shard_id in ("w1", "w3"):
+                dest = param.data[expert_id, 0 if shard_id == "w1" else 1]
+            elif shard_id == "w2":
+                dest = param.data[expert_id]
+            else:
+                raise ValueError(f"unknown EXL3 shard_id={shard_id}")
+            dest.fill_(int(loaded.reshape(-1)[0].item()) if loaded.numel() else 0)
+            return True if return_success else None
         if shard_id in ("w1", "w3"):
             shard_idx = 0 if shard_id == "w1" else 1
             sharded = shard_exl3_col(loaded, suffix, tp_rank, tp_size)
@@ -1741,22 +1975,16 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             "w13_suh",
             "w13_svh",
             "w13_mcg",
+            "w13_mul1",
             "w2_trellis",
             "w2_suh",
             "w2_svh",
             "w2_mcg",
+            "w2_mul1",
         ):
             getattr(layer, name)._exl3_owner = layer
-
-        mcg13 = layer.w13_mcg.reshape(-1)
-        mcg2 = layer.w2_mcg.reshape(-1)
-        if not torch.all(mcg13 == MCG_MARKER_SIGNED_INT32) or not torch.all(
-            mcg2 == MCG_MARKER_SIGNED_INT32
-        ):
-            raise RuntimeError(
-                "EXL3 mcg marker is not the MCG int32 0xCBAC1FED / "
-                f"{MCG_MARKER_SIGNED_INT32}; packed ABI mismatch"
-            )
+        _check_moe_codebook_markers(layer.w13_mcg, layer.w13_mul1, "w13")
+        _check_moe_codebook_markers(layer.w2_mcg, layer.w2_mul1, "w2")
 
         n_exp = int(layer.w13_trellis.shape[0])
         inners: list[dict[str, Any]] = []
@@ -1765,22 +1993,44 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 layer.w13_trellis[e, 0],
                 layer.w13_suh[e, 0],
                 layer.w13_svh[e, 0],
-                layer.w13_mcg[e, 0],
+                _moe_marker_or_none(layer.w13_mcg[e, 0]),
+                _moe_marker_or_none(layer.w13_mul1[e, 0]),
             )
             up = make_linear_exl3(
                 layer.w13_trellis[e, 1],
                 layer.w13_suh[e, 1],
                 layer.w13_svh[e, 1],
-                layer.w13_mcg[e, 1],
+                _moe_marker_or_none(layer.w13_mcg[e, 1]),
+                _moe_marker_or_none(layer.w13_mul1[e, 1]),
             )
             down = make_linear_exl3(
                 layer.w2_trellis[e],
                 layer.w2_suh[e],
                 layer.w2_svh[e],
-                layer.w2_mcg[e],
+                _moe_marker_or_none(layer.w2_mcg[e]),
+                _moe_marker_or_none(layer.w2_mul1[e]),
             )
             inners.append({"gate": gate, "up": up, "down": down})
         layer._exl3_inners = inners
+        # Codebook flags (mcg, mul1) per projection for the fused kernel launch;
+        # every expert in a layer must agree.
+        if inners:
+            flags = tuple(
+                bool(getattr(inners[0][w], a, d))
+                for w in ("gate", "up", "down")
+                for a, d in (("mcg", True), ("mul1", False))
+            )
+            for e, inner in enumerate(inners):
+                f_e = tuple(
+                    bool(getattr(inner[w], a, d))
+                    for w in ("gate", "up", "down")
+                    for a, d in (("mcg", True), ("mul1", False))
+                )
+                if f_e != flags:
+                    raise RuntimeError(
+                        f"EXL3 experts disagree on codebook: expert {e} {f_e} vs expert 0 {flags}"
+                    )
+            layer._exl3_codebook_flags = flags
         fused_ok = False
         fused_err = None
         # Native dispatch has its own environment control and must still build
@@ -1859,6 +2109,382 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         )
 
 
+# ---------------------------------------------------------------------------
+# Row-wise EXL3 embedding tables (exllamav3 n-gram format)
+# ---------------------------------------------------------------------------
+
+NGRAM_ROW_DIM = 160
+NGRAM_MUL1 = 0x83DCD12D
+
+
+def ngram_words_per_row(bits: int) -> int:
+    """Packed int16 words per row: one fp16 scale word plus the K-bit ring bitstream."""
+    return 1 + NGRAM_ROW_DIM * int(bits) // 16
+
+
+def _fp16_from_bits(bits16: int, device) -> torch.Tensor:
+    signed = bits16 - 0x10000 if bits16 >= 0x8000 else bits16
+    return torch.tensor([signed], dtype=torch.int16, device=device).view(torch.float16)
+
+
+# Reimplements the mul1 codebook arithmetic of ExLlamaV3's ngram_codec
+# (Copyright (c) 2025 Turboderp, MIT); see THIRD_PARTY_NOTICES.md.
+def ngram_mul1_codebook(device) -> torch.Tensor:
+    """The 65536-entry mul1 codebook as fp16, as exllamav3's cached table."""
+    state = torch.arange(65536, device=device, dtype=torch.int64)
+    prod = (state * NGRAM_MUL1) & 0xFFFFFFFF
+    h = 1024.0 + (
+        (prod & 0xFF) + ((prod >> 8) & 0xFF) + ((prod >> 16) & 0xFF) + ((prod >> 24) & 0xFF)
+    ).to(torch.float32)
+    k_inv = _fp16_from_bits(0x1EEE, device).to(torch.float32)
+    k_bias = _fp16_from_bits(0xC931, device).to(torch.float32)
+    return (h * k_inv + k_bias).to(torch.float16)
+
+
+def _ngram_bit_tables(bits: int, device) -> tuple[torch.Tensor, torch.Tensor]:
+    """(word index, bit index) of stream bit m of element i.
+
+    Bit m of element i lives at ring position ((i - m // K) mod ROW_DIM) * K + m % K,
+    offset by one for the scale word.
+    """
+    i = torch.arange(NGRAM_ROW_DIM, device=device, dtype=torch.int64).unsqueeze(1)
+    m = torch.arange(16, device=device, dtype=torch.int64).unsqueeze(0)
+    pos = (i - m // bits) % NGRAM_ROW_DIM
+    sb = pos * bits + m % bits
+    return 1 + (sb >> 4), sb & 15
+
+
+# Reimplements the row layout of ExLlamaV3's ngram_codec / ngram_dequant
+# kernel (Copyright (c) 2025 Turboderp, MIT); see THIRD_PARTY_NOTICES.md.
+def ngram_dequant_rows_torch(
+    packed: torch.Tensor,
+    bits: int,
+    heads: torch.Tensor,
+    head_bias: torch.Tensor,
+    chunk: int = 8192,
+) -> torch.Tensor:
+    """Pure-torch twin of ``exllamav3_ext.ngram_dequant`` (fallback and test oracle).
+
+    packed: (N, words) int16; heads: (N,) int; head_bias: (num_heads, ROW_DIM) fp16.
+    Returns (N, ROW_DIM) fp16: codebook[state] * scale + head_bias[head].
+    """
+    device = packed.device
+    widx, bidx = _ngram_bit_tables(bits, device)
+    codebook = ngram_mul1_codebook(device)
+    shifts = torch.arange(16, device=device, dtype=torch.int64)
+    out = torch.empty(packed.shape[0], NGRAM_ROW_DIM, dtype=torch.float16, device=device)
+    for s in range(0, packed.shape[0], chunk):
+        p = packed[s : s + chunk]
+        scale = p[:, 0].contiguous().view(torch.float16).to(torch.float32)
+        words = (p.to(torch.int64) & 0xFFFF)[:, widx]
+        state = (((words >> bidx) & 1) << shifts).sum(-1)
+        vals = codebook[state].to(torch.float32)
+        bias = head_bias[heads[s : s + chunk].to(torch.int64)].to(torch.float32)
+        out[s : s + chunk] = (vals * scale.unsqueeze(1) + bias).to(torch.float16)
+    return out
+
+
+class Exl3EmbeddingMethod(QuantizeMethodBase):
+    """Row-wise EXL3 embedding table in exllamav3's n-gram format.
+
+    Each row is stored packed: word 0 holds the row's fp16 scale, the remaining
+    ROW_DIM * K / 16 int16 words hold a tail-biting ring bitstream of 160 K-bit
+    trellis states. A lookup gathers packed rows and decodes them on the fly
+    (mul1 codebook * scale + per-head bias) into fp16, so the table stays at K
+    bits per weight in device memory (32.6 GB for the Qwen3.8-Flash-Next table
+    instead of 102 GB as bf16). Checkpoint layout under the table prefix:
+    ``shard_<i>.trellis`` int16 [rows_per_shard, words], ``head_bias`` fp16
+    [heads, 160], ``head_offsets`` / ``head_vocab_sizes`` int64 [heads],
+    ``layer_multipliers`` int64 [n]. Shard parameters are registered as child
+    modules so vLLM's AutoWeightsLoader lands them by name; they alias one
+    contiguous table used for the gather.
+    """
+
+    def __init__(self, quant_config: Exl3Config, spec: dict[str, Any]) -> None:
+        self.quant_config = quant_config
+        self.bits = int(spec["bits"])
+        self.num_shards = int(spec["num_shards"])
+        self.rows_per_shard = int(spec["rows_per_shard"])
+        self.num_heads = int(spec["num_heads"])
+        self.words = ngram_words_per_row(self.bits)
+        kernel = os.environ.get("VLLM_EXL3_NGRAM_KERNEL", "ext").strip().lower()
+        if kernel not in ("ext", "torch"):
+            raise ValueError(
+                f"VLLM_EXL3_NGRAM_KERNEL must be 'ext' or 'torch', got {kernel!r}"
+            )
+        self.kernel = kernel
+        self._ext = None
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        del input_size, extra_weight_attrs
+        if int(input_size_per_partition) != NGRAM_ROW_DIM:
+            raise ValueError(
+                f"EXL3 n-gram rows are {NGRAM_ROW_DIM} wide; layer asks for "
+                f"{int(input_size_per_partition)}"
+            )
+        total_rows = self.num_shards * self.rows_per_shard
+        parts = [int(s) for s in output_partition_sizes]
+        if int(output_size) != total_rows or parts != [total_rows]:
+            raise ValueError(
+                "EXL3 n-gram table geometry mismatch: vLLM built "
+                f"{int(output_size)} rows (partitions {parts}) but the checkpoint "
+                f"holds {self.num_shards} shards x {self.rows_per_shard} rows = {total_rows}"
+            )
+        _, tp_size = _resolve_tp_geometry(layer)
+        if int(tp_size) != 1:
+            raise RuntimeError("EXL3 n-gram embedding supports tensor parallel size 1 only")
+
+        table = torch.empty(
+            self.num_shards, self.rows_per_shard, self.words, dtype=torch.int16
+        )
+        loaded: set[int] = set()
+        for i in range(self.num_shards):
+            shard = torch.nn.Module()
+            p = Parameter(table[i], requires_grad=False)
+            p.weight_loader = self._make_shard_loader(i, loaded)
+            shard.register_parameter("trellis", p)
+            layer.add_module(f"shard_{i}", shard)
+        aux = {
+            "head_bias": Parameter(
+                torch.zeros(self.num_heads, NGRAM_ROW_DIM, dtype=torch.float16),
+                requires_grad=False,
+            ),
+            "head_offsets": Parameter(
+                torch.full((self.num_heads,), -1, dtype=torch.int64), requires_grad=False
+            ),
+            "head_vocab_sizes": Parameter(
+                torch.zeros(self.num_heads, dtype=torch.int64), requires_grad=False
+            ),
+            "layer_multipliers": Parameter(
+                torch.zeros(0, dtype=torch.int64), requires_grad=False
+            ),
+        }
+        aux_loaded: set[str] = set()
+        for name, p in aux.items():
+            p.weight_loader = self._make_aux_loader(name, aux_loaded)
+            layer.register_parameter(name, p)
+        layer._exl3_ngram_table = table
+        layer._exl3_ngram_loaded = loaded
+        layer._exl3_ngram_aux_loaded = aux_loaded
+        layer._exl3_ngram_dtype = params_dtype
+
+    def _make_shard_loader(self, index: int, loaded: set[int]):
+        rows, words, bits = self.rows_per_shard, self.words, self.bits
+
+        def weight_loader(param: Parameter, loaded_weight: torch.Tensor, loaded_shard_id=None):
+            del loaded_shard_id
+            if loaded_weight.dtype != torch.int16 or tuple(loaded_weight.shape) != (rows, words):
+                raise ValueError(
+                    f"EXL3 n-gram shard {index}: expected int16 ({rows}, {words}) for "
+                    f"K={bits}, got {loaded_weight.dtype} {tuple(loaded_weight.shape)}"
+                )
+            param.data.copy_(loaded_weight)
+            loaded.add(index)
+
+        return weight_loader
+
+    def _make_aux_loader(self, name: str, aux_loaded: set[str]):
+        def weight_loader(param: Parameter, loaded_weight: torch.Tensor, loaded_shard_id=None):
+            del loaded_shard_id
+            if name == "layer_multipliers":
+                param.data = loaded_weight.to(device=param.device, dtype=param.dtype).clone()
+            else:
+                if tuple(loaded_weight.shape) != tuple(param.shape):
+                    raise ValueError(
+                        f"EXL3 n-gram {name}: expected shape {tuple(param.shape)}, "
+                        f"got {tuple(loaded_weight.shape)}"
+                    )
+                param.data.copy_(loaded_weight.to(dtype=param.dtype))
+            aux_loaded.add(name)
+
+        return weight_loader
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        table = getattr(layer, "_exl3_ngram_table", None)
+        if table is None:
+            return
+        loaded = layer._exl3_ngram_loaded
+        missing = [i for i in range(self.num_shards) if i not in loaded]
+        if missing:
+            raise RuntimeError(
+                f"EXL3 n-gram table: {len(missing)} of {self.num_shards} shards never "
+                f"loaded (first missing: {missing[:8]})"
+            )
+        aux_missing = [
+            n for n in ("head_bias", "head_offsets", "head_vocab_sizes")
+            if n not in layer._exl3_ngram_aux_loaded
+        ]
+        if aux_missing:
+            raise RuntimeError(f"EXL3 n-gram table: aux tensors never loaded: {aux_missing}")
+        if layer.shard_0.trellis.data_ptr() != table.data_ptr():
+            raise RuntimeError(
+                "EXL3 n-gram shard parameters no longer alias the packed table; refusing to serve"
+            )
+        offs = layer.head_offsets.detach().cpu().tolist()
+        sizes = layer.head_vocab_sizes.detach().cpu().tolist()
+        total_rows = self.num_shards * self.rows_per_shard
+        consistent = (
+            offs[0] == 0
+            and all(offs[i + 1] == offs[i] + sizes[i] for i in range(len(offs) - 1))
+            and offs[-1] + sizes[-1] <= total_rows
+        )
+        if not consistent:
+            raise RuntimeError(
+                f"EXL3 n-gram head layout inconsistent with the table: offsets={offs} "
+                f"sizes={sizes} rows={total_rows}"
+            )
+        layer._exl3_ngram_rows = table.view(-1, self.words)
+        layer._exl3_ngram_head_offsets = layer.head_offsets.data.contiguous()
+        layer._exl3_ngram_head_bias = layer.head_bias.data.contiguous()
+        layer._exl3_opaque_name = _exl3_register_opaque_layer(layer, "ngram")
+        if self.kernel == "ext":
+            ext = load_exllamav3_ext()
+            if hasattr(ext, "ngram_dequant"):
+                self._ext = ext
+            else:
+                logger.warning(
+                    "exllamav3_ext has no ngram_dequant; the EXL3 n-gram table falls back "
+                    "to the torch decoder"
+                )
+                self.kernel = "torch"
+        logger.info(
+            "EXL3 n-gram embedding ready: %d shards x %d rows, K=%d, %d heads, "
+            "%.2f GiB packed, kernel=%s",
+            self.num_shards, self.rows_per_shard, self.bits, self.num_heads,
+            table.numel() * 2 / 2**30, self.kernel,
+        )
+
+    def _lookup_packed(self, layer: torch.nn.Module, ids_flat: torch.Tensor) -> torch.Tensor:
+        return layer._exl3_ngram_rows.index_select(0, ids_flat)
+
+    def _heads_for(self, layer: torch.nn.Module, ids_flat: torch.Tensor) -> torch.Tensor:
+        found = torch.searchsorted(layer._exl3_ngram_head_offsets, ids_flat, right=True) - 1
+        return found.clamp_(0, self.num_heads - 1).to(torch.int32)
+
+    def _decode(self, layer: torch.nn.Module, packed: torch.Tensor, heads: torch.Tensor) -> torch.Tensor:
+        bias = layer._exl3_ngram_head_bias
+        if self.kernel == "ext" and self._ext is not None:
+            out = torch.empty(
+                packed.shape[0], NGRAM_ROW_DIM, dtype=torch.float16, device=packed.device
+            )
+            self._ext.ngram_dequant(packed, self.bits, heads, bias, out)
+            return out
+        return ngram_dequant_rows_torch(packed, self.bits, heads, bias)
+
+    def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        name = getattr(layer, "_exl3_opaque_name", None)
+        if name is not None and _EXL3_OPS_READY:
+            return torch.ops.vllm.exl3_ngram_lookup(input_, name)
+        return self._embedding_impl(layer, input_)
+
+    def _embedding_impl(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        if getattr(layer, "_exl3_ngram_rows", None) is None:
+            raise RuntimeError("EXL3 n-gram table was not finalized after weight load")
+        ids = input_.reshape(-1).to(torch.int64)
+        packed = self._lookup_packed(layer, ids)
+        heads = self._heads_for(layer, ids)
+        out = self._decode(layer, packed, heads)
+        return out.to(layer._exl3_ngram_dtype).view(*input_.shape, NGRAM_ROW_DIM)
+
+    def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None):
+        raise NotImplementedError("EXL3 n-gram tables only support embedding lookup")
+
+
+# ---------------------------------------------------------------------------
+# torch.compile opacity: vLLM traces the model forward with fullgraph dynamo, which
+# cannot step into exllamav3's pybind kernels. The dense linear forward and the
+# n-gram lookup run behind vLLM custom ops, looked up by a stable layer name.
+# ---------------------------------------------------------------------------
+
+_EXL3_OPAQUE_LAYERS: dict[str, Any] = {}
+_EXL3_OPS_READY = False
+
+
+def _exl3_register_opaque_layer(layer: torch.nn.Module, kind: str) -> str:
+    stable = (
+        getattr(layer, "_exl3_prefix", None)
+        or getattr(layer, "prefix", None)
+        or getattr(layer, "layer_name", None)
+        or f"id{id(layer)}"
+    )
+    name = f"exl3_{kind}:{stable}"
+    _EXL3_OPAQUE_LAYERS[name] = layer
+    return name
+
+
+def _exl3_linear_forward_op(x: torch.Tensor, layer_name: str) -> torch.Tensor:
+    layer = _EXL3_OPAQUE_LAYERS[layer_name]
+    return layer.quant_method._apply_impl(layer, x)
+
+
+def _exl3_linear_forward_fake(x: torch.Tensor, layer_name: str) -> torch.Tensor:
+    layer = _EXL3_OPAQUE_LAYERS[layer_name]
+    out = int(
+        sum(
+            getattr(
+                layer, "_exl3_linear_true_out", layer._exl3_linear_output_partition_sizes
+            )
+        )
+    )
+    return x.new_empty(*x.shape[:-1], out)
+
+
+def _exl3_ngram_lookup_op(ids: torch.Tensor, layer_name: str) -> torch.Tensor:
+    layer = _EXL3_OPAQUE_LAYERS[layer_name]
+    return layer.quant_method._embedding_impl(layer, ids)
+
+
+def _exl3_ngram_lookup_fake(ids: torch.Tensor, layer_name: str) -> torch.Tensor:
+    layer = _EXL3_OPAQUE_LAYERS[layer_name]
+    return ids.new_empty(*ids.shape, NGRAM_ROW_DIM, dtype=layer._exl3_ngram_dtype)
+
+
+def _exl3_register_custom_ops() -> bool:
+    global _EXL3_OPS_READY
+    if _EXL3_OPS_READY:
+        return True
+    try:
+        try:
+            from vllm.utils.torch_utils import direct_register_custom_op
+        except ImportError:
+            from vllm.utils import direct_register_custom_op
+    except ImportError:
+        return False
+    try:
+        if not hasattr(torch.ops.vllm, "exl3_linear_forward"):
+            direct_register_custom_op(
+                op_name="exl3_linear_forward",
+                op_func=_exl3_linear_forward_op,
+                mutates_args=[],
+                fake_impl=_exl3_linear_forward_fake,
+            )
+        if not hasattr(torch.ops.vllm, "exl3_ngram_lookup"):
+            direct_register_custom_op(
+                op_name="exl3_ngram_lookup",
+                op_func=_exl3_ngram_lookup_op,
+                mutates_args=[],
+                fake_impl=_exl3_ngram_lookup_fake,
+            )
+    except Exception as exc:  # pragma: no cover - registration is best effort
+        logger.warning("EXL3 custom op registration failed; eager fallback: %r", exc)
+        return False
+    _EXL3_OPS_READY = True
+    return True
+
+
+if _VLLM_AVAILABLE and _TORCH_AVAILABLE:
+    _exl3_register_custom_ops()
+
+
 class Exl3LinearMethod(LinearMethodBase):
     """Non-routed (dense) EXL3 linear method for QKV/MLP dense projections.
 
@@ -1917,6 +2543,37 @@ class Exl3LinearMethod(LinearMethodBase):
 
         # K words per shard
         k_words = self.bits * 16
+
+        # EXL3 pads both matrix dims to multiples of 128 (zeros at the end;
+        # padded output columns carry svh = 0, padded input rows only see
+        # zero-extended inputs). Allocate the padded geometry, load the
+        # checkpoint tensors whole, and pad / trim activations in apply().
+        true_in = int(in_per_partition)
+        true_out_sizes = [int(s) for s in output_partition_sizes]
+        in_per_partition = _exl3_pad128(true_in)
+        output_partition_sizes = [_exl3_pad128(s) for s in true_out_sizes]
+        padded = in_per_partition != true_in or output_partition_sizes != true_out_sizes
+        if padded and (bf16_shards or n_shards > 1):
+            raise NotImplementedError(
+                "EXL3 padded linear geometry is supported for single-shard layers "
+                f"without bf16 shards only: in={true_in} out={true_out_sizes}"
+            )
+        if padded:
+            _, _pad_tp = _resolve_tp_geometry(layer)
+            if int(_pad_tp) > 1:
+                raise NotImplementedError(
+                    "EXL3 padded linear geometry requires tensor parallel size 1"
+                )
+            # vLLM registers the bias after create_weights with this instance's
+            # weight_loader; a padded checkpoint bias is trimmed to the true size.
+            _orig_loader = layer.weight_loader
+
+            def _bias_trim_loader(param, loaded_weight, *args, **kwargs):
+                if param.dim() == 1 and int(loaded_weight.shape[0]) > int(param.shape[0]):
+                    loaded_weight = loaded_weight[: int(param.shape[0])]
+                return _orig_loader(param, loaded_weight, *args, **kwargs)
+
+            layer.weight_loader = _bias_trim_loader
 
         # Validate tile alignment for all shards
         for i, out_size in enumerate(output_partition_sizes):
@@ -2014,6 +2671,9 @@ class Exl3LinearMethod(LinearMethodBase):
         layer._exl3_linear_is_qkv = is_qkv_parallel
         layer._exl3_linear_is_merged = is_merged_col_parallel
         layer._exl3_linear_bf16_shards = bf16_shards
+        layer._exl3_linear_padded = padded
+        layer._exl3_linear_true_in = true_in
+        layer._exl3_linear_true_out = true_out_sizes
 
     def _make_weight_loader(
         self,
@@ -2033,6 +2693,66 @@ class Exl3LinearMethod(LinearMethodBase):
             loaded_shard_id: str | int | None = None,
         ) -> None:
             tp_rank, tp_size = _resolve_tp_geometry(layer, param)
+
+            # One checkpoint tensor may span several consecutive shards; vLLM's
+            # WeightsMapper says so with a tuple of shard ids (Qwen3.5/4
+            # in_proj_qkv -> in_proj_qkvz shards (0, 1, 2)). Split it along the
+            # output dimension at the shard boundaries and load each piece.
+            span_ids = None
+            if isinstance(loaded_shard_id, (tuple, list)):
+                span_ids = [int(i) for i in loaded_shard_id]
+            elif loaded_shard_id is None and n_shards > 1:
+                # Already-fused checkpoint tensor on a merged linear: an
+                # output-sized tensor covering every shard is split; per-input
+                # tensors and markers apply to every shard.
+                if suffix in ("suh", "mcg", "mul1"):
+                    span_ids = list(range(n_shards))
+                else:
+                    loaded_out = (
+                        int(loaded_weight.shape[1]) * 16
+                        if suffix == "trellis"
+                        else int(loaded_weight.shape[0])
+                    )
+                    if loaded_out == sum(output_partition_sizes) and loaded_out != int(
+                        output_partition_sizes[0]
+                    ):
+                        span_ids = list(range(n_shards))
+            if span_ids is not None:
+                ids = span_ids
+                if (
+                    not ids
+                    or ids != list(range(ids[0], ids[0] + len(ids)))
+                    or ids[-1] >= n_shards
+                ):
+                    raise ValueError(
+                        f"EXL3 linear: unsupported shard id span {loaded_shard_id} "
+                        f"for n_shards={n_shards}"
+                    )
+                if suffix in ("suh", "mcg", "mul1"):
+                    for i in ids:
+                        weight_loader(param, loaded_weight, i)
+                    return
+                loaded_out = (
+                    int(loaded_weight.shape[1]) * 16
+                    if suffix == "trellis"
+                    else int(loaded_weight.shape[0])
+                )
+                span = sum(output_partition_sizes[i] for i in ids)
+                if loaded_out != span:
+                    raise RuntimeError(
+                        f"EXL3 linear load: {suffix} tensor covers {loaded_out} outputs "
+                        f"but shards {ids} total {span}"
+                    )
+                start = 0
+                for i in ids:
+                    size = output_partition_sizes[i]
+                    if suffix == "trellis":
+                        piece = loaded_weight[:, start // 16 : (start + size) // 16, :]
+                    else:
+                        piece = loaded_weight[start : start + size]
+                    weight_loader(param, piece, i)
+                    start += size
+                return
 
             # Map shard_id to shard index
             shard_idx = 0
@@ -2221,6 +2941,7 @@ class Exl3LinearMethod(LinearMethodBase):
             linears.append(linear)
 
         layer._exl3_linears = linears
+        layer._exl3_opaque_name = _exl3_register_opaque_layer(layer, "linear")
 
         # Keep bf16 weights if present, remove weight staging param if all loaded
         if bf16_shards and hasattr(layer, "weight"):
@@ -2254,6 +2975,16 @@ class Exl3LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        name = getattr(layer, "_exl3_opaque_name", None)
+        if name is not None and _EXL3_OPS_READY:
+            y = torch.ops.vllm.exl3_linear_forward(x, name)
+        else:
+            y = self._apply_impl(layer, x)
+        if bias is not None:
+            y = y + bias
+        return y
+
+    def _apply_impl(self, layer, x: torch.Tensor) -> torch.Tensor:
         linears = getattr(layer, "_exl3_linears", None)
         if not linears:
             raise RuntimeError("EXL3 linear layers were not built after weight load")
@@ -2272,6 +3003,10 @@ class Exl3LinearMethod(LinearMethodBase):
 
         # Cast to contiguous fp16 for EXL3 shards
         x_fp16 = x_2d.to(torch.float16).contiguous()
+        if getattr(layer, "_exl3_linear_padded", False):
+            pad_in = int(layer._exl3_linear_input_size_per_partition) - int(x_fp16.shape[1])
+            if pad_in > 0:
+                x_fp16 = F.pad(x_fp16, (0, pad_in))
 
         # Get bf16 shards and weight if present
         bf16_shards = getattr(layer, "_exl3_linear_bf16_shards", [])
@@ -2308,12 +3043,12 @@ class Exl3LinearMethod(LinearMethodBase):
         else:
             y = outputs[0]
 
+        # Trim padded output columns (svh = 0 there, so they are zeros)
+        if getattr(layer, "_exl3_linear_padded", False):
+            y = y[:, : sum(layer._exl3_linear_true_out)]
+
         # Cast back to input dtype
         y = y.to(dtype=x.dtype)
-
-        # Add bias if provided
-        if bias is not None:
-            y = y + bias
 
         # Restore original shape
         if len(orig_shape) > 2:
