@@ -258,14 +258,25 @@ wrong by construction:
 
 ## Install
 
+`main` now carries unreleased `0.4.0`, with native ExLlamaV3 pack support
+(mul1 codebooks, padded dense geometry, row-wise n-gram embedding tables).
+Until it's tagged, install straight from `main` to get it:
+
+```bash
+pip install git+https://github.com/vcruz305/vllm-exl3@main
+```
+
 Prebuilt wheels ship alongside the runtime wheels on Hugging Face for fast
 one-shot installs — see
 [vcruz305/GLM-5.3-Flash-EXL3-K2-spark-vllm](https://huggingface.co/vcruz305/GLM-5.3-Flash-EXL3-K2-spark-vllm)
-and the recipe repos below. Or install straight from a GitHub release:
+and the recipe repos below. `v0.3.1` is the last tagged release:
 
 ```bash
 pip install https://github.com/vcruz305/vllm-exl3/releases/download/v0.3.1/vllm_exl3-0.3.1-cp312-cp312-linux_aarch64.whl
 ```
+
+The `v0.3.1` tag's `exl3.py` does not import (a module docstring sits above
+`from __future__ import annotations`); use the `v0.3.0` tag or `main` instead.
 
 Check the [releases page](https://github.com/vcruz305/vllm-exl3/releases) for
 the current platform tag; wheels are built per Python/arch combination.
@@ -275,8 +286,10 @@ and will be removed in a future release.
 
 ## Recipes
 
-- [GLM-5.3-Flash EXL3 K2 on NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2-DGX-Spark-recipe)
+- [GLM-5.3-Flash EXL3 K2 on NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2-DGX-Spark-recipe): serving-proven on one or two Sparks.
 - [GLM-5.3-Flash EXL3 K2/K3 mix on NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2K3-mix-DGX-Spark-recipe)
+- [DeepSeek-V4-Flash-Vision EXL3 MixedK on NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory](https://github.com/vcruz305/DeepSeek-V4-Flash-Vision-EXL3-MixedK-DGX-Spark-recipe): mixed-bit routed experts, DSpark speculative decoding, one Spark.
+- [Qwen3.8-Flash-Next EXL3 on NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory](https://github.com/vcruz305/Qwen3.8-Flash-Next-EXL3-DGX-Spark-recipe): native pack, 3.05bpw, one Spark. Preliminary: 27.2-28.0 tok/s no draft, 37.3-41.3 tok/s with MTP k=2.
 
 ## Credits and upstream work
 
