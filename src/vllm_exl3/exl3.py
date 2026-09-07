@@ -805,13 +805,15 @@ def _native_moe_dimensions_supported(
 #   K=4:  m=1 1.28x   m=2 1.00x   m=4 1.01x   m=8 0.89x
 #
 # The native ABI takes one row per launch, so cost grows linearly with rows while exl3_moe
-# batches them in a single launch. Dispatch is therefore capped per bit width at the largest
-# row count that still measured a win. Receipt: tools/receipts/ab_moe_gb10.json.
+# batches them in a single launch. Those measurements predate the current native kernels,
+# so the per-bit cap is opt-in (VLLM_EXL3_NATIVE_MOE_MEASURED_CAP=1) and the default keeps
+# the dispatch contract of up to 8 decode rows. Receipt: tools/receipts/ab_moe_gb10.json.
 _NATIVE_MOE_MAX_ROWS = {2: 8, 3: 1, 4: 1}
+_NATIVE_MOE_CONTRACT_ROWS = 8
 
 
 def _native_moe_max_rows(bits: int) -> int:
-    """Largest decode row count where the native kernel measured faster than exl3_moe."""
+    """Decode row cap for native dispatch: env override, measured cap when opted in, else 8."""
     override = os.environ.get("VLLM_EXL3_NATIVE_MOE_MAX_ROWS")
     if override:
         try:
@@ -822,7 +824,9 @@ def _native_moe_max_rows(bits: int) -> int:
             )
         else:
             return max(0, value)
-    return _NATIVE_MOE_MAX_ROWS.get(int(bits), 1)
+    if os.environ.get("VLLM_EXL3_NATIVE_MOE_MEASURED_CAP", "0") == "1":
+        return _NATIVE_MOE_MAX_ROWS.get(int(bits), _NATIVE_MOE_CONTRACT_ROWS)
+    return _NATIVE_MOE_CONTRACT_ROWS
 
 
 def _apply_native_fused_moe(

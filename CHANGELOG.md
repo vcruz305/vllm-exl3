@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Native fused-MoE decode-row cap measured on GB10 (K2: 8 rows, K3/K4: 1) ships as an opt-in
+  (`VLLM_EXL3_NATIVE_MOE_MEASURED_CAP=1`, or `VLLM_EXL3_NATIVE_MOE_MAX_ROWS=<n>`); the default keeps
+  the dispatch contract of up to 8 rows. Receipt: `tools/receipts/ab_moe_gb10.json`.
 - Add `Exl3EmbeddingMethod` for row-wise n-gram embedding tables
   (`ngram_embedding`), decoded through the compiled
   `exllamav3_ext.ngram_dequant` kernel or a pure-torch fallback

@@ -20,7 +20,9 @@ import time
 
 import torch
 
-PACK = sys.argv[1] if len(sys.argv) > 1 else "/home/markus/models/Qwen3.8-Flash-Next-exl3-3.05bpw"
+if len(sys.argv) < 2:
+    sys.exit("usage: test_ngram_embedding.py <pack_dir>")
+PACK = sys.argv[1]
 PFX = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding."
 K = 5
 ROWS_PER_SHARD = 2500012
