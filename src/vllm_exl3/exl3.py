@@ -783,14 +783,46 @@ def _native_moe_dimensions_supported(
         return False
     hidden_meta = int(getattr(layer, "_exl3_hidden_size", x2d.shape[1]))
     inter_meta = int(getattr(layer, "_exl3_intermediate_local", 2048))
-    return (
-        1 <= int(x2d.shape[0]) <= 8
+    rows = int(x2d.shape[0])
+    bits = int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", -1)))
+    if not (
+        rows >= 1
         and int(x2d.shape[1]) == hidden_meta == 4096
         and inter_meta in (1024, 2048)
-        and int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", -1)))
-        in (2, 3, 4)
+        and bits in (2, 3, 4)
         and len(inners) > 0
-    )
+    ):
+        return False
+    return rows <= _native_moe_max_rows(bits)
+
+
+# Measured on one GB10 (sm_121) against exllamav3 exl3_moe in the same process, identical
+# experts and routing, 288 experts, top-8, hidden 4096, intermediate 2048. Speedup of
+# p2b_fused_moe over exl3_moe, median of 50 launches with fresh routing per launch:
+#
+#   K=2:  m=1 1.69x   m=2 1.21x   m=4 1.23x   m=8 1.06x
+#   K=3:  m=1 1.27x   m=2 0.95x   m=4 0.96x   m=8 0.82x
+#   K=4:  m=1 1.28x   m=2 1.00x   m=4 1.01x   m=8 0.89x
+#
+# The native ABI takes one row per launch, so cost grows linearly with rows while exl3_moe
+# batches them in a single launch. Dispatch is therefore capped per bit width at the largest
+# row count that still measured a win. Receipt: tools/receipts/ab_moe_gb10.json.
+_NATIVE_MOE_MAX_ROWS = {2: 8, 3: 1, 4: 1}
+
+
+def _native_moe_max_rows(bits: int) -> int:
+    """Largest decode row count where the native kernel measured faster than exl3_moe."""
+    override = os.environ.get("VLLM_EXL3_NATIVE_MOE_MAX_ROWS")
+    if override:
+        try:
+            value = int(override)
+        except ValueError:
+            logger.warning(
+                "Ignoring non-integer VLLM_EXL3_NATIVE_MOE_MAX_ROWS=%r", override
+            )
+        else:
+            return max(0, value)
+    return _NATIVE_MOE_MAX_ROWS.get(int(bits), 1)
 
 
 def _apply_native_fused_moe(
@@ -1177,11 +1209,11 @@ def apply_exl3_fused_moe(
             )
         return out
 
+    fat = counts > FAT_EXPERT_THRESHOLD
     # counts[e] cannot exceed the row count, so with no more rows than the
     # threshold no expert can be fat. Testing that Python-side first keeps the
     # device sync below off the decode path, where graph capture forbids it.
     fat_possible = tokens > FAT_EXPERT_THRESHOLD
-    fat = counts > FAT_EXPERT_THRESHOLD
     fat_route = torch.zeros_like(local, dtype=torch.bool)
     if fat_possible and bool(fat.any().item()):
         safe_local = local.clamp(min=0, max=max(n_exp - 1, 0))
@@ -1417,10 +1449,6 @@ class Exl3Config(QuantizationConfig):
         if self.bits not in (2, 3, 4, 5, 6):
             raise ValueError(f"unsupported EXL3 bits={self.bits}")
 
-    def get_name(self) -> str:
-        return "exl3"
-
-    _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
     def _mtp_expert_method(self, layer, prefix):
         """Quant method for draft/MTP experts, which stay in the base format.
@@ -1451,6 +1479,11 @@ class Exl3Config(QuantizationConfig):
             if method is not None:
                 return method, "non_routed"
         return None, "none"
+
+    def get_name(self) -> str:
+        return "exl3"
+
+    _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
     def bits_for_prefix(self, prefix: str) -> int:
         """Per-layer K: `layer_bits` entry for this layer, else the base K."""
