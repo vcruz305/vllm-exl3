@@ -134,6 +134,43 @@ This prevents long prompt prefill from starving parallel decode steps and stalli
 |---|---|---|
 | `Glm5Next` (GLM-5.3-Flash) | serving-proven | GLM-5.3-Flash EXL3 K2 / K2K3-mix |
 | `DeepseekV4` (DeepSeek-V4-Flash) | serving-proven on stock vLLM 0.28.0 (text, DSpark draft) and on the vLLM nightly vision class (text + images + DSpark draft, 64k context, tool calling); three small serving-side patches live in the recipe | DSV4-Flash-Vision EXL3 MixedK |
+| `Qwen4ExpForConditionalGeneration` (Qwen3.8-Flash-Next) | serving-proven, native ExLlamaV3 pack (fractional-bit mul1 experts, padded dense linears, row-wise n-gram embedding table); three small vLLM patches in `tools/patch_vllm_qwen4_exp/` | [turboderp/Qwen3.8-Flash-Next-exl3](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3), revision `3.05bpw_h5_ng5` |
+
+### Native ExLlamaV3 packs
+
+Beyond packs produced by this project's own conversion path, the plugin also
+serves packs quantized directly by turboderp's ExLlamaV3 tooling ("native"
+packs), which can assign a fractional average bit width (e.g. 3.05 bpw) by
+choosing bits per tensor rather than one width for the whole model. Support
+for this covers:
+
+- the `mul1` codebook (alongside `mcg`), selected per tensor via the packed
+  marker rather than declared once for the whole model;
+- per-tensor K for dense linears and `lm_head` through `non_routed_exl3`;
+- matrices padded to a multiple of 128 so trellis tiles never spill past
+  the real dimension;
+- row-wise n-gram embedding tables (`ngram_embedding`) kept packed instead
+  of expanded to BF16 -- 30.4 GiB on device instead of 102 GB.
+
+A native pack's `config.json` was not written for this plugin, so
+`tools/exl3_pack_tools/` rewrites it (see that directory's README), and
+`model.safetensors.index.json` must list every `*.safetensors` file the pack
+actually ships or vLLM silently skips tensors --
+`tools/exl3_pack_tools/regenerate_safetensors_index.py` rebuilds it from the
+files on disk. `Qwen4ExpForConditionalGeneration` also needs the three vLLM
+patches in `tools/patch_vllm_qwen4_exp/` so vLLM's own model code passes
+`quant_config` through to `lm_head` and the n-gram table at all.
+
+**Preliminary numbers** (2026-09-07, one DGX Spark GB10, 128 GB, 32768
+context, `--gpu-memory-utilization 0.80`, one request, decode excluding
+TTFT):
+
+| Mode | Decode | TTFT (128 tok) | Mean acceptance | Ready | On device | KV cache |
+|---|---|---|---|---|---|---|
+| No draft | 27.2-28.0 tok/s | 0.185 s | -- | ~13 min | 78.6 GiB | 385,570 tokens |
+| MTP k=1 | 33.8-36.4 tok/s | 0.185 s | 1.86 of 2 | ~13 min | 78.6 GiB | 385,570 tokens (no draft) |
+
+Recipe: https://github.com/vcruz305/Qwen3.8-Flash-Next-EXL3-DGX-Spark-recipe
 
 ## Config contract
 
@@ -190,7 +227,33 @@ wrong by construction:
   loads `.trellis/.suh/.svh` plus one `.mcg` or `.mul1` marker; a stale
   BF16 `.weight` for an EXL3 shard is shape-checked and discarded, so a pack
   may overlay EXL3 tensors on top of shards that still carry the BF16 copy.
-  `lm_head` is not covered yet.
+  `lm_head` is covered too: give it its own entry under
+  `non_routed_exl3.layers` (or match it via the short form's `modules`) once
+  the model passes `quant_config=` through to its `ParallelLMHead`. Not every
+  model does this by default -- `Qwen4ExpForConditionalGeneration` needs the
+  vLLM patches in `tools/patch_vllm_qwen4_exp/` first.
+- `ngram_embedding` *(optional)* -- a row-wise n-gram embedding table kept in
+  its packed ExLlamaV3 format instead of expanded to BF16 (e.g. the PLE table
+  in `Qwen4ExpForConditionalGeneration`):
+
+  ```json
+  "ngram_embedding": {
+    "bits": 5,
+    "num_shards": 128,
+    "rows_per_shard": 2500012,
+    "num_heads": 16,
+    "modules": ["ngram_embedding"]
+  }
+  ```
+
+  `modules` matches by prefix suffix, same as `non_routed_exl3`'s short form.
+  The checkpoint stores, per shard, `shard_<i>.trellis` (int16,
+  `[rows_per_shard, 1 + 160*bits/16]`), plus one `head_bias` (fp16,
+  `[num_heads, 160]`), `head_offsets` and `head_vocab_sizes` (int64,
+  `[num_heads]`), and `layer_multipliers` (int64). Tensor parallel size 1
+  only. The dequant kernel is chosen with `VLLM_EXL3_NGRAM_KERNEL=ext`
+  (default, the compiled `exllamav3_ext` kernel) or `=torch` (a pure-PyTorch
+  fallback, used by the CPU-only unit tests and as a correctness cross-check).
 
 ## Install
 
@@ -200,8 +263,11 @@ one-shot installs — see
 and the recipe repos below. Or install straight from a GitHub release:
 
 ```bash
-pip install https://github.com/vcruz305/vllm-exl3/releases/download/v0.2.0/vllm_exl3-0.2.0-py3-none-any.whl
+pip install https://github.com/vcruz305/vllm-exl3/releases/download/v0.3.1/vllm_exl3-0.3.1-cp312-cp312-linux_aarch64.whl
 ```
+
+Check the [releases page](https://github.com/vcruz305/vllm-exl3/releases) for
+the current platform tag; wheels are built per Python/arch combination.
 
 The old `glm53_exl3_plugin` import path still works via a deprecated shim
 and will be removed in a future release.
@@ -267,6 +333,10 @@ Apache-2.0. Redistribution must retain the [NOTICE](NOTICE) file — see
   the nightly vision class. Upstreaming those patches and the `FusedMoE` compat
   layer for other architectures is next; GLM-5.3 remains fork-only until the
   architecture exists upstream.
-- Dense EXL3 for `lm_head` (`ParallelLMHead`) and TP>1 with `bf16_shards`.
+- **Dense EXL3 for `lm_head` (`ParallelLMHead`): done in this release**, via
+  `non_routed_exl3` (plus the vLLM plumbing patches for
+  `Qwen4ExpForConditionalGeneration`). Padded dense geometry and n-gram
+  embedding tables are tensor-parallel-1 only; TP>1 with `bf16_shards`
+  remains open.
 - Fat-expert prefill acceleration (sorted/batched expert dispatch) for extreme
   contexts.

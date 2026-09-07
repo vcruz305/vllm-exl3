@@ -4,6 +4,9 @@
   the EXL3 trellis/MCG format and the compiled kernels this plugin drives.
 - **[vLLM](https://github.com/vllm-project/vllm)** — the serving engine and
   the plugin/quantization interfaces this package registers into.
+- **[turboderp/Qwen3.8-Flash-Next-exl3](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3)**
+  — thank you for the native EXL3 pack used to validate this release's
+  native-pack support (n-gram embedding, mul1 experts, padded dense geometry).
 - **[MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks)**
   (MIT-licensed) — idea and benchmark credits, routed-expert serving path, and
   Fat GEMM CUDA kernels (`csrc/exl3_fat_gemm.cu` and `csrc/exl3_fat_gemm.cuh`
