@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-exl3"
-version = "0.3.1"
+version = "0.4.0"
 description = "EXL3 (ExLlamaV3 trellis/MCG) quantization plugin for vLLM fork runtimes"
 readme = "README.md"
 requires-python = ">=3.12"

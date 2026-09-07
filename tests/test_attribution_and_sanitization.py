@@ -54,12 +54,12 @@ def test_upstream_attribution_present():
 
 
 def test_package_version_and_metadata():
-    """Verify version 0.3.1 in pyproject.toml and setup.py."""
+    """Verify version 0.4.0 in pyproject.toml and setup.py."""
     pyproject_path = os.path.join(REPO_ROOT, "pyproject.toml")
     with open(pyproject_path, "r", encoding="utf-8") as f:
         pyproject = f.read()
 
-    assert 'version = "0.3.1"' in pyproject, "pyproject.toml version is not 0.3.1"
+    assert 'version = "0.4.0"' in pyproject, "pyproject.toml version is not 0.4.0"
     assert 'name = "vllm-exl3"' in pyproject, "pyproject.toml name is not vllm-exl3"
 
     setup_path = os.path.join(REPO_ROOT, "setup.py")
