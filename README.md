@@ -170,6 +170,7 @@ TTFT):
 | No draft | 27.2-28.0 tok/s | 0.185 s | -- | ~13 min | 78.6 GiB | 385,570 tokens |
 | MTP k=1 | 33.8-36.4 tok/s | 0.199 s | 1.86 of 2 | ~13 min | 78.6 GiB | 275,636 tokens |
 | MTP k=2 | 37.3-41.3 tok/s | 0.201 s | 2.54 of 3 | ~13 min | 78.6 GiB | 275,636 tokens (MTP) |
+| MTP k=3 | 34.4-38.2 tok/s | 0.21 s | 2.95 of 4 | ~11 min | 78.6 GiB | 224,694 tokens |
 
 Recipe: https://github.com/vcruz305/Qwen3.8-Flash-Next-EXL3-DGX-Spark-recipe
 
