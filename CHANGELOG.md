@@ -58,6 +58,16 @@
   Spark performance and full-model TP1/TP2 qualification remain required; no
   new throughput result is claimed.
 
+### Added
+
+- `VLLM_EXL3_PREFILL_SYNC=<max_rows>`: synchronizes the device before each EXL3
+  dense or routed-expert call whose row count is between 2 and max_rows (never
+  during CUDA graph capture, never for single-row decode). Workaround for a vLLM
+  nightly V2 model runner wedge on Qwen3.8-Flash-Next where prefills of roughly
+  33 to 144 tokens never complete (EngineCore at 100% CPU, GPU busy at idle
+  power); the same request completes with the synchronizations in place, and
+  decode speed is unchanged. Recommended value 256 on that runner.
+
 ## 0.3.1
 
 - **Super Fat GEMM Prefill Kernel Suite (`csrc/exl3_fat_gemm.cu`, `csrc/exl3_fat_gemm.cuh`)**:

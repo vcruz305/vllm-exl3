@@ -184,6 +184,10 @@ Recipe: https://github.com/vcruz305/Qwen3.8-Flash-Next-EXL3-DGX-Spark-recipe
 
 Short prompts route few rows per expert and never reach the fat-expert prefill path, so a pack can generate fluent text while its long-prompt output is wrong. Before this fix, packs whose gate and up experts carry distinct `suh` rotations (turboderp's native Qwen3.8-Flash-Next pack, for example) scored mean NLL 4.21 over a 6000-token prompt through vLLM against 0.94 through exllamav3 on the same weights; every release up to 0.3.x is affected. After changing anything on the expert path, score a few-thousand-token text with `prompt_logprobs` through vLLM and through exllamav3 on the same token ids and compare per-token NLL; a mean difference above about 0.05 nats is a bug. Setting `VLLM_EXL3_FAT_THRESHOLD=1000000000` disables the fat path as a workaround on older builds.
 
+### Known issue: mid-length prefill wedge on the vLLM nightly V2 runner
+
+On vLLM 0.28.1rc1 nightly with the V2 model runner and Qwen3.8-Flash-Next, prompts of roughly 33 to 144 tokens never complete; EngineCore runs at 100% CPU, GPU utilization remains high at idle power, and the engine never recovers. Shorter prompts of 32 tokens and longer prompts of many thousands of tokens process normally, suggesting a race condition specific to that row-count range. The classic runner cannot serve this architecture, so the issue is confined to the V2 runner. Testing ruled out the sampler backend, CUDA graphs and torch.compile fusion, prefix caching, asynchronous scheduling, and Triton JIT compilation as the root cause. The workaround is to set the environment variable `VLLM_EXL3_PREFILL_SYNC=256`, which makes the plugin synchronize the device before each EXL3 kernel call whose row count falls in the 2 to 256 range; this forces isolation and eliminates the hang. When the workaround is in place, the same request completes normally. Time to first token on affected prompt lengths rises by about 0.1 seconds, while decoding speed remains unchanged and token generation completes at the expected rate.
+
 ## Config contract
 
 The pack's `config.json` must declare the quantization; without it, vLLM
