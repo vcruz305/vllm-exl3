@@ -2515,6 +2515,56 @@ def _prefill_sync(rows: int) -> None:
     if 1 < rows <= _EXL3_PREFILL_SYNC and not torch.cuda.is_current_stream_capturing():
         torch.cuda.synchronize()
 
+
+_EXL3_GEMV_MAX_ROWS = 2
+_EXL3_RECONSTRUCT_THRESHOLD = 144
+
+
+def _env_int(name: str, default: int) -> int:
+    """Return an int from the environment with a fallback."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw, 10)
+    except (ValueError, TypeError):
+        return default
+
+
+_EXL3_RECON_MIN_ROWS = _env_int("VLLM_EXL3_RECONSTRUCT_MIN_ROWS", 9)
+_EXL3_COOP_GEMM = os.environ.get("VLLM_EXL3_COOP_GEMM", "").strip() in ("1", "true", "yes")
+
+
+def _dense_forward(linear, x_fp16: torch.Tensor) -> torch.Tensor:
+    """Route dense calls to GEMV, reconstruct+hgemm, or sliced GEMV based on row count.
+
+    The cooperative trellis GEMM wedges the engine on the vLLM nightly V2 runner
+    for 3 to 144-row dense calls (deterministically on 33 to 144-token prefills,
+    after 30 to 60 minutes of MTP k=2 decoding at 3 rows per sequence). exllamav3's
+    non-cooperative GEMV kernels cover at most 2 rows on K=5 layers, so this
+    dispatcher routes:
+    - rows <= 2: GEMV (non-cooperative, no wedge)
+    - rows 3 to 8: sliced GEMV (2-row chunks, concatenated)
+    - rows 9 to 144: reconstruct+hgemm (bit-identical, prefill-sized calls only)
+    - rows > 144: exllamav3 internally reconstructs
+
+    VLLM_EXL3_COOP_GEMM=1 restores the old dispatch (allows cooperative GEMM).
+    VLLM_EXL3_RECONSTRUCT_MIN_ROWS moves the reconstruct threshold.
+    """
+    rows = x_fp16.shape[0]
+    if _EXL3_COOP_GEMM or rows <= _EXL3_GEMV_MAX_ROWS or rows > _EXL3_RECONSTRUCT_THRESHOLD:
+        return linear.forward(x_fp16, {}, out_dtype=torch.float32)
+    if rows >= _EXL3_RECON_MIN_ROWS:
+        return linear.forward(x_fp16, {"reconstruct": True}, out_dtype=torch.float32)
+    # 3.._EXL3_RECON_MIN_ROWS-1 rows: slices of at most _EXL3_GEMV_MAX_ROWS rows through
+    # the GEMV path, concatenated
+    outs = [
+        linear.forward(x_fp16[i : i + _EXL3_GEMV_MAX_ROWS].contiguous(), {}, out_dtype=torch.float32)
+        for i in range(0, rows, _EXL3_GEMV_MAX_ROWS)
+    ]
+    return torch.cat(outs, dim=0)
+
+
 class Exl3LinearMethod(LinearMethodBase):
     """Non-routed (dense) EXL3 linear method for QKV/MLP dense projections.
 
@@ -3066,7 +3116,7 @@ class Exl3LinearMethod(LinearMethodBase):
                 linear = linears[i]
                 if linear is None:
                     raise RuntimeError(f"EXL3 linear shard {i} is None")
-                out = linear.forward(x_fp16, {}, out_dtype=torch.float32)
+                out = _dense_forward(linear, x_fp16)
                 outputs.append(out)
 
         # Concatenate shards along output dimension
