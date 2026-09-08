@@ -1307,6 +1307,8 @@ def apply_exl3_experts(
     fused: bool | None = None,
 ) -> torch.Tensor:
     """Shipped routed-expert apply. `fused=None` honors EXL3_FUSED_MOE."""
+    if _EXL3_PREFILL_SYNC:
+        _prefill_sync(int(x.numel() // x.shape[-1]))
     inners = getattr(layer, "_exl3_inners", None)
     if not inners:
         raise RuntimeError("EXL3 experts were not built after weight load")
@@ -2491,6 +2493,28 @@ if _VLLM_AVAILABLE and _TORCH_AVAILABLE:
     _exl3_register_custom_ops()
 
 
+
+def _env_prefill_sync_rows() -> int:
+    raw = os.environ.get("VLLM_EXL3_PREFILL_SYNC", "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 256
+
+
+_EXL3_PREFILL_SYNC = _env_prefill_sync_rows()
+
+
+def _prefill_sync(rows: int) -> None:
+    """Workaround for the nightly V2 runner wedge on 33..144-row prefills: serialize the
+    CPU against the device before each EXL3 kernel call of a prefill step. Off unless
+    VLLM_EXL3_PREFILL_SYNC=<max_rows> is set; never inside CUDA graph capture; never for
+    single-row (decode) calls, so decode speed is unchanged."""
+    if 1 < rows <= _EXL3_PREFILL_SYNC and not torch.cuda.is_current_stream_capturing():
+        torch.cuda.synchronize()
+
 class Exl3LinearMethod(LinearMethodBase):
     """Non-routed (dense) EXL3 linear method for QKV/MLP dense projections.
 
@@ -2992,6 +3016,8 @@ class Exl3LinearMethod(LinearMethodBase):
 
     def _apply_impl(self, layer, x: torch.Tensor) -> torch.Tensor:
         linears = getattr(layer, "_exl3_linears", None)
+        if _EXL3_PREFILL_SYNC:
+            _prefill_sync(int(x.numel() // x.shape[-1]))
         if not linears:
             raise RuntimeError("EXL3 linear layers were not built after weight load")
 
