@@ -180,6 +180,10 @@ model's `max_position_embeddings`.
 
 Recipe: https://github.com/vcruz305/Qwen3.8-Flash-Next-EXL3-DGX-Spark-recipe
 
+### Long-prompt quality check
+
+Short prompts route few rows per expert and never reach the fat-expert prefill path, so a pack can generate fluent text while its long-prompt output is wrong. Before this fix, packs whose gate and up experts carry distinct `suh` rotations (turboderp's native Qwen3.8-Flash-Next pack, for example) scored mean NLL 4.21 over a 6000-token prompt through vLLM against 0.94 through exllamav3 on the same weights; every release up to 0.3.x is affected. After changing anything on the expert path, score a few-thousand-token text with `prompt_logprobs` through vLLM and through exllamav3 on the same token ids and compare per-token NLL; a mean difference above about 0.05 nats is a bug. Setting `VLLM_EXL3_FAT_THRESHOLD=1000000000` disables the fat path as a workaround on older builds.
+
 ## Config contract
 
 The pack's `config.json` must declare the quantization; without it, vLLM
