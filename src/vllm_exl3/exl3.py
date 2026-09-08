@@ -2531,38 +2531,33 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-_EXL3_RECON_MIN_ROWS = _env_int("VLLM_EXL3_RECONSTRUCT_MIN_ROWS", 9)
+_EXL3_RECON_MIN_ROWS = _env_int("VLLM_EXL3_RECONSTRUCT_MIN_ROWS", 17)
 _EXL3_COOP_GEMM = os.environ.get("VLLM_EXL3_COOP_GEMM", "").strip() in ("1", "true", "yes")
 
 
 def _dense_forward(linear, x_fp16: torch.Tensor) -> torch.Tensor:
-    """Route dense calls to GEMV, reconstruct+hgemm, or sliced GEMV based on row count.
+    """Dense EXL3 forward with the wedge-prone row range kept off the cooperative GEMM.
 
-    The cooperative trellis GEMM wedges the engine on the vLLM nightly V2 runner
-    for 3 to 144-row dense calls (deterministically on 33 to 144-token prefills,
-    after 30 to 60 minutes of MTP k=2 decoding at 3 rows per sequence). exllamav3's
-    non-cooperative GEMV kernels cover at most 2 rows on K=5 layers, so this
-    dispatcher routes:
-    - rows <= 2: GEMV (non-cooperative, no wedge)
-    - rows 3 to 8: sliced GEMV (2-row chunks, concatenated)
-    - rows 9 to 144: reconstruct+hgemm (bit-identical, prefill-sized calls only)
-    - rows > 144: exllamav3 internally reconstructs
+    exllamav3 dispatches by row count: up to 2 rows run the non-cooperative GEMV
+    (exl3_gemv_int8; the QTIP gemv needs K in 2..4 so it never applies to K=5),
+    3..144 rows run the cooperative trellis GEMM (cudaLaunchCooperativeKernel,
+    grid barriers over a shared lock buffer), and above 144 rows LinearEXL3
+    reconstructs the weight and runs hgemm. On the vLLM nightly V2 model runner
+    the cooperative GEMM wedged the engine on every 33..144-token prefill and,
+    through those prefills, every long MTP run. Routing rows >= 17 through the
+    reconstruct path removed the wedge: a 4-worker MTP k=2 stress that wedged
+    the baseline in 161 s ran clean for 45 minutes (1085 requests) with decode
+    speed unchanged. Rows 3..16 (single-request MTP steps and small batches)
+    keep exllamav3's dispatch; that range ran clean in the same 45 minutes and
+    the reconstruct path would cost about 10x per call there.
 
-    VLLM_EXL3_COOP_GEMM=1 restores the old dispatch (allows cooperative GEMM).
-    VLLM_EXL3_RECONSTRUCT_MIN_ROWS moves the reconstruct threshold.
+    VLLM_EXL3_RECONSTRUCT_MIN_ROWS moves the threshold (17 by default);
+    VLLM_EXL3_COOP_GEMM=1 restores the old dispatch for A/B runs.
     """
-    rows = x_fp16.shape[0]
-    if _EXL3_COOP_GEMM or rows <= _EXL3_GEMV_MAX_ROWS or rows > _EXL3_RECONSTRUCT_THRESHOLD:
-        return linear.forward(x_fp16, {}, out_dtype=torch.float32)
-    if rows >= _EXL3_RECON_MIN_ROWS:
+    rows = int(x_fp16.shape[0])
+    if (not _EXL3_COOP_GEMM) and _EXL3_RECON_MIN_ROWS <= rows <= _EXL3_RECONSTRUCT_THRESHOLD:
         return linear.forward(x_fp16, {"reconstruct": True}, out_dtype=torch.float32)
-    # 3.._EXL3_RECON_MIN_ROWS-1 rows: slices of at most _EXL3_GEMV_MAX_ROWS rows through
-    # the GEMV path, concatenated
-    outs = [
-        linear.forward(x_fp16[i : i + _EXL3_GEMV_MAX_ROWS].contiguous(), {}, out_dtype=torch.float32)
-        for i in range(0, rows, _EXL3_GEMV_MAX_ROWS)
-    ]
-    return torch.cat(outs, dim=0)
+    return linear.forward(x_fp16, {}, out_dtype=torch.float32)
 
 
 class Exl3LinearMethod(LinearMethodBase):
