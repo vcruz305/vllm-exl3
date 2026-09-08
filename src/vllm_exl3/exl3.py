@@ -2515,6 +2515,51 @@ def _prefill_sync(rows: int) -> None:
     if 1 < rows <= _EXL3_PREFILL_SYNC and not torch.cuda.is_current_stream_capturing():
         torch.cuda.synchronize()
 
+
+_EXL3_GEMV_MAX_ROWS = 2
+_EXL3_RECONSTRUCT_THRESHOLD = 144
+
+
+def _env_int(name: str, default: int) -> int:
+    """Return an int from the environment with a fallback."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw, 10)
+    except (ValueError, TypeError):
+        return default
+
+
+_EXL3_RECON_MIN_ROWS = _env_int("VLLM_EXL3_RECONSTRUCT_MIN_ROWS", 17)
+_EXL3_COOP_GEMM = os.environ.get("VLLM_EXL3_COOP_GEMM", "").strip() in ("1", "true", "yes")
+
+
+def _dense_forward(linear, x_fp16: torch.Tensor) -> torch.Tensor:
+    """Dense EXL3 forward with the wedge-prone row range kept off the cooperative GEMM.
+
+    exllamav3 dispatches by row count: up to 2 rows run the non-cooperative GEMV
+    (exl3_gemv_int8; the QTIP gemv needs K in 2..4 so it never applies to K=5),
+    3..144 rows run the cooperative trellis GEMM (cudaLaunchCooperativeKernel,
+    grid barriers over a shared lock buffer), and above 144 rows LinearEXL3
+    reconstructs the weight and runs hgemm. On the vLLM nightly V2 model runner
+    the cooperative GEMM wedged the engine on every 33..144-token prefill and,
+    through those prefills, every long MTP run. Routing rows >= 17 through the
+    reconstruct path removed the wedge: a 4-worker MTP k=2 stress that wedged
+    the baseline in 161 s ran clean for 45 minutes (1085 requests) with decode
+    speed unchanged. Rows 3..16 (single-request MTP steps and small batches)
+    keep exllamav3's dispatch; that range ran clean in the same 45 minutes and
+    the reconstruct path would cost about 10x per call there.
+
+    VLLM_EXL3_RECONSTRUCT_MIN_ROWS moves the threshold (17 by default);
+    VLLM_EXL3_COOP_GEMM=1 restores the old dispatch for A/B runs.
+    """
+    rows = int(x_fp16.shape[0])
+    if (not _EXL3_COOP_GEMM) and _EXL3_RECON_MIN_ROWS <= rows <= _EXL3_RECONSTRUCT_THRESHOLD:
+        return linear.forward(x_fp16, {"reconstruct": True}, out_dtype=torch.float32)
+    return linear.forward(x_fp16, {}, out_dtype=torch.float32)
+
+
 class Exl3LinearMethod(LinearMethodBase):
     """Non-routed (dense) EXL3 linear method for QKV/MLP dense projections.
 
@@ -3066,7 +3111,7 @@ class Exl3LinearMethod(LinearMethodBase):
                 linear = linears[i]
                 if linear is None:
                     raise RuntimeError(f"EXL3 linear shard {i} is None")
-                out = linear.forward(x_fp16, {}, out_dtype=torch.float32)
+                out = _dense_forward(linear, x_fp16)
                 outputs.append(out)
 
         # Concatenate shards along output dimension
