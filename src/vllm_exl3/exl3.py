@@ -989,6 +989,15 @@ def _fat_scratch(
         "w_up": torch.empty(
             (hidden, intermediate), dtype=torch.float16, device=device
         ),
+        # Contiguous per-projection outputs for the distinct-suh branch: the
+        # extension GEMM and Hadamard kernels index row-major contiguous
+        # operands, so column slices of ``gate_up`` must not be handed to them.
+        "g_tmp": torch.empty(
+            (bucketed_cap, intermediate), dtype=torch.float32, device=device
+        ),
+        "u_tmp": torch.empty(
+            (bucketed_cap, intermediate), dtype=torch.float32, device=device
+        ),
     }
     _FAT_SCRATCH_CACHE[key] = scratch
     return scratch
@@ -1069,30 +1078,27 @@ def apply_exl3_batched_fat(
                 w_up = scratch["w_up"]
                 ext.reconstruct(w_gate, gate.trellis, k, mcg, mul1)
                 ext.reconstruct(w_up, up.trellis, k, mcg, mul1)
-                ext.hgemm(gate_h, w_gate, gate_up[:, :intermediate])
-                ext.hgemm(up_h, w_up, gate_up[:, intermediate:])
-                ext.had_r_128(
-                    gate_up[:, :intermediate],
-                    gate_up[:, :intermediate],
-                    None,
-                    gate.svh,
-                    1.0,
-                )
-                ext.had_r_128(
-                    gate_up[:, intermediate:],
-                    gate_up[:, intermediate:],
-                    None,
-                    up.svh,
-                    1.0,
-                )
+                # Contiguous temporaries: ext.hgemm / ext.had_r_128 read and
+                # write row-major contiguous matrices, and a column slice of
+                # ``gate_up`` is neither (see patch_fat_distinct).
+                g_tmp = scratch["g_tmp"][:n_rows]
+                u_tmp = scratch["u_tmp"][:n_rows]
+                ext.hgemm(gate_h, w_gate, g_tmp)
+                ext.hgemm(up_h, w_up, u_tmp)
+                ext.had_r_128(g_tmp, g_tmp, None, gate.svh, 1.0)
+                ext.had_r_128(u_tmp, u_tmp, None, up.svh, 1.0)
             else:
                 w13 = scratch["w13"]
                 ext.reconstruct(w13, packed13, k, mcg, mul1)
                 ext.hgemm(h13, w13, gate_up)
                 ext.had_r_128(gate_up, gate_up, None, svh13, 1.0)
 
-        gate_out = gate_up[:, :intermediate]
-        up_out = gate_up[:, intermediate:]
+        if distinct_suh:
+            gate_out = scratch["g_tmp"][:n_rows]
+            up_out = scratch["u_tmp"][:n_rows]
+        else:
+            gate_out = gate_up[:, :intermediate]
+            up_out = gate_up[:, intermediate:]
         if limit is not None and limit > 0:
             gate_out.clamp_(max=limit)
             up_out.clamp_(min=-limit, max=limit)
