@@ -1,11 +1,11 @@
 """Planning policy for future grouped routed-expert prefill execution.
 
 The performance motivation is informed by public grouped-expert work, including
-MiaAI-Lab's GLM-5.3-Flash E3 results.  This module is independently implemented
-around vllm-exl3's own K2/K3 serving constraints.  It does not reproduce their
-CUDA kernels, routing-table builder, or launcher code.  See docs/provenance.md.
+MiaAI-Lab's GLM-5.3-Flash E3 results. This module is independently implemented
+around vllm-exl3's own K2/K3 serving constraints. It does not reproduce their
+CUDA kernels, routing-table builder, or launcher code. See docs/provenance.md.
 
-The policy deliberately does *not* dispatch a kernel.  It defines a bounded,
+The policy deliberately does *not* dispatch a kernel. It defines a bounded,
 fail-closed contract that a GPU implementation can consume after qualification.
 """
 
@@ -67,13 +67,9 @@ def grouped_prefill_scratch_bytes(
 ) -> int:
     """Conservative scratch budget for one grouped-prefill row window.
 
-    The budget assumes three transient fp16-class regions per row:
-      * gathered hidden input: ``hidden_size`` values;
-      * gate + up intermediates: ``2 * intermediate_size`` values;
-      * activated/down-input values: ``intermediate_size`` values.
-
-    A concrete kernel may require less by fusing stages.  Treat this as an
-    admission/planning ceiling, not a claim about an existing allocation.
+    The budget assumes transient fp16-class storage for a gathered hidden row,
+    gate+up intermediates, and activated/down-input values. A concrete fused
+    kernel may require less; this is an admission ceiling, not a live allocation.
     """
     for name, value in {
         "rows": rows,
@@ -124,9 +120,8 @@ def plan_grouped_prefill(
 ) -> GroupedPrefillPlan:
     """Return a bounded grouped-prefill candidate plan.
 
-    Eligibility intentionally mirrors only invariants needed by a future local
-    kernel contract.  It does not infer CUDA architecture support and does not
-    mean that a grouped kernel is installed.
+    Eligibility covers local format/shape invariants only. It does not infer GPU
+    architecture support and never implies that a grouped executor is installed.
     """
     ints = {
         "bits": bits,
@@ -149,25 +144,17 @@ def plan_grouped_prefill(
     limit = grouped_prefill_max_rows() if max_rows is None else max_rows
     if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
         raise ValueError("max_rows must be a positive integer")
-
-    aligned_limit = (limit // tile_rows) * tile_rows
-    if aligned_limit == 0:
-        aligned_limit = tile_rows
-    window_rows = min(max(routed_rows, 1), aligned_limit) if routed_rows else 0
-    if window_rows:
-        window_rows = min(aligned_limit, math.ceil(window_rows / tile_rows) * tile_rows)
-    windows = math.ceil(routed_rows / window_rows) if window_rows else 0
-    scratch = grouped_prefill_scratch_bytes(
-        window_rows, hidden_size, intermediate_size
-    ) if window_rows else 0
+    if limit < tile_rows:
+        raise ValueError("max_rows must fit at least one tile")
 
     reason = "eligible"
     eligible = True
+    normalized_codebook = str(codebook).strip().lower()
     if not requested:
         eligible, reason = False, "disabled"
     elif bits not in supported:
         eligible, reason = False, f"unsupported_bits:{bits}"
-    elif str(codebook).strip().lower() != "mcg":
+    elif normalized_codebook != "mcg":
         eligible, reason = False, f"unsupported_codebook:{codebook}"
     elif has_mul1:
         eligible, reason = False, "mul1_not_supported"
@@ -178,12 +165,22 @@ def plan_grouped_prefill(
     elif routed_rows <= fat_threshold:
         eligible, reason = False, "below_fat_threshold"
 
+    window_rows = 0
+    windows = 0
+    scratch = 0
+    if eligible:
+        aligned_limit = (limit // tile_rows) * tile_rows
+        required = math.ceil(routed_rows / tile_rows) * tile_rows
+        window_rows = min(required, aligned_limit)
+        windows = math.ceil(routed_rows / window_rows)
+        scratch = grouped_prefill_scratch_bytes(window_rows, hidden_size, intermediate_size)
+
     return GroupedPrefillPlan(
         requested=requested,
         eligible=eligible,
         reason=reason,
         bits=bits,
-        codebook=str(codebook).strip().lower(),
+        codebook=normalized_codebook,
         routed_rows=routed_rows,
         fat_threshold=fat_threshold,
         tile_rows=tile_rows,
