@@ -7,4 +7,4 @@ authors:
     given-names: Victor
     alias: vcruz305
 repository-code: "https://github.com/vcruz305/vllm-exl3"
-license: Apache-2.0
+license: AGPL-3.0-only
