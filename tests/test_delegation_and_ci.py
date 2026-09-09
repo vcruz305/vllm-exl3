@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import sys
+import tomllib
 import types
 
 import pytest
@@ -48,7 +49,6 @@ def test_declared_non_routed_delegate_has_priority(monkeypatch):
     _install_quantization_stub(monkeypatch, getter)
     config = object.__new__(Exl3Config)
     config.non_routed_quantization = {"quant_method": "declared_fp8", "format": "source"}
-
     assert config._non_routed_delegate() == ("delegate", "declared_fp8")
     assert calls == ["declared_fp8"]
 
@@ -60,7 +60,6 @@ def test_invalid_declared_non_routed_delegate_fails_loudly(monkeypatch):
     _install_quantization_stub(monkeypatch, getter)
     config = object.__new__(Exl3Config)
     config.non_routed_quantization = {"quant_method": "missing_fp8", "bits": 8}
-
     with pytest.raises(RuntimeError, match="missing_fp8"):
         config._non_routed_delegate()
 
@@ -75,9 +74,7 @@ def test_invalid_declared_non_routed_delegate_fails_loudly(monkeypatch):
         (4096, 95.4, 128.0, 2.0),
     ],
 )
-def test_context_scaling_rejects_invalid_domains(
-    max_model_len, model_weights_gb, total_mem_gb, mem_util
-):
+def test_context_scaling_rejects_invalid_domains(max_model_len, model_weights_gb, total_mem_gb, mem_util):
     with pytest.raises(ValueError):
         validate_context_scaling(max_model_len, model_weights_gb, total_mem_gb, mem_util)
 
@@ -91,7 +88,6 @@ def test_speculative_filter_rejects_invalid_threshold(threshold):
 def test_speculative_filter_tensor_return_mode_keeps_scalar_on_device():
     probs = torch.tensor([0.9, 0.4, 0.8])
     mask, kept = filter_speculative_candidates(probs, threshold=0.5, return_tensor=True)
-
     assert mask.tolist() == [True, False, False]
     assert isinstance(kept, torch.Tensor)
     assert kept.ndim == 0
@@ -102,10 +98,16 @@ def test_speculative_filter_tensor_return_mode_keeps_scalar_on_device():
 
 def test_license_notice_and_ci_metadata_are_checked_in():
     root = Path(__file__).resolve().parents[1]
-    pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+    with (root / "pyproject.toml").open("rb") as f:
+        project = tomllib.load(f)["project"]
     workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
-    assert 'license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]' in pyproject
+    assert project["license"] == "AGPL-3.0-only"
+    required = {"LICENSE", "LICENSE.APACHE-2.0", "NOTICE", "THIRD_PARTY_NOTICES.md"}
+    assert set(project["license-files"]) == required
+    for filename in required:
+        assert (root / filename).is_file(), f"missing packaged license/notice file: {filename}"
+
     assert "push:" in workflow and "pull_request:" in workflow
     assert "branches: [ main ]" in workflow
     assert "runs-on: ubuntu-latest" in workflow
