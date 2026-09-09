@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.4.2 (2026-09-09)
+
+### Fixed
+
+- Dense EXL3 calls no longer launch exllamav3's cooperative trellis GEMM. Rows 17 to 144 take exllamav3's reconstruct+hgemm path (exact); rows up to 16 keep exllamav3's own dispatch. On the vLLM nightly V2 model runner the cooperative GEMM wedged the engine; a 4-worker MTP stress that wedged within 3 minutes ran clean for 45 minutes once the routing was in place, with decode speed unchanged. `VLLM_EXL3_COOP_GEMM=1` restores the old dispatch; `VLLM_EXL3_RECONSTRUCT_MIN_ROWS` moves the reconstruct threshold.
+- Fat-expert prefill path: the branch for packs whose gate and up projections carry distinct `suh` rotations handed column slices of the shared `gate_up` scratch buffer to kernels requiring contiguous row-major operands. The branch now runs on contiguous fp32 temporaries. Regression test: `tests/test_fat_distinct_suh.py`.
 
 ### Added
 
@@ -8,17 +13,6 @@
 - `src/vllm_exl3/runtime_policy.py` adds independently implemented TP1-oriented policy helpers. Per-bit overrides (`VLLM_EXL3_NATIVE_MOE_MAX_ROWS_K2/K3/K4`) make it possible to A/B K2 separately from K3/K4 instead of forcing one global native-row threshold across different trellis costs. `VLLM_EXL3_FUSED_TEMP_ROWS` exposes the requested fused scratch capacity while preserving the historical 2048-row default.
 - `docs/provenance.md` records exact source/design provenance and establishes commit-message labels for copied/derived work, adapted designs, and independent implementations.
 - `VLLM_EXL3_PREFILL_SYNC=<max_rows>`: synchronizes the device before each EXL3 dense or routed-expert call whose row count is between 2 and max_rows (never during CUDA graph capture, never for single-row decode). Workaround for a vLLM nightly V2 model runner wedge on Qwen3.8-Flash-Next where prefills of roughly 33 to 144 tokens never complete; decode speed is unchanged. Recommended value 256 on that runner.
-
-### Licensing
-
-- vllm-exl3 moves forward under **AGPL-3.0-only** so improvements to modified network-served versions remain available to their users. The prior Apache-2.0 license text is retained in `LICENSE.APACHE-2.0`; all existing MIT/Apache third-party notices remain in `THIRD_PARTY_NOTICES.md` and `NOTICE`.
-- The newer TP1 runtime-policy helpers were independently written around this project's APIs. Recent public MiaAI-Lab GLM serving work is credited as relevant design prior art; no post-relicense scheduler or dense-FP8 source was copied into these helpers.
-
-### Fixed
-
-- Dense EXL3 calls no longer launch exllamav3's cooperative trellis GEMM. Rows 17 to 144 take exllamav3's reconstruct+hgemm path (exact); rows up to 16 keep exllamav3's own dispatch. On the vLLM nightly V2 model runner the cooperative GEMM wedged the engine; a 4-worker MTP stress that wedged within 3 minutes ran clean for 45 minutes once the routing was in place, with decode speed unchanged. `VLLM_EXL3_COOP_GEMM=1` restores the old dispatch; `VLLM_EXL3_RECONSTRUCT_MIN_ROWS` moves the reconstruct threshold.
-- Fat-expert prefill path: the branch for packs whose gate and up projections carry distinct `suh` rotations handed column slices of the shared `gate_up` scratch buffer to kernels requiring contiguous row-major operands. The branch now runs on contiguous fp32 temporaries. Regression test: `tests/test_fat_distinct_suh.py`.
-- Native fused-MoE decode-row cap measured on GB10 (K2: 8 rows, K3/K4: 1) ships as an opt-in (`VLLM_EXL3_NATIVE_MOE_MEASURED_CAP=1`, or `VLLM_EXL3_NATIVE_MOE_MAX_ROWS=<n>`); the default keeps the dispatch contract of up to 8 rows. Receipt: `tools/receipts/ab_moe_gb10.json`.
 - Add `Exl3EmbeddingMethod` for row-wise n-gram embedding tables (`ngram_embedding`), decoded through the compiled `exllamav3_ext.ngram_dequant` kernel or a pure-torch fallback (`VLLM_EXL3_NGRAM_KERNEL=ext|torch`).
 - Add the `ngram_embedding` config spec and its checkpoint layout; tensor parallel size 1 only.
 - Extend `get_quant_method` with branches for `ParallelLMHead` and `VocabParallelEmbedding`.
@@ -34,6 +28,25 @@
 - Extend the native fused MoE ABI with local intermediate width (1024 or 2048) and optional input-clipped SwiGLU while preserving K2/K3/K4 support.
 - Keep legacy native calls compatible and fall back when an older extension cannot implement the requested width or clipping. Rebuild `vllm_exl3_c` to obtain `P2B_MOE_ABI_VERSION=2`.
 - Add CPU dispatch/compatibility tests and CUDA numerical/graph-replay fixtures. Spark performance and full-model TP1/TP2 qualification remain required; no new throughput result is claimed.
+
+### Changed
+
+- Native fused-MoE decode-row cap measured on GB10 (K2: 8 rows, K3/K4: 1) ships as an opt-in (`VLLM_EXL3_NATIVE_MOE_MEASURED_CAP=1`, or `VLLM_EXL3_NATIVE_MOE_MAX_ROWS=<n>`); the default keeps the dispatch contract of up to 8 rows. Receipt: `tools/receipts/ab_moe_gb10.json`.
+- Gate/up input rotations are compared once at load and cached on the expert pack (`_exl3_gate_up_shared_suh`) instead of per expert per prefill chunk, removing a CUDA `torch.equal` from the fat-prefill hot loop. Behaviour is unchanged; a fallback recomputes the flag for callers that bypass `build_exl3_fused_state`.
+
+### Licensing
+
+- vllm-exl3 moves forward under **AGPL-3.0-only** so improvements to modified network-served versions remain available to their users. The prior Apache-2.0 license text is retained in `LICENSE.APACHE-2.0`; all existing MIT/Apache third-party notices remain in `THIRD_PARTY_NOTICES.md` and `NOTICE`.
+- The newer TP1 runtime-policy helpers were independently written around this project's APIs. Recent public MiaAI-Lab GLM serving work is credited as relevant design prior art; no post-relicense scheduler or dense-FP8 source was copied into these helpers.
+
+### Known issues
+
+- Routed-expert calls with small row counts still dispatch exllamav3's cooperative `exl3_moe` kernel, the same kernel family whose dense counterpart wedged the vLLM nightly V2 model runner (see the dense routing fix above). It did not fire in any run behind this release, including a 45-minute 4-worker MTP stress and two full 120-item evaluation suites, but the dense fix does not cover this path. `VLLM_EXL3_MOE_KERNEL` selects the backend if you need to move off it.
+- At 8 concurrent sequences against a small KV pool the scheduler can hold one request back for roughly 16 seconds while the others decode. This is pool-size dependent, reproduces identically on builds before and after this release, and is listed here so it is not mistaken for a regression: pin the pool with `--kv-cache-memory-bytes` when comparing revisions.
+
+### Validation
+
+- One GB10, TP=1. GLM-5.3-Flash K2/K3-mix before and after this release with the KV pool pinned to 5.5 GiB: decode p50 17.0 tok/s both, aggregate 37.9 tok/s both at 4 concurrent and 41.1 against 40.9 at 8, so the release is performance-neutral there. DeepSeek-V4-Flash-Vision ablit serves coherently at 62.0 tok/s aggregate over 8 streams with speculative acceptance 2.72. Qwen3.8-Flash-Next, the only pack that exercises the distinct-`suh` fat-expert branch, scores corpus mean NLL 0.9436 against the exllamav3 reference 0.9422 with top-1 agreement 74.51% against 74.70%, and sits +0.0005 nats from the previous revision on an identical procedure. It serves at 27.9 tok/s greedy decode with 0.303 s TTFT and 979 tok/s prefill on a 1,218-token prompt without a draft head. Score the corpus in one forward: the scorer's default 4,096-token chunking scores the tail without preceding context and costs 0.09 nats on a healthy build.
 
 ## 0.3.1
 
