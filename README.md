@@ -304,7 +304,7 @@ and will be removed in a future release.
 - [GLM-5.3-Flash EXL3 K2 on NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2-DGX-Spark-recipe): serving-proven on one or two Sparks.
 - [GLM-5.3-Flash EXL3 K2/K3 mix on NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2K3-mix-DGX-Spark-recipe)
 - [DeepSeek-V4-Flash-Vision EXL3 MixedK on NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory](https://github.com/vcruz305/DeepSeek-V4-Flash-Vision-EXL3-MixedK-DGX-Spark-recipe): mixed-bit routed experts, DSpark speculative decoding, one Spark.
-- [Qwen3.8-Flash-Next EXL3 on NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory](https://github.com/vcruz305/Qwen3.8-Flash-Next-EXL3-DGX-Spark-recipe): native pack, 3.05bpw, one Spark. Preliminary: 27.2-28.0 tok/s no draft, 37.3-41.3 tok/s with MTP k=2.
+- [Qwen3.8-Flash-Next EXL3 on NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory](https://github.com/vcruz305/Qwen3.8-Flash-Next-EXL3-DGX-Spark-recipe): native pack, 3.05bpw, one Spark with MTP k=2. Greedy decode 47.6 tok/s p50 and 0.300 s TTFT p50, 38.4 tok/s at vendor thinking settings, 1,122 tok/s prefill on a 9.5k-token prompt, sixcat 87.5. The whole model including the n-gram embedding table stays resident in 102 GiB, leaving room for 304k tokens of KV cache; the Q4_K_M GGUF of the same model pages a 95.4 GiB embedding table from disk and runs 1.45x slower to decode and about half as fast to prefill.
 
 ## Credits and upstream work
 
