@@ -40,6 +40,26 @@ Existing integrations include `Glm5Next`, `DeepseekV4`, and `Qwen4ExpForConditio
 
 Start with the [GLM single-Spark recipe](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2-DGX-Spark-recipe) and its [TP1 qualification protocol](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2-DGX-Spark-recipe/blob/main/docs/TP1_POLICY_AB.md).
 
+### Qwen3.8-Flash-Next
+
+`Qwen4ExpForConditionalGeneration` serves from turboderp's native ExLlamaV3 pack
+([Qwen3.8-Flash-Next-exl3](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3), revision `3.05bpw_h5_ng5`),
+including its row-wise n-gram embedding table through `Exl3EmbeddingMethod`. It needs the three vLLM patches in
+`tools/patch_vllm_qwen4_exp/` and the one-time pack rewrites described in the
+[Qwen single-Spark recipe](https://github.com/vcruz305/Qwen3.8-Flash-Next-EXL3-DGX-Spark-recipe).
+
+Measured on one GB10 at TP=1 on plugin revision `6b26e5c` against vLLM `0.28.1rc1.dev324`, MTP k=2, 65,536-token
+context, one request in flight: greedy decode 47.6 tok/s at p50 with 0.300 s TTFT p50, 38.4 tok/s at vendor
+thinking settings, and 1,122 tok/s prefill on a 9,483-token prompt. Weights occupy 79.96 GiB resident with the
+n-gram table included, leaving 11.04 GiB of KV cache, which is 303,951 tokens at 64k context, for 102 to 103 GiB
+of system memory in use and 79.4 GiB on disk. On sixcat-eval v0.5.1 under vendor policy it scores 86.7 on first
+attempt and 90.0 best-of-attempts; the Q4_K_M GGUF of the same model on llama.cpp scores 89.2 and 92.5 on the
+same two bases while decoding 1.45x slower and prefilling at roughly half the rate, because its 95.4 GiB BF16
+embedding table is paged from NVMe rather than held resident.
+
+These figures are a record of that revision on that workload. They are not part of the 0.4.2 qualification target
+above, and they were not re-measured on 0.4.2.
+
 Routed expert weights remain packed at load time. Some fallback/prefill paths reconstruct **temporary FP16 weights for an expert**; packed loading does not mean zero reconstruction or zero scratch memory. The existing tiled fat-GEMM fast path is gated to eligible **K4/MCG**, non-mul1 projections with compatible gate/up input rotations. K2/K3 and distinct-rotation cases retain their applicable fallback paths.
 
 Native MoE ABI 2 includes hidden width 4096 and local intermediate widths 1024/2048 with K2/K3/K4 and optional SwiGLU clipping. These are kernel contract dimensions, not a promise that every model or row count uses the native path. Unsupported cases may fall back. Verify actual dispatch, not only the requested backend or presence of an extension symbol.
