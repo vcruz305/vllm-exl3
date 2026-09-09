@@ -1,0 +1,55 @@
+name: Cache fat-expert SUH compatibility once
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply exact idempotent source patch
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path("src/vllm_exl3/exl3.py")
+          text = p.read_text(encoding="utf-8")
+
+          load_old = '''    n_exp = len(inners)\n    hidden = int(layer._exl3_hidden_size)\n    intermediate = int(layer._exl3_intermediate_local)\n'''
+          load_new = '''    n_exp = len(inners)\n    # Gate/up input rotations are immutable after load. Cache this compatibility\n    # fact once so fat-prefill dispatch never calls torch.equal on CUDA tensors\n    # in the per-expert hot loop.\n    for pack in inners:\n        pack["_exl3_gate_up_shared_suh"] = bool(\n            torch.equal(pack["gate"].suh, pack["up"].suh)\n        )\n    hidden = int(layer._exl3_hidden_size)\n    intermediate = int(layer._exl3_intermediate_local)\n'''
+          hot_old = '''        distinct_suh = not torch.equal(gate.suh, up.suh)\n        if not distinct_suh:\n'''
+          hot_new = '''        shared_suh = inners[e].get("_exl3_gate_up_shared_suh")\n        if shared_suh is None:\n            # Compatibility fallback for callers that bypass build_exl3_fused_state.\n            shared_suh = bool(torch.equal(gate.suh, up.suh))\n            inners[e]["_exl3_gate_up_shared_suh"] = shared_suh\n        distinct_suh = not shared_suh\n        if not distinct_suh:\n'''
+
+          if load_new not in text:
+              if text.count(load_old) != 1:
+                  raise SystemExit(f"load-time cache anchor drifted: {text.count(load_old)} matches")
+              text = text.replace(load_old, load_new, 1)
+          if hot_new not in text:
+              if text.count(hot_old) != 1:
+                  raise SystemExit(f"fat-loop cache anchor drifted: {text.count(hot_old)} matches")
+              text = text.replace(hot_old, hot_new, 1)
+          p.write_text(text, encoding="utf-8")
+          PY
+
+      - name: Validate syntax
+        run: python -m py_compile src/vllm_exl3/exl3.py
+
+      - name: Commit only when changed
+        run: |
+          if git diff --quiet -- src/vllm_exl3/exl3.py; then
+            echo "Already patched."
+            exit 0
+          fi
+          git config user.name "vcruz305"
+          git config user.email "vcruz305@users.noreply.github.com"
+          git add src/vllm_exl3/exl3.py
+          git commit -m "perf(prefill): cache immutable gate-up SUH compatibility at load"
+          git push origin HEAD:main
