@@ -12,7 +12,7 @@ The EXL3 trellis format, codebooks, quantization math, and native packed executi
 
 The original routed-expert vLLM integration and the E2 fat-prefill kernel lineage came from [MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks). Existing copied/derived files and the exact historical MIT commit used are documented in `THIRD_PARTY_NOTICES.md`.
 
-The upstream repository later moved to AGPL-3.0. vllm-exl3 now also moves forward under AGPL-3.0, while retaining the original third-party MIT and Apache notices and preserving its earlier Apache-2.0 license text in `LICENSE.APACHE-2.0`.
+The upstream repository later moved to AGPL-3.0. vllm-exl3 now also moves forward under AGPL-3.0-only, while retaining the original third-party MIT and Apache notices and preserving its earlier Apache-2.0 license text in `LICENSE.APACHE-2.0`.
 
 ## How new work is handled
 
@@ -34,7 +34,21 @@ Recent MiaAI-Lab work demonstrated the value of reducing host-driven expert disp
 - bounded scratch-memory use because TP1 has less memory headroom than a two-node deployment,
 - per-bit decode dispatch rather than assuming one row threshold is optimal for K2/K3/K4.
 
-The initial `runtime_policy.py` implementation is independently written and contains no copied scheduler or dense-FP8 code from the newer MiaAI-Lab commits. Future grouped-prefill work may intentionally derive from the historical MIT snapshot where appropriate; if so, the exact source commit and modifications will be recorded here and in `THIRD_PARTY_NOTICES.md`.
+### Bounded K2/K3 grouped-prefill planning
+
+MiaAI-Lab's E3 grouped fat-expert work (public commit `1a0feb0`) is prior art for the high-level observation that a large routed-MoE prefill can benefit from grouping work on-device rather than driving one fat expert at a time from the host. A verified historical snapshot containing the grouped implementation under MIT is `9cdf84570117a6afc203125a5c01ec61978c4e60`.
+
+`src/vllm_exl3/prefill_policy.py` is **adapted-design / independently written code**, not copied or translated CUDA. It differs intentionally:
+
+- it targets K2/K3 MCG candidates first rather than assuming the upstream K4 packed layout;
+- it defines bounded row windows instead of sizing a persistent workspace for every possible routed row;
+- it exposes conservative scratch accounting as an admission contract;
+- it is architecture-neutral and does not claim that a grouped GPU executor exists;
+- execution remains default-off until a local kernel passes parity, graph-replay, memory, and end-to-end TP1 qualification.
+
+If a future CUDA executor actually reuses or derives from the historical MIT source, that commit must identify the exact upstream files/snapshot and enumerate the local K2/K3 changes in both Git history and `THIRD_PARTY_NOTICES.md`.
+
+The earlier `runtime_policy.py` implementation is likewise independently written and contains no copied scheduler or dense-FP8 code from newer MiaAI-Lab commits.
 
 ## Commit-message standard
 
