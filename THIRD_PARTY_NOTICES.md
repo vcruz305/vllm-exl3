@@ -1,7 +1,8 @@
 # Third-party notices
 
-This project is Apache-2.0. It contains and derives from MIT-licensed work by other authors, whose
-copyright and permission notices are reproduced below as those licences require.
+Current vllm-exl3 releases are distributed as a whole under **AGPL-3.0-only**. Earlier vllm-exl3 releases were Apache-2.0; that historical license text is preserved in `LICENSE.APACHE-2.0`.
+
+This project contains and derives from third-party MIT- and Apache-licensed work. Those original copyright, permission, and attribution notices remain in force for the material they cover and are reproduced below. The project-level AGPL license does not erase or replace those notices.
 
 ---
 
@@ -25,6 +26,8 @@ https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks
   which precedes this project's first commit. Substantial portions of the routed-expert EXL3/MCG
   path, including its pointer-table construction, expert-map pinning and diagnostic strings,
   originate there.
+
+For later optimization work, `docs/provenance.md` distinguishes historical MIT source material from newer upstream work and records whether local changes are copied/derived, adapted designs, or independent implementations.
 
 ```
 MIT License
@@ -96,7 +99,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-
 ---
 
 ## vLLM
@@ -106,4 +108,4 @@ Author: the vLLM project ([vllm-project/vllm](https://github.com/vllm-project/vl
 `_exl3_routed_experts_loader` in `src/vllm_exl3/exl3.py` mirrors the checkpoint-name resolution of
 vLLM's `RoutedExperts.load_weights`, adapted to load one EXL3 tensor per expert instead of taking
 vLLM's fused (3-D) branch. This plugin's custom ops are also registered through vLLM's
-`direct_register_custom_op`. Apache-2.0.
+`direct_register_custom_op`. That source lineage is Apache-2.0.
