@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-exl3"
-version = "0.4.0"
+version = "0.4.1"
 description = "EXL3 (ExLlamaV3 trellis/MCG) quantization plugin for vLLM fork runtimes"
 readme = "README.md"
 requires-python = ">=3.12"
-license = "Apache-2.0"
-license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]
+license = "AGPL-3.0-only"
+license-files = ["LICENSE", "LICENSE.APACHE-2.0", "NOTICE", "THIRD_PARTY_NOTICES.md"]
 authors = [{ name = "Victor Cruz" }]
 keywords = ["vllm", "exl3", "exllamav3", "quantization", "moe", "dgx-spark"]
 
