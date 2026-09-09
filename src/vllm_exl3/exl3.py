@@ -706,6 +706,13 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
 
     device = layer.w13_trellis.device
     n_exp = len(inners)
+    # Gate/up input rotations are immutable after load. Cache this compatibility
+    # fact once so fat-prefill dispatch never calls torch.equal on CUDA tensors
+    # in the per-expert hot loop.
+    for pack in inners:
+        pack["_exl3_gate_up_shared_suh"] = bool(
+            torch.equal(pack["gate"].suh, pack["up"].suh)
+        )
     hidden = int(layer._exl3_hidden_size)
     intermediate = int(layer._exl3_intermediate_local)
 
@@ -1039,7 +1046,12 @@ def apply_exl3_batched_fat(
         h = scratch["h"][:n_rows]
         h13 = scratch["h13"][:n_rows]
         torch.index_select(xh, 0, token_idx, out=h)
-        distinct_suh = not torch.equal(gate.suh, up.suh)
+        shared_suh = inners[e].get("_exl3_gate_up_shared_suh")
+        if shared_suh is None:
+            # Compatibility fallback for callers that bypass build_exl3_fused_state.
+            shared_suh = bool(torch.equal(gate.suh, up.suh))
+            inners[e]["_exl3_gate_up_shared_suh"] = shared_suh
+        distinct_suh = not shared_suh
         if not distinct_suh:
             ext.had_r_128(h, h13, gate.suh, None, 1.0)
 
