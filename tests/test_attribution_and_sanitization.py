@@ -48,7 +48,7 @@ def test_package_version_and_metadata():
     with open(os.path.join(REPO_ROOT, "pyproject.toml"), "rb") as f:
         project = tomllib.load(f)["project"]
     assert project["name"] == "vllm-exl3"
-    assert project["version"] == "0.4.1"
+    assert project["version"] == "0.4.2"
     assert project["license"] == "AGPL-3.0-only"
 
     setup_content = open(os.path.join(REPO_ROOT, "setup.py"), "r", encoding="utf-8").read()
