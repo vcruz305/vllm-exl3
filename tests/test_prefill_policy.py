@@ -34,12 +34,15 @@ def test_tp1_k2_k3_candidates_are_eligible(bits):
     assert plan.scratch_bytes == 1024 * (4096 + 3 * 2048) * 2
 
 
-def test_policy_is_default_off(monkeypatch):
+def test_policy_is_default_off_and_allocates_nothing(monkeypatch):
     monkeypatch.delenv("VLLM_EXL3_GROUPED_PREFILL", raising=False)
     plan = _plan(requested=None)
     assert not plan.requested
     assert not plan.eligible
     assert plan.reason == "disabled"
+    assert plan.window_rows == 0
+    assert plan.windows == 0
+    assert plan.scratch_bytes == 0
 
 
 @pytest.mark.parametrize(
@@ -57,6 +60,9 @@ def test_candidate_contract_fails_closed(overrides, reason):
     plan = _plan(**overrides)
     assert not plan.eligible
     assert plan.reason == reason
+    assert plan.window_rows == 0
+    assert plan.windows == 0
+    assert plan.scratch_bytes == 0
 
 
 def test_large_prefill_is_split_into_bounded_windows():
@@ -70,6 +76,11 @@ def test_small_candidate_rounds_workspace_to_tile_without_exceeding_limit():
     plan = _plan(routed_rows=300, max_rows=1024)
     assert plan.window_rows == 320
     assert plan.windows == 1
+
+
+def test_max_rows_must_hold_at_least_one_tile():
+    with pytest.raises(ValueError, match="one tile"):
+        _plan(max_rows=32, tile_rows=64)
 
 
 def test_env_max_rows_is_validated(monkeypatch):
