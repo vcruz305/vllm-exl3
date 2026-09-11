@@ -10,12 +10,18 @@ Use the model at tensor parallel size 4 **with expert parallelism enabled**.
 
 Under vLLM EP, the routed MoE changes from tensor-sharded experts to whole-expert ownership across the original TP group:
 
-| Layout | Experts/rank | Hidden | Intermediate/rank | First-boot EXL3 path |
+| Layout | Experts/rank | Hidden | Intermediate/rank | EXL3 path |
 |---|---:|---:|---:|---|
-| TP4 only | 384 | 5120 | 576 | Not recommended; exceeds the current fused expert-count envelope and creates a 64-element tail in 128-wide native tiles |
+| TP4 only | 384 | 5120 | 576 | Not recommended; exceeds the current ExLlamaV3 fused expert-count envelope and leaves a 64-element tail in 128-wide native tiles |
 | **TP4 + EP4** | **96** | **5120** | **2304** | **Recommended; full experts, dimensions aligned to 128, within ExLlamaV3's 128-local-expert fused envelope** |
 
-The current native `vllm-exl3` p2b kernel remains qualified for the 4096 x {1024, 2048} family. The first V4.1 boot should therefore use the ExLlamaV3 fused expert executor. A dedicated SM121 5120 x 2304 native specialization is a follow-up optimization, not a correctness prerequisite.
+The safe first V4.1 boot remains the ExLlamaV3 fused expert executor. This branch also generalizes the native cooperative p2b kernel to positive 128-aligned hidden/intermediate dimensions and bumps its ABI to **3**. V4.1 native dispatch is intentionally opt-in until GB10 parity and throughput are measured:
+
+```bash
+export VLLM_EXL3_V41_NATIVE_MOE=1
+```
+
+The Python compatibility layer refuses the V4.1 native geometry unless the loaded extension reports `P2B_MOE_ABI_VERSION >= 3`, preventing an older ABI-2 `.so` from being used accidentally.
 
 ## Required EXL3 pack metadata
 
@@ -97,20 +103,27 @@ Run these gates in order. Never change EXL3, Engram, speculative decoding and CU
    - No persistent BF16 reconstruction of routed experts.
    - Start eager for the first correctness pass.
 
-3. **DSpark-5**
+3. **Native p2b A/B**
+   - Rebuild `vllm_exl3_c` from this branch and verify ABI 3.
+   - Hold the checkpoint, prompts, TP4+EP4 topology and sampling constant.
+   - Baseline with `VLLM_EXL3_V41_NATIVE_MOE` unset.
+   - Candidate with `VLLM_EXL3_V41_NATIVE_MOE=1`.
+   - Require output/parity checks before interpreting throughput.
+
+4. **DSpark-5**
    - Keep DSpark experts source-native.
    - Use five speculative tokens, matching the trained V4.1 block size.
    - Begin with adaptive verification disabled on SM121 until the pinned sparse-MLA stack proves padded/variable graph shapes safe.
 
-4. **CUDA graphs**
+5. **CUDA graphs**
    - Capture only after all runtime JIT kernels are prebuilt/warmed.
    - Record exact capture sizes and verify no decode batch is silently padded into an unsupported sparse-MLA shape.
 
-5. **Context scaling**
+6. **Context scaling**
    - Validate 64K, 128K, 300K, then longer contexts.
    - Record KV token capacity, graph pool, peak unified memory, host headroom and per-rank model residency.
 
-6. **Vision/tools**
+7. **Vision/tools**
    - Text correctness first, then enable the vision encoder and V4.1 tool/reasoning parsers.
    - Run at least one image request and one complete tool-call round trip.
 
@@ -147,6 +160,7 @@ For every meaningful A/B, capture:
 - vLLM image digest and source commit;
 - `vllm-exl3` commit;
 - ExLlamaV3 revision;
+- native p2b ABI;
 - CUDA/Torch/FlashInfer/DeepGEMM versions;
 - TP/EP topology and rank-to-expert ownership;
 - EXL3 K per layer;
