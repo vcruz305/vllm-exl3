@@ -12,6 +12,8 @@ No DeepSeek or vLLM source code is copied into this module.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import math
+import os
 import re
 from typing import Any, Mapping
 
@@ -23,6 +25,8 @@ DEEPSEEK_V41_INTERMEDIATE = 2304
 DEEPSEEK_V41_DSPARK_STAGES = 3
 DEEPSEEK_V41_DSPARK_TOKENS = 5
 EXLLAMAV3_FUSED_EXPERT_LIMIT = 128
+V41_NATIVE_MOE_ENV = "VLLM_EXL3_V41_NATIVE_MOE"
+V41_NATIVE_MOE_ABI = 3
 
 
 def _mapping(value: object) -> Mapping[str, Any]:
@@ -39,6 +43,13 @@ def _normalize_block_size(value: object) -> tuple[int, int] | None:
     if rows <= 0 or cols <= 0:
         return None
     return rows, cols
+
+
+def _env_enabled(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def source_quantization_config(config: object) -> Mapping[str, Any]:
@@ -102,6 +113,21 @@ def should_delegate_dspark_source(
     )
 
 
+def native_p2b_geometry_supported(hidden_size: int, intermediate_size: int) -> bool:
+    """Whether ABI-3 p2b geometry can cover the dimensions without 128 tails."""
+    return (
+        hidden_size > 0
+        and intermediate_size > 0
+        and hidden_size % 128 == 0
+        and intermediate_size % 128 == 0
+    )
+
+
+def v41_native_moe_requested() -> bool:
+    """V4.1 native p2b remains opt-in until GB10 parity/throughput qualification."""
+    return _env_enabled(V41_NATIVE_MOE_ENV, False)
+
+
 @dataclass(frozen=True)
 class DeepseekV41Plan:
     tensor_parallel_size: int
@@ -116,6 +142,8 @@ class DeepseekV41Plan:
     top_k: int
     exllamav3_fused_candidate: bool
     native_p2b_candidate: bool
+    native_p2b_requires_abi: int
+    native_p2b_default_enabled: bool
     preferred_first_boot_backend: str
     reason: str
 
@@ -168,26 +196,23 @@ def plan_deepseek_v41(
 
     exllamav3_candidate = (
         local_experts <= EXLLAMAV3_FUSED_EXPERT_LIMIT
-        and hidden_size % 128 == 0
-        and inter_local % 128 == 0
+        and native_p2b_geometry_supported(hidden_size, inter_local)
     )
-    # Current vllm-exl3 native p2b ABI is still the qualified 4096 x {1024,2048}
-    # family. Keep this false for V4.1 until the dedicated SM121 specialization
-    # is implemented and GPU-qualified.
-    native_candidate = hidden_size == 4096 and inter_local in (1024, 2048)
+    native_candidate = native_p2b_geometry_supported(hidden_size, inter_local)
 
     if expert_parallel and exllamav3_candidate:
         backend = "exllamav3"
         reason = (
             "TP4+EP4 keeps full experts on each rank: 96 local experts at "
-            "5120x2304, within the ExLlamaV3 fused expert-count/alignment envelope"
+            "5120x2304. ExLlamaV3 is the safe first-boot backend; ABI-3 native "
+            "p2b is available as an explicit post-parity A/B."
         )
     elif exllamav3_candidate:
         backend = "exllamav3"
         reason = "layout is fused-compatible, but pure TP is not the preferred Spark path"
     else:
         backend = "loop"
-        reason = "layout exceeds the currently qualified fused EXL3 envelope"
+        reason = "layout exceeds the currently aligned fused EXL3 envelope"
 
     return DeepseekV41Plan(
         tensor_parallel_size=tensor_parallel_size,
@@ -202,19 +227,66 @@ def plan_deepseek_v41(
         top_k=top_k,
         exllamav3_fused_candidate=exllamav3_candidate,
         native_p2b_candidate=native_candidate,
+        native_p2b_requires_abi=V41_NATIVE_MOE_ABI,
+        native_p2b_default_enabled=False,
         preferred_first_boot_backend=backend,
         reason=reason,
     )
 
 
+def _install_native_geometry_wrapper(exl3_module: object) -> None:
+    original = getattr(exl3_module, "_native_moe_dimensions_supported", None)
+    if not callable(original) or bool(
+        getattr(original, "_vllm_exl3_v41_geometry_wrapped", False)
+    ):
+        return
+
+    def dimensions_supported_v41(x2d, layer, inners, limit=None):
+        if original(x2d, layer, inners, limit):
+            return True
+        if not v41_native_moe_requested():
+            return False
+        try:
+            if x2d.dim() != 2 or not x2d.is_cuda:
+                return False
+            if limit is not None and (not math.isfinite(limit) or limit < 0):
+                return False
+            hidden = int(getattr(layer, "_exl3_hidden_size", x2d.shape[1]))
+            intermediate = int(getattr(layer, "_exl3_intermediate_local", 0))
+            bits = int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", -1)))
+            rows = int(x2d.shape[0])
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return False
+
+        if not (
+            hidden == DEEPSEEK_V41_HIDDEN
+            and intermediate == DEEPSEEK_V41_INTERMEDIATE
+            and int(x2d.shape[1]) == hidden
+            and native_p2b_geometry_supported(hidden, intermediate)
+            and bits in (2, 3, 4)
+            and rows >= 1
+            and len(inners) > 0
+        ):
+            return False
+
+        native = exl3_module._load_native_exl3_ext()
+        if native is None or int(getattr(native, "P2B_MOE_ABI_VERSION", 0)) < V41_NATIVE_MOE_ABI:
+            return False
+        return rows <= exl3_module._native_moe_max_rows(bits)
+
+    dimensions_supported_v41._vllm_exl3_v41_geometry_wrapped = True  # type: ignore[attr-defined]
+    setattr(exl3_module, "_native_moe_dimensions_supported", dimensions_supported_v41)
+
+
 def install_deepseek_v41_compat(exl3_module: object) -> None:
     """Install narrow V4.1 compatibility shims onto ``Exl3Config`` once.
 
-    The shim has two jobs only:
+    The shim has three jobs only:
     1. Surface the delegated source block shape through the outer EXL3 config so
        vLLM V4.1 can choose the correct MXFP8 scale naming/layout.
     2. Allow V4.1's 128-expert DSpark blocks to remain source MXFP4 when a pack
        requests ``mtp_experts=source`` but omits a numeric start-layer marker.
+    3. Add an opt-in ABI-3 native geometry path for the aligned EP4 expert shape.
 
     All actual model architecture, attention, Engram, routing and DSpark execution
     remain owned by vLLM.
@@ -261,4 +333,5 @@ def install_deepseek_v41_compat(exl3_module: object) -> None:
         get_quant_method_v41._vllm_exl3_v41_wrapped = True  # type: ignore[attr-defined]
         setattr(config_cls, "get_quant_method", get_quant_method_v41)
 
+    _install_native_geometry_wrapper(exl3_module)
     setattr(exl3_module, "_vllm_exl3_v41_compat_installed", True)
