@@ -19,6 +19,8 @@ __all__ = [
     "source_weight_block_size",
     "is_deepseek_v41_source_quant",
     "should_delegate_dspark_source",
+    "CpuOffloadPlan",
+    "plan_exllamav3_cpu_offload",
 ]
 
 
@@ -75,6 +77,14 @@ def runtime_diagnostics():
         ),
         "recommended_tp4_ep4": plan_deepseek_v41().to_dict(),
     }
+    record["cpu_offload"] = {
+        "execution_available": False,
+        "owner": "external ExLlamaV3 experiment only",
+        "note": (
+            "vllm-exl3 does not provide a host-resident CPU expert executor; "
+            "use plan_exllamav3_cpu_offload() to preflight the external runtime contract"
+        ),
+    }
     return record
 
 
@@ -108,4 +118,7 @@ def __getattr__(name: str):
     }:
         from . import deepseek_v41
         return getattr(deepseek_v41, name)
+    if name in {"CpuOffloadPlan", "plan_exllamav3_cpu_offload"}:
+        from . import cpu_offload
+        return getattr(cpu_offload, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
