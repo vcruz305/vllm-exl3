@@ -34,6 +34,9 @@ def test_native_geometry_accepts_tp1_tp2_and_clipping(intermediate, bits, limit)
      ((1, 4096), True, 2048, 4, math.inf)],
 )
 def test_native_geometry_retains_unsupported_guards(shape, cuda, intermediate, bits, limit):
+    # This is the legacy/default Python geometry policy. DeepSeek V4.1's ABI-3
+    # 5120x2304 extension path is installed separately by plugin registration
+    # and remains opt-in until its GB10 qualification completes.
     x = SimpleNamespace(shape=shape, is_cuda=cuda, dim=lambda: len(shape))
     layer = SimpleNamespace(_exl3_intermediate_local=intermediate, _exl3_k=bits)
     assert not exl3._native_moe_dimensions_supported(x, layer, [{}], limit)
@@ -44,7 +47,7 @@ def native_cuda():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for native MoE numerical checks")
     extension = pytest.importorskip("vllm_exl3_c")
-    assert getattr(extension, "P2B_MOE_ABI_VERSION", 1) >= 2, "rebuild vllm_exl3_c for MoE ABI 2"
+    assert getattr(extension, "P2B_MOE_ABI_VERSION", 1) >= 2, "rebuild vllm_exl3_c for MoE ABI 2+"
     return extension
 
 
@@ -148,6 +151,80 @@ def test_native_moe_clipping_width_and_graph_parity(native_cuda, bits, intermedi
     assert storage
 
 
+def test_native_moe_v41_5120x2304_numerical_parity(native_cuda, monkeypatch):
+    """Representative ABI-3 parity gate for one full V4.1 EP expert geometry."""
+    if getattr(native_cuda, "P2B_MOE_ABI_VERSION", 0) < 3:
+        pytest.skip("rebuild vllm_exl3_c for dynamic-geometry MoE ABI 3")
+
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    torch.manual_seed(41)
+    device = torch.device("cuda")
+    bits = 2
+    hidden = 5120
+    intermediate = 2304
+
+    def projection(in_features, out_features, output_scale):
+        trellis = torch.randint(
+            -32768,
+            32767,
+            (in_features // 16, out_features // 16, 16 * bits),
+            dtype=torch.int16,
+        )
+        suh = torch.full((in_features,), 1.0 / 64, dtype=torch.float16)
+        svh = torch.full((out_features,), output_scale, dtype=torch.float16)
+        dense = native_cuda.dequant_trellis(trellis, suh, svh, bits, True).to(device).float()
+        storage = (trellis.to(device), suh.to(device), svh.to(device))
+        ptrs = [
+            torch.tensor([tensor.data_ptr()], dtype=torch.int64, device=device)
+            for tensor in storage
+        ]
+        return storage, ptrs, dense
+
+    gate_storage, gate_ptrs, gate_dense = projection(hidden, intermediate, 4.0)
+    up_storage, up_ptrs, up_dense = projection(hidden, intermediate, 4.0)
+    down_storage, down_ptrs, down_dense = projection(intermediate, hidden, 1.0)
+    storage = (gate_storage, up_storage, down_storage)
+    ptrs = gate_ptrs + up_ptrs + down_ptrs
+
+    x = torch.randn(1, hidden, dtype=torch.float16, device=device)
+    ids = torch.zeros(1, dtype=torch.int32, device=device)
+    weights = torch.ones(1, dtype=torch.float16, device=device)
+    out = torch.empty_like(x)
+    limit = 10.0
+
+    g = (x.float() @ gate_dense).half().float().clamp(max=limit)
+    u = (x.float() @ up_dense).half().float().clamp(min=-limit, max=limit)
+    h = (torch.nn.functional.silu(g) * u).half()
+    expected = (h.float() @ down_dense).half().float()
+
+    native_cuda.p2b_fused_moe(
+        x,
+        out,
+        *ptrs,
+        ids,
+        weights,
+        bits,
+        bits,
+        bits,
+        True,
+        intermediate,
+        limit,
+    )
+    torch.cuda.synchronize()
+
+    actual = out.float()
+    assert torch.isfinite(actual).all()
+    relative_error = (actual - expected).norm() / expected.norm().clamp_min(1e-8)
+    assert relative_error < 0.01, f"relative error: {relative_error.item()}"
+    torch.testing.assert_close(
+        actual,
+        expected,
+        rtol=0.01,
+        atol=0.01 * expected.abs().max().item(),
+    )
+    assert storage
+
+
 @pytest.mark.parametrize("bad", ["rows", "width", "negative_limit", "nan_limit", "strided_pointers"])
 def test_native_moe_rejects_unsafe_calls_before_launch(native_cuda, bad):
     x = torch.zeros(1, 4096, dtype=torch.float16, device="cuda")
@@ -160,7 +237,7 @@ def test_native_moe_rejects_unsafe_calls_before_launch(native_cuda, bad):
     if bad == "rows":
         x = x.repeat(2, 1)
     elif bad == "width":
-        width = 1536
+        width = 1537
     elif bad == "negative_limit":
         limit = -1.0
     elif bad == "nan_limit":

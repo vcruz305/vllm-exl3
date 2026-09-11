@@ -14,20 +14,30 @@ __all__ = [
     "grouped_prefill_max_rows",
     "grouped_prefill_scratch_bytes",
     "plan_grouped_prefill",
+    "DeepseekV41Plan",
+    "plan_deepseek_v41",
+    "source_weight_block_size",
+    "is_deepseek_v41_source_quant",
+    "should_delegate_dspark_source",
 ]
 
 
 def register() -> None:
     # Importing the module executes its register_quantization_config decorator.
     from . import exl3
+    from .deepseek_v41 import install_deepseek_v41_compat
     from .runtime_policy import install_native_row_policy
 
+    # Install model-family compatibility before runtime policy wrappers inspect
+    # the quantization config. vLLM still owns the DeepSeek V4.1 architecture.
+    install_deepseek_v41_compat(exl3)
     install_native_row_policy(exl3)
 
 
 def runtime_diagnostics():
     """Return effective EXL3 runtime policy and extension availability."""
     from . import exl3
+    from .deepseek_v41 import plan_deepseek_v41
     from .prefill_policy import grouped_prefill_enabled, grouped_prefill_max_rows
     from .runtime_policy import diagnostics, fused_temp_rows_requested, native_row_cap
 
@@ -59,6 +69,12 @@ def runtime_diagnostics():
         "max_rows_per_window": grouped_prefill_max_rows(),
         "execution_available": False,
     }
+    record["deepseek_v41"] = {
+        "compat_installed": bool(
+            getattr(exl3, "_vllm_exl3_v41_compat_installed", False)
+        ),
+        "recommended_tp4_ep4": plan_deepseek_v41().to_dict(),
+    }
     return record
 
 
@@ -83,4 +99,13 @@ def __getattr__(name: str):
     }:
         from . import prefill_policy
         return getattr(prefill_policy, name)
+    if name in {
+        "DeepseekV41Plan",
+        "plan_deepseek_v41",
+        "source_weight_block_size",
+        "is_deepseek_v41_source_quant",
+        "should_delegate_dspark_source",
+    }:
+        from . import deepseek_v41
+        return getattr(deepseek_v41, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
