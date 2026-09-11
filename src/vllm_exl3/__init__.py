@@ -21,6 +21,10 @@ __all__ = [
     "should_delegate_dspark_source",
     "CpuOffloadPlan",
     "plan_exllamav3_cpu_offload",
+    "UvaExpertLayerStatus",
+    "inspect_exl3_moe_uva_layer",
+    "validate_exl3_moe_uva_layer",
+    "uva_expert_offload_required",
 ]
 
 
@@ -29,11 +33,13 @@ def register() -> None:
     from . import exl3
     from .deepseek_v41 import install_deepseek_v41_compat
     from .runtime_policy import install_native_row_policy
+    from .uva_offload import install_uva_expert_validation
 
     # Install model-family compatibility before runtime policy wrappers inspect
     # the quantization config. vLLM still owns the DeepSeek V4.1 architecture.
     install_deepseek_v41_compat(exl3)
     install_native_row_policy(exl3)
+    install_uva_expert_validation(exl3)
 
 
 def runtime_diagnostics():
@@ -42,6 +48,10 @@ def runtime_diagnostics():
     from .deepseek_v41 import plan_deepseek_v41
     from .prefill_policy import grouped_prefill_enabled, grouped_prefill_max_rows
     from .runtime_policy import diagnostics, fused_temp_rows_requested, native_row_cap
+    from .uva_offload import (
+        EXL3_MOE_UVA_PARAMETER_SEGMENTS,
+        uva_expert_offload_required,
+    )
 
     native = exl3._load_native_exl3_ext()
     installed = bool(getattr(exl3, "_vllm_exl3_per_bit_policy_installed", False))
@@ -56,13 +66,19 @@ def runtime_diagnostics():
     record = diagnostics(
         backend=exl3.get_moe_kernel_backend(),
         native_available=native is not None,
-        native_abi=int(getattr(native, "P2B_MOE_ABI_VERSION", 0)) if native is not None else 0,
+        native_abi=(
+            int(getattr(native, "P2B_MOE_ABI_VERSION", 0))
+            if native is not None
+            else 0
+        ),
         native_caps=caps,
         fused_rows_actual=exl3.TEMP_ROWS_FUSED,
         fused_rows_requested=fused_temp_rows_requested(exl3.TEMP_ROWS_FUSED),
         fat_threshold=exl3.FAT_EXPERT_THRESHOLD,
         fat_kernel_available=exl3._fat_kernel_available(),
-        spec_schedule=exl3.os.environ.get(exl3.SPECULATIVE_SCHEDULE_ENV, "<default>"),
+        spec_schedule=exl3.os.environ.get(
+            exl3.SPECULATIVE_SCHEDULE_ENV, "<default>"
+        ),
         per_bit_policy_installed=installed,
     )
     record["grouped_prefill"] = {
@@ -81,9 +97,33 @@ def runtime_diagnostics():
         "execution_available": False,
         "owner": "external ExLlamaV3 experiment only",
         "note": (
-            "vllm-exl3 does not provide a host-resident CPU expert executor; "
-            "use plan_exllamav3_cpu_offload() to preflight the external runtime contract"
+            "vllm-exl3 does not provide a host-CPU expert compute backend; "
+            "use plan_exllamav3_cpu_offload() for that external runtime contract"
         ),
+    }
+    record["uva_expert_offload"] = {
+        "requested": uva_expert_offload_required(),
+        "guard_installed": bool(
+            getattr(
+                getattr(exl3, "Exl3MoEMethod", object),
+                "process_weights_after_loading",
+                None,
+            )
+            and bool(
+                getattr(
+                    getattr(
+                        exl3.Exl3MoEMethod,
+                        "process_weights_after_loading",
+                        None,
+                    ),
+                    "_vllm_exl3_uva_guard_wrapped",
+                    False,
+                )
+            )
+        ),
+        "parameter_segments": list(EXL3_MOE_UVA_PARAMETER_SEGMENTS),
+        "execution_model": "GPU kernels over vLLM mapped pinned-host UVA views",
+        "qualification": "experimental; requires real GPU parity/performance testing",
     }
     return record
 
@@ -99,6 +139,7 @@ def __getattr__(name: str):
         "validate_context_scaling",
     }:
         from . import exl3
+
         return getattr(exl3, name)
     if name in {
         "GroupedPrefillPlan",
@@ -108,6 +149,7 @@ def __getattr__(name: str):
         "plan_grouped_prefill",
     }:
         from . import prefill_policy
+
         return getattr(prefill_policy, name)
     if name in {
         "DeepseekV41Plan",
@@ -117,8 +159,19 @@ def __getattr__(name: str):
         "should_delegate_dspark_source",
     }:
         from . import deepseek_v41
+
         return getattr(deepseek_v41, name)
     if name in {"CpuOffloadPlan", "plan_exllamav3_cpu_offload"}:
         from . import cpu_offload
+
         return getattr(cpu_offload, name)
+    if name in {
+        "UvaExpertLayerStatus",
+        "inspect_exl3_moe_uva_layer",
+        "validate_exl3_moe_uva_layer",
+        "uva_expert_offload_required",
+    }:
+        from . import uva_offload
+
+        return getattr(uva_offload, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
