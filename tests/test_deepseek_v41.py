@@ -27,6 +27,30 @@ def _v41_config(**overrides):
     return SimpleNamespace(**values)
 
 
+def _fake_exl3_module(native_abi=3):
+    class FakeConfig:
+        def __init__(self):
+            self.non_routed_quantization = {
+                "quant_method": "deepseek_v4_fp8",
+                "weight_block_size": [32, 32],
+            }
+
+        def get_quant_method(self, layer, prefix):
+            return None
+
+    def existing_dimensions_supported(x2d, layer, inners, limit=None):
+        return False
+
+    return SimpleNamespace(
+        Exl3Config=FakeConfig,
+        _native_moe_dimensions_supported=existing_dimensions_supported,
+        _load_native_exl3_ext=lambda: SimpleNamespace(
+            P2B_MOE_ABI_VERSION=native_abi
+        ),
+        _native_moe_max_rows=lambda bits: 8,
+    )
+
+
 def test_tp4_ep4_is_the_fused_first_boot_layout():
     plan = plan_deepseek_v41()
     assert plan.tensor_parallel_size == 4
@@ -61,6 +85,26 @@ def test_native_geometry_requires_128_aligned_dimensions():
     assert native_p2b_geometry_supported(4096, 2048) is True
     assert native_p2b_geometry_supported(5120, 576) is False
     assert native_p2b_geometry_supported(0, 2304) is False
+
+
+def test_v41_native_geometry_is_opt_in_and_requires_abi3(monkeypatch):
+    x = SimpleNamespace(shape=(1, 5120), is_cuda=True, dim=lambda: 2)
+    layer = SimpleNamespace(
+        _exl3_hidden_size=5120,
+        _exl3_intermediate_local=2304,
+        _exl3_k=2,
+    )
+
+    module = _fake_exl3_module(native_abi=3)
+    install_deepseek_v41_compat(module)
+    assert not module._native_moe_dimensions_supported(x, layer, [{}], 10.0)
+
+    monkeypatch.setenv("VLLM_EXL3_V41_NATIVE_MOE", "1")
+    assert module._native_moe_dimensions_supported(x, layer, [{}], 10.0)
+
+    stale = _fake_exl3_module(native_abi=2)
+    install_deepseek_v41_compat(stale)
+    assert not stale._native_moe_dimensions_supported(x, layer, [{}], 10.0)
 
 
 def test_source_quantization_traits_surface_v41_mxfp8_block_shape():
@@ -118,28 +162,12 @@ def test_dspark_inference_fails_closed_without_source_request():
 
 
 def test_installer_surfaces_outer_weight_block_size_and_is_idempotent():
-    class FakeConfig:
-        def __init__(self):
-            self.non_routed_quantization = {
-                "quant_method": "deepseek_v4_fp8",
-                "weight_block_size": [32, 32],
-            }
-
-        def get_quant_method(self, layer, prefix):
-            return None
-
-    def existing_dimensions_supported(x2d, layer, inners, limit=None):
-        return False
-
-    module = SimpleNamespace(
-        Exl3Config=FakeConfig,
-        _native_moe_dimensions_supported=existing_dimensions_supported,
-    )
+    module = _fake_exl3_module()
     install_deepseek_v41_compat(module)
     wrapped_dimensions = module._native_moe_dimensions_supported
     install_deepseek_v41_compat(module)
 
-    config = FakeConfig()
+    config = module.Exl3Config()
     assert config.weight_block_size == [32, 32]
     assert config.has_blocked_weights() is True
     assert module._vllm_exl3_v41_compat_installed is True
