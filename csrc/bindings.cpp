@@ -189,8 +189,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("expert_indices"), py::arg("routing_weights"), py::arg("K_gate"),
           py::arg("K_up"), py::arg("K_down"), py::arg("mcg"),
           py::arg("intermediate_size") = 2048, py::arg("swiglu_limit") = 0.0f);
-    // Python must not pass TP2 pointers or a clipping request to an older binary.
-    m.attr("P2B_MOE_ABI_VERSION") = 2;
+    // ABI 3 adds dynamic 128-aligned hidden/intermediate geometry to the
+    // cooperative p2b MoE path. Python must gate new geometries on this value
+    // so an older ABI-2 binary can never be used for DeepSeek V4.1.
+    m.attr("P2B_MOE_ABI_VERSION") = 3;
     m.def("exl3_fat_gemm", &exl3_fat_gemm, "Native EXL3 fat GEMM for large prefill rows",
           py::arg("a"), py::arg("packed"), py::arg("out"), py::arg("svh"),
           py::arg("K"), py::arg("mcg"), py::arg("mul1"));
