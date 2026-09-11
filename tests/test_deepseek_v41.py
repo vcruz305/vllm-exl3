@@ -3,8 +3,10 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_exl3.deepseek_v41 import (
+    V41_NATIVE_MOE_ABI,
     install_deepseek_v41_compat,
     is_deepseek_v41_source_quant,
+    native_p2b_geometry_supported,
     plan_deepseek_v41,
     should_delegate_dspark_source,
     source_weight_block_size,
@@ -37,7 +39,9 @@ def test_tp4_ep4_is_the_fused_first_boot_layout():
     assert plan.intermediate_size_per_rank == 2304
     assert plan.top_k == 6
     assert plan.exllamav3_fused_candidate is True
-    assert plan.native_p2b_candidate is False
+    assert plan.native_p2b_candidate is True
+    assert plan.native_p2b_requires_abi == V41_NATIVE_MOE_ABI == 3
+    assert plan.native_p2b_default_enabled is False
     assert plan.preferred_first_boot_backend == "exllamav3"
 
 
@@ -50,6 +54,13 @@ def test_pure_tp4_exposes_the_576_wide_problem():
     assert plan.exllamav3_fused_candidate is False
     assert plan.native_p2b_candidate is False
     assert plan.preferred_first_boot_backend == "loop"
+
+
+def test_native_geometry_requires_128_aligned_dimensions():
+    assert native_p2b_geometry_supported(5120, 2304) is True
+    assert native_p2b_geometry_supported(4096, 2048) is True
+    assert native_p2b_geometry_supported(5120, 576) is False
+    assert native_p2b_geometry_supported(0, 2304) is False
 
 
 def test_source_quantization_traits_surface_v41_mxfp8_block_shape():
@@ -117,14 +128,22 @@ def test_installer_surfaces_outer_weight_block_size_and_is_idempotent():
         def get_quant_method(self, layer, prefix):
             return None
 
-    module = SimpleNamespace(Exl3Config=FakeConfig)
+    def existing_dimensions_supported(x2d, layer, inners, limit=None):
+        return False
+
+    module = SimpleNamespace(
+        Exl3Config=FakeConfig,
+        _native_moe_dimensions_supported=existing_dimensions_supported,
+    )
     install_deepseek_v41_compat(module)
+    wrapped_dimensions = module._native_moe_dimensions_supported
     install_deepseek_v41_compat(module)
 
     config = FakeConfig()
     assert config.weight_block_size == [32, 32]
     assert config.has_blocked_weights() is True
     assert module._vllm_exl3_v41_compat_installed is True
+    assert wrapped_dimensions is module._native_moe_dimensions_supported
 
 
 def test_plan_rejects_non_divisible_expert_layout():
