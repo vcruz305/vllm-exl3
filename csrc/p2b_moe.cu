@@ -4,6 +4,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cooperative_groups.h>
 #include <cmath>
+#include <limits>
 
 #include "util.h"
 #include "util.cuh"
@@ -423,11 +424,16 @@ at::Tensor p2b_fused_moe_cuda(const at::Tensor& x, at::Tensor& out,
     int64_t kd, bool mcg, int64_t intermediate_size, float swiglu_limit) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf, "fused MoE requires CUDA fp16 input");
     TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kHalf, "fused MoE output must be CUDA fp16");
-    TORCH_CHECK(x.dim() == 2 && x.size(0) == 1 && x.size(1) == 4096,
-                "fused MoE requires one input row with hidden width 4096");
+    TORCH_CHECK(x.dim() == 2 && x.size(0) == 1,
+                "fused MoE requires exactly one input row");
     TORCH_CHECK(out.sizes() == x.sizes(), "fused MoE output shape must match input");
-    TORCH_CHECK(intermediate_size == 1024 || intermediate_size == 2048,
-                "fused MoE local intermediate width must be 1024 or 2048");
+    TORCH_CHECK(x.size(1) > 0 && x.size(1) % 128 == 0,
+                "fused MoE hidden width must be a positive multiple of 128");
+    TORCH_CHECK(intermediate_size > 0 && intermediate_size % 128 == 0,
+                "fused MoE local intermediate width must be a positive multiple of 128");
+    TORCH_CHECK(x.size(1) <= std::numeric_limits<int>::max() &&
+                intermediate_size <= std::numeric_limits<int>::max(),
+                "fused MoE dimensions exceed int32 kernel indexing");
     TORCH_CHECK(std::isfinite(swiglu_limit) && swiglu_limit >= 0.0f,
                 "fused MoE SwiGLU limit must be finite and nonnegative (0 disables clipping)");
     TORCH_CHECK(mcg && kg == ku && ku == kd && (kg == 2 || kg == 3 || kg == 4), "unsupported fused MoE K");
@@ -449,7 +455,8 @@ at::Tensor p2b_fused_moe_cuda(const at::Tensor& x, at::Tensor& out,
     }
     const c10::cuda::CUDAGuard device_guard(x.device());
     const int e = static_cast<int>(ids.numel());
-    constexpr int m = 1, hidden = 4096;
+    constexpr int m = 1;
+    const int hidden = static_cast<int>(x.size(1));
     const int inter = static_cast<int>(intermediate_size);
 
     auto gate = at::empty({e, m, inter}, x.options());
