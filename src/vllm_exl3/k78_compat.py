@@ -1,14 +1,15 @@
 """K7/K8 configuration compatibility for EXL3.
 
-ExLlamaV3's generic LinearEXL3 path supports the full K2-K8 trellis family,
-while vllm-exl3's native cooperative MoE kernels intentionally remain limited
-to the bit widths they have been qualified for. Historically Exl3Config rejected
-K7/K8 before dispatch could fall back to the generic path.
+ExLlamaV3's EXL3 execution stack includes K1-K8 fused MoE kernel instances and
+supports the K2-K8 trellis family. vllm-exl3's *custom native p2b* kernels are a
+separate path and intentionally remain limited to the bit widths they have been
+qualified for. Historically Exl3Config rejected K7/K8 before dispatch could use
+ExLlamaV3's normal execution path.
 
 This narrow installer widens *configuration acceptance* to K2-K8 without
-claiming native-kernel support for K5-K8. It does not add tensor-level mixed-K
+claiming custom-native support for K5-K8. It does not add tensor-level mixed-K
 inside one RoutedExperts layer; current routed-MoE allocation still expects one
-K per layer.
+K per transformer layer.
 """
 from __future__ import annotations
 
@@ -16,7 +17,6 @@ from copy import deepcopy
 from typing import Any
 
 _ALLOWED = frozenset(range(2, 9))
-_LEGACY_ALLOWED = frozenset(range(2, 7))
 
 
 def _safe_legacy_k(value: object) -> object:
@@ -60,12 +60,12 @@ def _sanitize_non_routed(raw: object) -> tuple[object, dict[str, Any] | None]:
 
 
 def install_k78_config_compat(exl3_module: object) -> bool:
-    """Allow K7/K8 config values while preserving native dispatch guards.
+    """Allow K7/K8 config values while preserving custom-native dispatch guards.
 
-    The underlying Exl3Config currently validates K2-K6. During its constructor
-    only, K7/K8 declarations are temporarily represented as K6 so all unrelated
-    validation/setup runs unchanged. The original K values are restored on the
-    resulting config before any layer quant method is created.
+    The underlying Exl3Config historically validates K2-K6. During its
+    constructor only, K7/K8 declarations are temporarily represented as K6 so
+    unrelated validation/setup runs unchanged. Original K values are restored
+    before any layer quant method is created.
     """
     if bool(getattr(exl3_module, "_vllm_exl3_k78_compat_installed", False)):
         return False
@@ -128,5 +128,5 @@ def supported_config_bits() -> tuple[int, ...]:
 
 
 def native_qualified_bits() -> tuple[int, ...]:
-    # Kept explicit: widening config acceptance must never imply native support.
+    # Custom native p2b only. ExLlamaV3 has a broader K execution family.
     return (2, 3, 4)
