@@ -24,7 +24,6 @@ DEEPSEEK_V41_HIDDEN = 5120
 DEEPSEEK_V41_INTERMEDIATE = 2304
 DEEPSEEK_V41_DSPARK_STAGES = 3
 DEEPSEEK_V41_DSPARK_TOKENS = 5
-EXLLAMAV3_FUSED_EXPERT_LIMIT = 128
 V41_NATIVE_MOE_ENV = "VLLM_EXL3_V41_NATIVE_MOE"
 V41_NATIVE_MOE_ABI = 3
 
@@ -123,6 +122,17 @@ def native_p2b_geometry_supported(hidden_size: int, intermediate_size: int) -> b
     )
 
 
+def exllamav3_fused_geometry_supported(hidden_size: int, intermediate_size: int) -> bool:
+    """Whether the layer geometry is suitable for ExLlamaV3's fused MoE path.
+
+    Expert-count itself is not capped at 128. The historical ``>128`` fallback
+    in vllm-exl3 refers to *tokens routed to one expert* in a batch, not the
+    number of experts owned by the layer. ExLlamaV3's fused kernel accepts a
+    num-experts-sized pointer table and has compiled K1-K8 instances.
+    """
+    return native_p2b_geometry_supported(hidden_size, intermediate_size)
+
+
 def v41_native_moe_requested() -> bool:
     """V4.1 native p2b remains opt-in until GB10 parity/throughput qualification."""
     return _env_enabled(V41_NATIVE_MOE_ENV, False)
@@ -163,9 +173,9 @@ def plan_deepseek_v41(
     """Describe the routed-expert layout for a DeepSeek V4.1 deployment.
 
     Under vLLM expert parallelism, the MoE stops tensor-sharding each expert and
-    instead shards whole experts over the original TP group. This is the desired
-    four-Spark EXL3 layout: 96 complete 5120x2304 experts per rank rather than
-    384 experts with an awkward 576-wide TP partition.
+    instead shards whole experts over the original TP group. TP4 owns 96 complete
+    5120x2304 experts per rank; TP2 owns 192 complete experts per rank. Both EP
+    layouts keep the full 2304 intermediate width and avoid pure-TP4's 576 tail.
     """
     values = {
         "tensor_parallel_size": tensor_parallel_size,
@@ -194,25 +204,23 @@ def plan_deepseek_v41(
         local_experts = global_experts
         inter_local = intermediate_size // tensor_parallel_size
 
-    exllamav3_candidate = (
-        local_experts <= EXLLAMAV3_FUSED_EXPERT_LIMIT
-        and native_p2b_geometry_supported(hidden_size, inter_local)
-    )
+    exllamav3_candidate = exllamav3_fused_geometry_supported(hidden_size, inter_local)
     native_candidate = native_p2b_geometry_supported(hidden_size, inter_local)
 
     if expert_parallel and exllamav3_candidate:
         backend = "exllamav3"
         reason = (
-            "TP4+EP4 keeps full experts on each rank: 96 local experts at "
-            "5120x2304. ExLlamaV3 is the safe first-boot backend; ABI-3 native "
-            "p2b is available as an explicit post-parity A/B."
+            f"TP{tensor_parallel_size}+EP{tensor_parallel_size} keeps {local_experts} "
+            f"full experts per rank at {hidden_size}x{inter_local}. ExLlamaV3 is "
+            "the correctness-first backend; ABI-3 native p2b is an explicit A/B "
+            "for K2-K4 layers only."
         )
     elif exllamav3_candidate:
         backend = "exllamav3"
-        reason = "layout is fused-compatible, but pure TP is not the preferred Spark path"
+        reason = "layout is fused-compatible, but expert parallel is preferred on Spark"
     else:
         backend = "loop"
-        reason = "layout exceeds the currently aligned fused EXL3 envelope"
+        reason = "layout has a 128-wide geometry tail and requires a fallback path"
 
     return DeepseekV41Plan(
         tensor_parallel_size=tensor_parallel_size,
@@ -286,7 +294,7 @@ def install_deepseek_v41_compat(exl3_module: object) -> None:
        vLLM V4.1 can choose the correct MXFP8 scale naming/layout.
     2. Allow V4.1's 128-expert DSpark blocks to remain source MXFP4 when a pack
        requests ``mtp_experts=source`` but omits a numeric start-layer marker.
-    3. Add an opt-in ABI-3 native geometry path for the aligned EP4 expert shape.
+    3. Add an opt-in ABI-3 native geometry path for the aligned V4.1 EP expert shape.
 
     All actual model architecture, attention, Engram, routing and DSpark execution
     remain owned by vLLM.
