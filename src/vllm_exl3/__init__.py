@@ -25,6 +25,8 @@ __all__ = [
     "inspect_exl3_moe_uva_layer",
     "validate_exl3_moe_uva_layer",
     "uva_expert_offload_required",
+    "supported_config_bits",
+    "native_qualified_bits",
 ]
 
 
@@ -32,8 +34,14 @@ def register() -> None:
     # Importing the module executes its register_quantization_config decorator.
     from . import exl3
     from .deepseek_v41 import install_deepseek_v41_compat
+    from .k78_compat import install_k78_config_compat
     from .runtime_policy import install_native_row_policy
     from .uva_offload import install_uva_expert_validation
+
+    # Accept K7/K8 config values before model-family/runtime wrappers inspect the
+    # quantization config. Native MoE dispatch remains separately gated to its
+    # qualified widths; K5-K8 can fall back to generic ExLlamaV3 execution.
+    install_k78_config_compat(exl3)
 
     # Install model-family compatibility before runtime policy wrappers inspect
     # the quantization config. vLLM still owns the DeepSeek V4.1 architecture.
@@ -46,6 +54,7 @@ def runtime_diagnostics():
     """Return effective EXL3 runtime policy and extension availability."""
     from . import exl3
     from .deepseek_v41 import plan_deepseek_v41
+    from .k78_compat import native_qualified_bits, supported_config_bits
     from .prefill_policy import grouped_prefill_enabled, grouped_prefill_max_rows
     from .runtime_policy import diagnostics, fused_temp_rows_requested, native_row_cap
     from .uva_offload import (
@@ -61,7 +70,7 @@ def runtime_diagnostics():
             if installed
             else native_row_cap(bits, exl3._native_moe_max_rows)
         )
-        for bits in (2, 3, 4)
+        for bits in native_qualified_bits()
     }
     record = diagnostics(
         backend=exl3.get_moe_kernel_backend(),
@@ -81,6 +90,19 @@ def runtime_diagnostics():
         ),
         per_bit_policy_installed=installed,
     )
+    record["mixed_k"] = {
+        "config_bits": list(supported_config_bits()),
+        "native_qualified_bits": list(native_qualified_bits()),
+        "k78_config_compat_installed": bool(
+            getattr(exl3, "_vllm_exl3_k78_compat_installed", False)
+        ),
+        "routed_allocation_scope": "one K per RoutedExperts layer",
+        "tensor_level_mixed_k_within_layer": False,
+        "note": (
+            "K7/K8 are accepted for generic fallback execution; this does not add "
+            "tensor-level mixed-K allocation inside one routed-MoE layer."
+        ),
+    }
     record["grouped_prefill"] = {
         "requested": grouped_prefill_enabled(),
         "supported_bits": [2, 3],
@@ -174,4 +196,8 @@ def __getattr__(name: str):
         from . import uva_offload
 
         return getattr(uva_offload, name)
+    if name in {"supported_config_bits", "native_qualified_bits"}:
+        from . import k78_compat
+
+        return getattr(k78_compat, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
