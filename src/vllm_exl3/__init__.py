@@ -39,8 +39,8 @@ def register() -> None:
     from .uva_offload import install_uva_expert_validation
 
     # Accept K7/K8 config values before model-family/runtime wrappers inspect the
-    # quantization config. Native MoE dispatch remains separately gated to its
-    # qualified widths; K5-K8 can fall back to generic ExLlamaV3 execution.
+    # quantization config. ExLlamaV3's normal EXL3 MoE family covers K1-K8;
+    # vllm-exl3's custom native p2b path remains independently gated to K2-K4.
     install_k78_config_compat(exl3)
 
     # Install model-family compatibility before runtime policy wrappers inspect
@@ -92,15 +92,17 @@ def runtime_diagnostics():
     )
     record["mixed_k"] = {
         "config_bits": list(supported_config_bits()),
+        "exllamav3_moe_kernel_bits": list(range(1, 9)),
         "native_qualified_bits": list(native_qualified_bits()),
         "k78_config_compat_installed": bool(
             getattr(exl3, "_vllm_exl3_k78_compat_installed", False)
         ),
-        "routed_allocation_scope": "one K per RoutedExperts layer",
+        "routed_allocation_scope": "one K per RoutedExperts transformer layer",
         "tensor_level_mixed_k_within_layer": False,
         "note": (
-            "K7/K8 are accepted for generic fallback execution; this does not add "
-            "tensor-level mixed-K allocation inside one routed-MoE layer."
+            "K7/K8 are accepted for ExLlamaV3 execution. The custom native p2b "
+            "path remains K2-K4. Current vLLM routed allocation still requires "
+            "one K per RoutedExperts transformer layer."
         ),
     }
     record["grouped_prefill"] = {
