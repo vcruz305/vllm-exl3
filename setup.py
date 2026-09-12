@@ -5,6 +5,15 @@ from setuptools import setup
 
 ROOT = Path(__file__).resolve().parent
 
+def _src(name):
+    """Return a source path relative to setup.py for setuptools >=77.
+    
+    setuptools >=77 rejects absolute paths in Extension() sources
+    but allows them in include_dirs. This helper relativizes only
+    the source file paths against the setup.py directory.
+    """
+    return str((ROOT / "csrc" / name).relative_to(ROOT))
+
 ext_modules = []
 cmdclass = {}
 
@@ -44,12 +53,12 @@ if os.environ.get("VLLM_EXL3_NO_CUDA", "0") != "1":
             CUDAExtension(
                 name="vllm_exl3_c",
                 sources=[
-                    str(ROOT / "csrc" / "bindings.cpp"),
-                    str(ROOT / "csrc" / "exl3_gemv.cu"),
-                    str(ROOT / "csrc" / "p2b_batched.cu"),
-                    str(ROOT / "csrc" / "p2b_moe.cu"),
-                    str(ROOT / "csrc" / "exl3_gemm.cu"),
-                    str(ROOT / "csrc" / "exl3_fat_gemm.cu"),
+                    _src("bindings.cpp"),
+                    _src("exl3_gemv.cu"),
+                    _src("p2b_batched.cu"),
+                    _src("p2b_moe.cu"),
+                    _src("exl3_gemm.cu"),
+                    _src("exl3_fat_gemm.cu"),
                 ],
                 include_dirs=include_dirs,
                 extra_compile_args={

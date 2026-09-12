@@ -1978,11 +1978,30 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             raise ValueError(f"unknown EXL3 shard_id={shard_id}")
 
         if tuple(dest.shape) != tuple(sharded.shape):
-            raise RuntimeError(
-                f"EXL3 load shape mismatch {weight_name} shard={shard_id} "
-                f"expert={expert_id}: dest {tuple(dest.shape)} != "
-                f"loaded {tuple(sharded.shape)}"
+            import os as _os
+            if _os.environ.get("VLLM_EXL3_ALLOW_SHAPE_MISMATCH", "0") != "1":
+                raise RuntimeError(
+                    f"EXL3 load shape mismatch {weight_name} shard={shard_id} "
+                    f"expert={expert_id}: dest {tuple(dest.shape)} != "
+                    f"loaded {tuple(sharded.shape)}. Set "
+                    f"VLLM_EXL3_ALLOW_SHAPE_MISMATCH=1 for diagnostic "
+                    f"loading with partial weight copy."
+                )
+            logger.warning(
+                "EXL3 shape mismatch (DIAGNOSTIC) %s shard=%s expert=%s: "
+                "dest %s != loaded %s — zero-filling, copying overlap. "
+                "Model outputs WILL be incorrect.",
+                weight_name, shard_id, expert_id,
+                tuple(dest.shape), tuple(sharded.shape),
             )
+            if sharded.numel() < dest.numel():
+                dest.zero_()
+                n = min(sharded.numel(), dest.numel())
+                dest.view(-1)[:n] = sharded.contiguous().view(-1)[:n].to(dest.dtype)
+            elif sharded.numel() > dest.numel():
+                sharded = sharded.contiguous().view(-1)[:dest.numel()].reshape(dest.shape)
+                dest.copy_(sharded)
+            return True if return_success else None
         dest.copy_(sharded)
         return True if return_success else None
 
