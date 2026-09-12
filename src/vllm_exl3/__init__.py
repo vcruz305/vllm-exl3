@@ -36,12 +36,18 @@ def register() -> None:
     from .deepseek_v41 import install_deepseek_v41_compat
     from .k78_compat import install_k78_config_compat
     from .runtime_policy import install_native_row_policy
+    from .tp_geometry_compat import install_tp_geometry_compat
     from .uva_offload import install_uva_expert_validation
 
     # Accept K7/K8 config values before model-family/runtime wrappers inspect the
     # quantization config. ExLlamaV3's normal EXL3 MoE family covers K1-K8;
     # vllm-exl3's custom native p2b path remains independently gated to K2-K4.
     install_k78_config_compat(exl3)
+
+    # Current vLLM keeps the authoritative expert TP/EP geometry under
+    # RoutedExperts.moe_config.moe_parallel_config. Resolve that before falling
+    # back to process-wide TP state so EP ranks keep whole expert matrices.
+    install_tp_geometry_compat(exl3)
 
     # Install model-family compatibility before runtime policy wrappers inspect
     # the quantization config. vLLM still owns the DeepSeek V4.1 architecture.
@@ -103,6 +109,18 @@ def runtime_diagnostics():
             "K7/K8 are accepted for ExLlamaV3 execution. The custom native p2b "
             "path remains K2-K4. Current vLLM routed allocation still requires "
             "one K per RoutedExperts transformer layer."
+        ),
+    }
+    record["tp_geometry"] = {
+        "nested_moe_config_compat_installed": bool(
+            getattr(exl3, "_vllm_exl3_tp_geometry_compat_installed", False)
+        ),
+        "resolution_order": (
+            "RoutedExperts.moe_config.moe_parallel_config -> legacy layer attrs -> process TP"
+        ),
+        "note": (
+            "Expert-parallel layouts can have MoE tp_size=1 while process TP is >1; "
+            "weight slicing must use the per-MoE geometry."
         ),
     }
     record["grouped_prefill"] = {
