@@ -7,6 +7,10 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+env:
+  # Keep the required adapter/build check aligned with the DGX Spark runtime lock.
+  EXLLAMAV3_SPARK_REF: be57335b087e4f001c5caae061544df3c06ba01e
+
 jobs:
   lint-and-syntax:
     name: Lint & Python Bytecode Compilation
@@ -31,6 +35,34 @@ jobs:
             fi
           done
 
+      - name: Validate setuptools extension source contract
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          source = Path("setup.py").read_text()
+          tree = ast.parse(source)
+          helpers = {
+              node.name for node in tree.body
+              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+          }
+          assert "_src" in helpers, "setup.py must keep the relative-source _src helper"
+
+          cuda_calls = [
+              node for node in ast.walk(tree)
+              if isinstance(node, ast.Call)
+              and getattr(node.func, "id", None) == "CUDAExtension"
+          ]
+          assert len(cuda_calls) == 1, f"expected one CUDAExtension, found {len(cuda_calls)}"
+          call = cuda_calls[0]
+          sources_kw = next((kw for kw in call.keywords if kw.arg == "sources"), None)
+          assert sources_kw is not None and isinstance(sources_kw.value, (ast.List, ast.Tuple))
+          for item in sources_kw.value.elts:
+              assert isinstance(item, ast.Call), ast.dump(item)
+              assert getattr(item.func, "id", None) == "_src", ast.dump(item)
+          PY
+
   doc-integrity-and-links:
     name: Documentation Integrity & Link Verification
     runs-on: ubuntu-latest
@@ -45,11 +77,11 @@ jobs:
 
       - name: Verify Canonical URLs & Local Documentation Links
         run: |
-          python - << 'EOF'
-          import os, re, sys
+          python - <<'PY'
+          import re
+          import sys
           from pathlib import Path
 
-          # 1. Assert no legacy turboderp/ without -org across docs
           bad_pattern = re.compile(r'https?://github\.com/turboderp/exllamav3[^\s\)\#"`>]*')
           violations = []
           for md in Path('.').glob('*.md'):
@@ -59,12 +91,10 @@ jobs:
                   violations.append(f"{md}: {matches}")
           if violations:
               print("FAILED: Legacy turboderp/exllamav3 URLs found:", file=sys.stderr)
-              for v in violations:
-                  print(f"  {v}", file=sys.stderr)
+              for item in violations:
+                  print(f"  {item}", file=sys.stderr)
               sys.exit(1)
-          print("PASSED: All ExLlamaV3 URLs use canonical turboderp-org namespace.")
 
-          # 2. Check local relative links in README.md
           readme = Path("README.md").read_text(encoding="utf-8")
           local_links = re.findall(r'\[.*?\]\((?!https?://)(.*?)\)', readme)
           missing = []
@@ -73,10 +103,9 @@ jobs:
               if clean and not Path(clean).exists():
                   missing.append(link)
           if missing:
-              print(f"FAILED: Missing local file links referenced in README: {missing}", file=sys.stderr)
+              print(f"FAILED: Missing local README links: {missing}", file=sys.stderr)
               sys.exit(1)
-          print(f"PASSED: All {len(local_links)} local documentation links exist.")
-          EOF
+          PY
 
   unit-tests:
     name: Unit & Attribution Test Suite
@@ -97,11 +126,10 @@ jobs:
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Run Pytest Suite
-        run: |
-          python -m pytest -v
+        run: python -m pytest -v
 
   exllamav3-aarch64-patch-test:
-    name: ExLlamaV3 aarch64 Patch Verification
+    name: Pinned Spark ExLlamaV3 aarch64 Patch Verification
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -112,18 +140,23 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Clone Canonical ExLlamaV3
+      - name: Fetch exact Spark-pinned ExLlamaV3
         run: |
-          git clone --depth 1 https://github.com/turboderp-org/exllamav3.git /tmp/exllamav3_test
-          git -C /tmp/exllamav3_test rev-parse HEAD
+          git init /tmp/exllamav3_test
+          git -C /tmp/exllamav3_test remote add origin https://github.com/turboderp-org/exllamav3.git
+          git -C /tmp/exllamav3_test fetch --depth 1 origin "$EXLLAMAV3_SPARK_REF"
+          git -C /tmp/exllamav3_test checkout --detach FETCH_HEAD
+          test "$(git -C /tmp/exllamav3_test rev-parse HEAD)" = "$EXLLAMAV3_SPARK_REF"
 
-      - name: Execute patch_exllamav3_aarch64.py
+      - name: Execute aarch64 adapter
         run: |
-          python tools/patch_exllamav3_aarch64.py /tmp/exllamav3_test/exllamav3/exllamav3_ext --force
+          python tools/patch_exllamav3_aarch64.py \
+            /tmp/exllamav3_test/exllamav3/exllamav3_ext --force
 
-      - name: Assert x86 Intrinsics Guarded & Yield Replaced
+      - name: Verify guarded x86 intrinsics and aarch64 substitutions
         run: |
-          python tools/verify_exllamav3_aarch64.py /tmp/exllamav3_test/exllamav3/exllamav3_ext
+          python tools/verify_exllamav3_aarch64.py \
+            /tmp/exllamav3_test/exllamav3/exllamav3_ext
 
   packaging-check:
     name: Pure-Python Wheel & SDist Build Check
