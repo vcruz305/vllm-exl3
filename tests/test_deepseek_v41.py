@@ -69,6 +69,17 @@ def test_tp4_ep4_is_the_fused_first_boot_layout():
     assert plan.preferred_first_boot_backend == "exllamav3"
 
 
+def test_tp2_ep2_is_also_exllamav3_fused_candidate():
+    plan = plan_deepseek_v41(tensor_parallel_size=2, expert_parallel=True)
+    assert plan.expert_parallel_size == 2
+    assert plan.local_experts == 192
+    assert plan.intermediate_size_per_rank == 2304
+    assert plan.exllamav3_fused_candidate is True
+    assert plan.native_p2b_candidate is True
+    assert plan.preferred_first_boot_backend == "exllamav3"
+    assert "192 full experts" in plan.reason
+
+
 def test_pure_tp4_exposes_the_576_wide_problem():
     plan = plan_deepseek_v41(expert_parallel=False)
     assert plan.moe_tensor_parallel_size == 4
