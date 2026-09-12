@@ -1987,20 +1987,27 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     f"VLLM_EXL3_ALLOW_SHAPE_MISMATCH=1 for diagnostic "
                     f"loading with partial weight copy."
                 )
+            if dest.ndim != sharded.ndim:
+                # Rank mismatches cannot be coordinate-mapped; reject before
+                # zero-filling so a failed load leaves the destination intact.
+                raise RuntimeError(
+                    f"EXL3 diagnostic load requires matching rank for "
+                    f"{weight_name} shard={shard_id} expert={expert_id}: "
+                    f"dest {dest.ndim}D {tuple(dest.shape)} vs loaded "
+                    f"{sharded.ndim}D {tuple(sharded.shape)}."
+                )
             logger.warning(
                 "EXL3 shape mismatch (DIAGNOSTIC) %s shard=%s expert=%s: "
-                "dest %s != loaded %s — zero-filling, copying overlap. "
-                "Model outputs WILL be incorrect.",
+                "dest %s != loaded %s — zero-filling, coordinate-copying "
+                "per-dimension overlap. Model outputs WILL be incorrect.",
                 weight_name, shard_id, expert_id,
                 tuple(dest.shape), tuple(sharded.shape),
             )
-            if sharded.numel() < dest.numel():
-                dest.zero_()
-                n = min(sharded.numel(), dest.numel())
-                dest.view(-1)[:n] = sharded.contiguous().view(-1)[:n].to(dest.dtype)
-            elif sharded.numel() > dest.numel():
-                sharded = sharded.contiguous().view(-1)[:dest.numel()].reshape(dest.shape)
-                dest.copy_(sharded)
+            dest.zero_()
+            slices = tuple(
+                slice(0, min(d, s)) for d, s in zip(dest.shape, sharded.shape)
+            )
+            dest[slices].copy_(sharded[slices].to(dest.dtype))
             return True if return_success else None
         dest.copy_(sharded)
         return True if return_success else None
