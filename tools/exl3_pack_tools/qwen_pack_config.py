@@ -8,9 +8,9 @@ one K. This reads the header scan, checks that, and rewrites config.json's quant
 accordingly. The original block is preserved under `native_quantization_config` and
 config.json is backed up to config.json.native first.
 
-Refuses (exit 2) if any MoE layer has experts at different K, because the plugin stacks a
-layer's experts into one tensor and cannot hold mixed widths, or if the pack holds n-gram
-tables of differing geometry (the plugin takes one spec).
+Non-uniform expert K within a layer is supported (ragged per-expert trellis;
+heterogeneous layers use python_loop). Still refuses (exit 2) if the pack holds
+n-gram tables of differing geometry (the plugin takes one spec).
 
 usage: python3 qwen_pack_config.py <pack_dir> [--scan pack_scan.json] [--dry-run]
 """
@@ -39,32 +39,50 @@ def main():
         # config.json was already rewritten by this tool; start from the native block
         q = q["native_quantization_config"]
 
-    if scan["expert_k_nonuniform"]:
-        print("REFUSE: experts within a layer have different K; plugin cannot stack them:")
-        for r in scan["expert_k_nonuniform"][:10]:
-            print(f"  layer {r['layer']} {r['proj']}: {r['ks']}")
-        return 2
     if scan.get("ngram_problems"):
         print("REFUSE: n-gram table problems:")
         for p in scan["ngram_problems"]:
             print("  ", p)
         return 2
 
-    # one K per layer (gate/up/down must agree too, since the plugin uses one K per layer)
+    # Prefer a single representative K per layer for layer_bits. Heterogeneous
+    # experts (and gate/up/down disagreement) are allowed at load time via
+    # ragged trellis storage; config still needs a base bits + overrides map.
+    if scan["expert_k_nonuniform"]:
+        print(
+            "NOTE: experts within a layer have different K; plugin keeps exact "
+            "per-expert shapes and uses python_loop for those layers:"
+        )
+        for r in scan["expert_k_nonuniform"][:10]:
+            print(f"  layer {r['layer']} {r['proj']}: {r['ks']}")
+
     layer_k = {}
     disagree = []
     for layer, row in scan["expert_k_per_layer"].items():
-        ks = {row[p][0] for p in row}
-        if len(ks) != 1:
+        # Use the most common K across gate/up/down expert values as the layer
+        # representative (config metadata only; actual tensors keep exact K).
+        vals = []
+        for proj in row:
+            vals.extend(row[proj])
+        if not vals:
+            continue
+        counts = collections.Counter(vals)
+        rep = counts.most_common(1)[0][0]
+        layer_k[int(layer)] = rep
+        proj_reps = {p: collections.Counter(row[p]).most_common(1)[0][0] for p in row}
+        if len(set(proj_reps.values())) != 1:
             disagree.append((layer, row))
-        else:
-            layer_k[int(layer)] = ks.pop()
     if disagree:
-        print("REFUSE: gate/up/down experts differ in K within a layer:")
+        print(
+            "NOTE: gate/up/down K disagree within a layer (supported via "
+            "python_loop; layer_bits uses the mode K):"
+        )
         for layer, row in disagree[:10]:
             print(f"  layer {layer}: {row}")
-        return 2
 
+    if not layer_k:
+        print("REFUSE: no MoE expert K values found in scan")
+        return 2
     base = collections.Counter(layer_k.values()).most_common(1)[0][0]
     layer_bits = {str(l): k for l, k in sorted(layer_k.items()) if k != base}
 

@@ -1,8 +1,9 @@
 """Inventory a turboderp-native EXL3 pack's tensors so the plugin's config can be derived.
 
-The vllm-exl3 plugin stacks a layer's experts into one [E, in/16, out/16, 16*K] tensor, so it
-needs a single K per MoE layer. exl3 packs quantized to a fractional average (3.05 bpw) assign K
-per tensor. This reads every safetensors header (no tensor data) and reports:
+The vllm-exl3 plugin keeps exact per-expert trellis shapes (uniform-K layers still
+use the fused fast path; heterogeneous packed K falls back to python_loop).
+exl3 packs quantized to a fractional average (3.05 bpw) assign K per tensor.
+This reads every safetensors header (no tensor data) and reports:
   - per MoE layer: the set of K values across experts for gate/up/down (uniform or not)
   - per dense linear (attention, dense MLP, shared expert, lm_head): K and suffixes
   - row-wise n-gram embedding tables (exllamav3 ngram format): shard count, rows, K, aux tensors
@@ -157,7 +158,10 @@ def main():
             kd[tuple(ks)] += 1
     print("expert K distribution (per layer/proj):", dict(kd))
     if nonuniform:
-        print("NONUNIFORM expert K within a layer (plugin cannot stack these):")
+        print(
+            "NONUNIFORM expert K within a layer "
+            "(supported: ragged trellis + python_loop):"
+        )
         for l, p, ks in nonuniform[:12]:
             print(f"  layer {l} {p}: {ks}")
     print("dense K by family:")
