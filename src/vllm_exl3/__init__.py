@@ -36,6 +36,7 @@ def register() -> None:
     from .deepseek_v41 import install_deepseek_v41_compat
     from .k78_compat import install_k78_config_compat
     from .mixed_k_guard import install_mixed_k_prescan_guard
+    from .physical_k_compat import install_physical_fused_k_compat
     from .runtime_policy import install_native_row_policy
     from .tp_geometry_compat import install_tp_geometry_compat
     from .uva_offload import install_uva_expert_validation
@@ -54,6 +55,11 @@ def register() -> None:
     # range. Disable that optimization for non-linear placement/EPLB and let the
     # authoritative vLLM loader mapping drive expert ownership instead.
     install_mixed_k_prescan_guard(exl3)
+
+    # Fused/native layers must use the K encoded by the physical trellis rather
+    # than a possibly stale config/base K. This also rejects accidental fused
+    # construction if heterogeneous physical K somehow reaches that path.
+    install_physical_fused_k_compat(exl3)
 
     # Install model-family compatibility before runtime policy wrappers inspect
     # the quantization config. vLLM still owns the DeepSeek V4.1 architecture.
@@ -115,6 +121,10 @@ def runtime_diagnostics():
         "tensor_level_mixed_k_within_layer": True,
         "heterogeneous_dispatch": "python_loop",
         "uniform_k_dispatch": "fused_when_available",
+        "fused_k_source": "physical_trellis_geometry",
+        "physical_fused_k_guard_installed": bool(
+            getattr(exl3, "_vllm_exl3_physical_fused_k_compat_installed", False)
+        ),
         "cudagraph_qualified": False,
         "recommended_first_boot": "eager",
         "arena_prescan_placement_contract": "linear_contiguous_global_expert_ids",
@@ -132,7 +142,8 @@ def runtime_diagnostics():
             "path remains K2-K4. Routed experts store exact per-expert trellis "
             "shapes (including intra-expert w1/w2/w3 K disagreement). "
             "Heterogeneous packed K within a layer forces the LinearEXL3 "
-            "python_loop; uniform-K layers still use the fused fast path. "
+            "python_loop; uniform-K layers still use the fused fast path using "
+            "the K encoded by the loaded trellis, not a config default. "
             "The heterogeneous path is correctness-first and should remain eager "
             "until CUDA-graph qualification is completed."
         ),
