@@ -9,6 +9,16 @@ torch = pytest.importorskip("torch")
 import vllm_exl3.exl3 as exl3
 
 
+def _new_moe_method(moe, cfg, bits: int = 4):
+    """Construct Exl3MoEMethod without requiring a real vLLM FusedMoEMethodBase."""
+    method = object.__new__(exl3.Exl3MoEMethod)
+    method.moe = moe
+    method.quant_config = cfg
+    method.bits = int(bits)
+    method._logged = False
+    return method
+
+
 class _ReadOnlyExpertMapLayer:
     def __init__(self, expert_map: torch.Tensor) -> None:
         self._raw_expert_map = expert_map
@@ -18,32 +28,57 @@ class _ReadOnlyExpertMapLayer:
         return self._raw_expert_map
 
 
-class _MoEOwner:
+class _MoEOwner(torch.nn.Module):
     tp_rank = 0
     tp_size = 1
+    moe_tp_size = 1
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.layer_name = "layers.0.ffn.experts"
+        self.global_num_experts = 1
+        self.local_num_experts = 1
+        self.starting_expert_offset = 0
+        self.moe_config = SimpleNamespace(
+            hidden_dim=16,
+            num_experts=1,
+            num_local_experts=1,
+            experts_per_token=1,
+            activation="silu",
+            rocm_aiter_fmoe_enabled=False,
+            swiglu_limit=None,
+        )
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
-        return expert_id
+        return expert_id if 0 <= int(expert_id) < 1 else -1
 
 
-def test_moe_loader_prefers_layer_tp_geometry() -> None:
+def test_moe_loader_prefers_layer_tp_geometry(monkeypatch: pytest.MonkeyPatch) -> None:
     """A MoE layer with TP=1 must not inherit process TP=8 slicing."""
+    monkeypatch.setenv("VLLM_EXL3_TRELLIS_ARENA", "0")
+    monkeypatch.setenv("VLLM_EXL3_ARENA_PRESCAN", "0")
     owner = _MoEOwner()
-    param = torch.nn.Parameter(
-        torch.empty(1, 2, 1, 1, 32, dtype=torch.int16), requires_grad=False
+    method = _new_moe_method(owner.moe_config, exl3.Exl3Config(bits=2, codebook="mcg", scope="test"), bits=2)
+    method.create_weights(
+        owner,
+        num_experts=1,
+        hidden_size=16,
+        intermediate_size_per_partition=16,
+        params_dtype=torch.bfloat16,
     )
-    param._exl3_owner = owner
-    loaded = torch.arange(32, dtype=torch.int16).reshape(1, 1, 32)
-    method = object.__new__(exl3.Exl3MoEMethod)
-    method._load_exl3(
-        param,
+    owner.moe_tp_size = 1
+    owner.tp_rank = 0
+    loaded = torch.arange(1 * 1 * 32, dtype=torch.int16).reshape(1, 1, 32)
+    ok = method._load_exl3(
+        owner.w13_trellis,
         loaded,
         "experts.w13_trellis",
         shard_id="w1",
         expert_id=0,
+        return_success=True,
     )
-
-    torch.testing.assert_close(param[0, 0], loaded)
+    assert ok is True
+    torch.testing.assert_close(owner.gate_trellis[0], loaded)
 
 
 def test_pin_expert_map_uses_private_cache_for_read_only_property() -> None:
@@ -121,173 +156,52 @@ def test_qkv_loader_replicated_kv_heads_uses_shard_specific_tp() -> None:
     torch.testing.assert_close(svh[512:640], loaded_svh)
 
 
-def _mismatch_param(dest_shape: tuple[int, ...]) -> torch.nn.Parameter:
-    """w1 slot-0 parameter whose destination slice has ``dest_shape``."""
-    param = torch.nn.Parameter(
-        torch.full((1, 2, *dest_shape), 7, dtype=torch.float32),
-        requires_grad=False,
+def test_suh_shape_mismatch_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Scale tensors still hard-fail on shape mismatch (exact dest geometry)."""
+    monkeypatch.setenv("VLLM_EXL3_TRELLIS_ARENA", "0")
+    owner = _MoEOwner()
+    method = _new_moe_method(owner.moe_config, exl3.Exl3Config(bits=2, codebook="mcg", scope="test"), bits=2)
+    method.create_weights(
+        owner,
+        num_experts=1,
+        hidden_size=16,
+        intermediate_size_per_partition=16,
+        params_dtype=torch.bfloat16,
     )
-    param._exl3_owner = _MoEOwner()
-    return param
-
-
-def test_shape_mismatch_raises_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Without the opt-in env var a mismatched load must hard-fail untouched."""
-    monkeypatch.setenv("VLLM_EXL3_ALLOW_SHAPE_MISMATCH", "0")
-    param = _mismatch_param((3, 4))
-    method = object.__new__(exl3.Exl3MoEMethod)
-
+    owner.moe_tp_size = 1
+    owner.tp_rank = 0
     with pytest.raises(RuntimeError, match="shape mismatch"):
         method._load_exl3(
-            param,
-            torch.arange(8, dtype=torch.float32).reshape(2, 4),
-            "experts.w13_trellis",
+            owner.w13_suh,
+            torch.arange(8, dtype=torch.float16),
+            "experts.w13_suh",
             shard_id="w1",
             expert_id=0,
             return_success=True,
         )
 
-    assert (param.data[0, 0] == 7).all()
 
-
-def test_diagnostic_mode_source_smaller_zero_fills_and_coordinate_copies(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Opt-in padding: overlap is coordinate-copied, the tail zero-filled."""
-    monkeypatch.setenv("VLLM_EXL3_ALLOW_SHAPE_MISMATCH", "1")
-    param = _mismatch_param((3, 4))
-    src = torch.arange(8, dtype=torch.float32).reshape(2, 4) + 1
-    method = object.__new__(exl3.Exl3MoEMethod)
-
-    result = method._load_exl3(
-        param, src, "experts.w13_trellis",
-        shard_id="w1", expert_id=0, return_success=True,
+def test_trellis_exact_shape_replaces_placeholder(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_EXL3_TRELLIS_ARENA", "0")
+    owner = _MoEOwner()
+    method = _new_moe_method(owner.moe_config, exl3.Exl3Config(bits=2, codebook="mcg", scope="test"), bits=2)
+    method.create_weights(
+        owner,
+        num_experts=1,
+        hidden_size=16,
+        intermediate_size_per_partition=16,
+        params_dtype=torch.bfloat16,
     )
-
-    assert result is True
-    torch.testing.assert_close(param.data[0, 0, :2], src)
-    assert (param.data[0, 0, 2:] == 0).all()
-
-
-def test_diagnostic_mode_source_larger_coordinate_trims(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Opt-in trimming: only the leading per-dimension overlap is kept."""
-    monkeypatch.setenv("VLLM_EXL3_ALLOW_SHAPE_MISMATCH", "1")
-    param = _mismatch_param((2, 4))
-    src = torch.arange(15, dtype=torch.float32).reshape(3, 5) + 1
-    method = object.__new__(exl3.Exl3MoEMethod)
-
-    result = method._load_exl3(
-        param, src, "experts.w13_trellis",
-        shard_id="w1", expert_id=0, return_success=True,
-    )
-
-    assert result is True
-    torch.testing.assert_close(param.data[0, 0], src[:2, :4])
-
-
-def test_diagnostic_mode_equal_numel_keeps_coordinates(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Equal-numel/different-shape: rows must not be packed across rows.
-
-    A flattened prefix copy would fill ``dest[2]`` from ``src[1]``'s tail;
-    the coordinate copy leaves the non-overlapping row zero. The source is
-    deliberately non-contiguous with 12 elements, like the destination.
-    """
-    monkeypatch.setenv("VLLM_EXL3_ALLOW_SHAPE_MISMATCH", "1")
-    param = _mismatch_param((3, 4))
-    src = (torch.arange(24, dtype=torch.float32).reshape(4, 6) + 1)[::2]
-    assert not src.is_contiguous()
-    assert tuple(src.shape) == (2, 6)
-    method = object.__new__(exl3.Exl3MoEMethod)
-
-    method._load_exl3(
-        param, src, "experts.w13_trellis", shard_id="w1", expert_id=0,
-    )
-
-    torch.testing.assert_close(param.data[0, 0, :2], src[:, :4])
-    assert (param.data[0, 0, 2:] == 0).all()
-
-
-def test_diagnostic_mode_dtype_converted_on_copy(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Opt-in copy narrows the source dtype to the destination dtype."""
-    monkeypatch.setenv("VLLM_EXL3_ALLOW_SHAPE_MISMATCH", "1")
-    param = torch.nn.Parameter(
-        torch.full((1, 2, 3, 4), 7, dtype=torch.float16), requires_grad=False
-    )
-    param._exl3_owner = _MoEOwner()
-    src = torch.arange(8, dtype=torch.float32).reshape(2, 4) + 1
-    method = object.__new__(exl3.Exl3MoEMethod)
-
-    method._load_exl3(
-        param, src, "experts.w13_trellis", shard_id="w1", expert_id=0,
-    )
-
-    torch.testing.assert_close(
-        param.data[0, 0, :2], src.to(torch.float16), rtol=0, atol=0
-    )
-    assert (param.data[0, 0, 2:] == 0).all()
-
-
-def test_diagnostic_mode_ndim_mismatch_raises(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Rank mismatches stay a hard error even in diagnostic mode."""
-    monkeypatch.setenv("VLLM_EXL3_ALLOW_SHAPE_MISMATCH", "1")
-    param = _mismatch_param((3, 4))
-    method = object.__new__(exl3.Exl3MoEMethod)
-
-    with pytest.raises(RuntimeError, match="matching rank"):
-        method._load_exl3(
-            param,
-            torch.arange(12, dtype=torch.float32).reshape(3, 4, 1),
-            "experts.w13_trellis",
-            shard_id="w1",
-            expert_id=0,
-            return_success=True,
-        )
-
-    assert (param.data[0, 0] == 7).all()
-
-
-def test_return_success_only_in_diagnostic_mode(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Mismatched loads report success only with the explicit opt-in."""
-    param = _mismatch_param((3, 4))
-    mismatched = torch.arange(8, dtype=torch.float32).reshape(2, 4)
-    method = object.__new__(exl3.Exl3MoEMethod)
-
-    monkeypatch.setenv("VLLM_EXL3_ALLOW_SHAPE_MISMATCH", "1")
+    owner.moe_tp_size = 1
+    owner.tp_rank = 0
+    loaded = torch.arange(1 * 1 * 48, dtype=torch.int16).reshape(1, 1, 48)  # K=3
     assert method._load_exl3(
-        param, mismatched, "experts.w13_trellis",
-        shard_id="w1", expert_id=0, return_success=True,
+        owner.w13_trellis,
+        loaded,
+        "experts.0.w1.trellis",
+        shard_id="w1",
+        expert_id=0,
+        return_success=True,
     )
-    monkeypatch.setenv("VLLM_EXL3_ALLOW_SHAPE_MISMATCH", "0")
-    with pytest.raises(RuntimeError, match="shape mismatch"):
-        method._load_exl3(
-            param, mismatched, "experts.w13_trellis",
-            shard_id="w1", expert_id=0, return_success=True,
-        )
-
-    # Matching shapes succeed regardless of the diagnostic opt-in.
-    matched_param = torch.nn.Parameter(
-        torch.zeros(1, 2, 2, 4, dtype=torch.float32), requires_grad=False
-    )
-    matched_param._exl3_owner = _MoEOwner()
-    matched = torch.arange(8, dtype=torch.float32).reshape(2, 4)
-    assert method._load_exl3(
-        matched_param, matched, "experts.w13_trellis",
-        shard_id="w1", expert_id=0, return_success=True,
-    )
-    assert (
-        method._load_exl3(
-            matched_param, matched, "experts.w13_trellis",
-            shard_id="w1", expert_id=0,
-        )
-        is None
-    )
+    assert tuple(owner.gate_trellis[0].shape) == (1, 1, 48)
+    torch.testing.assert_close(owner.gate_trellis[0], loaded)

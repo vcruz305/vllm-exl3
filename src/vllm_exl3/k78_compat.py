@@ -7,9 +7,9 @@ qualified for. Historically Exl3Config rejected K7/K8 before dispatch could use
 ExLlamaV3's normal execution path.
 
 This narrow installer widens *configuration acceptance* to K2-K8 without
-claiming custom-native support for K5-K8. It does not add tensor-level mixed-K
-inside one RoutedExperts layer; current routed-MoE allocation still expects one
-K per transformer layer.
+claiming custom-native support for K5-K8. Tensor-level mixed-K inside one
+RoutedExperts layer is handled separately by ragged per-expert trellis
+allocation in ``Exl3MoEMethod`` (python_loop when K disagrees).
 """
 from __future__ import annotations
 

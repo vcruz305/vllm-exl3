@@ -9,10 +9,10 @@ before vLLM can load it.
 
 - `qwen_pack_scan.py` inventories every tensor in the pack by reading each
   `*.safetensors` header only (no tensor data). It reports, per MoE layer,
-  the set of K values across experts for gate/up/down (the plugin stacks a
-  layer's experts into one tensor, so it needs them uniform); per dense
-  linear (attention, dense MLP, shared expert, `lm_head`), its K; and for
-  each row-wise n-gram embedding table, its shard count, row count, K and
+  the set of K values across experts for gate/up/down (non-uniform expert K
+  is supported via ragged trellis storage + python_loop); per dense linear
+  (attention, dense MLP, shared expert, `lm_head`), its K; and for each
+  row-wise n-gram embedding table, its shard count, row count, K and
   auxiliary tensors. Writes `pack_scan.json` next to the pack.
 
   `python3 qwen_pack_scan.py <pack_dir> [--out scan.json]`
@@ -20,11 +20,11 @@ before vLLM can load it.
 - `qwen_pack_config.py` reads that scan and rewrites `config.json`'s
   `quantization_config` into the plugin's own fields: `layer_bits` (per-layer
   expert K overrides), `non_routed_exl3.layers` (a per-prefix bit map for
-  dense linears), and `ngram_embedding` (the row-wise table spec). It refuses
-  (exit 2) if any MoE layer's experts disagree on K, or if the pack's n-gram
-  tables have inconsistent geometry, since the plugin cannot represent
-  either case. The original block is kept under `native_quantization_config`
-  and `config.json` is backed up to `config.json.native` first.
+  dense linears), and `ngram_embedding` (the row-wise table spec). Non-uniform
+  expert K is allowed and noted; it still refuses (exit 2) if the pack's
+  n-gram tables have inconsistent geometry. The original block is kept under
+  `native_quantization_config` and `config.json` is backed up to
+  `config.json.native` first.
 
   `python3 qwen_pack_config.py <pack_dir> [--scan pack_scan.json] [--dry-run]`
 

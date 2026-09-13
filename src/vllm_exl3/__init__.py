@@ -103,12 +103,18 @@ def runtime_diagnostics():
         "k78_config_compat_installed": bool(
             getattr(exl3, "_vllm_exl3_k78_compat_installed", False)
         ),
-        "routed_allocation_scope": "one K per RoutedExperts transformer layer",
-        "tensor_level_mixed_k_within_layer": False,
+        "routed_allocation_scope": (
+            "per-expert exact trellis shapes; uniform-K layers keep fused path"
+        ),
+        "tensor_level_mixed_k_within_layer": True,
+        "heterogeneous_dispatch": "python_loop",
+        "uniform_k_dispatch": "fused_when_available",
         "note": (
             "K7/K8 are accepted for ExLlamaV3 execution. The custom native p2b "
-            "path remains K2-K4. Current vLLM routed allocation still requires "
-            "one K per RoutedExperts transformer layer."
+            "path remains K2-K4. Routed experts store exact per-expert trellis "
+            "shapes (including intra-expert w1/w2/w3 K disagreement). "
+            "Heterogeneous packed K within a layer forces the LinearEXL3 "
+            "python_loop; uniform-K layers still use the fused fast path."
         ),
     }
     record["tp_geometry"] = {

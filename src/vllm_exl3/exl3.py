@@ -24,9 +24,13 @@ work, Copyright (c) 2025 Turboderp, MIT. See THIRD_PARTY_NOTICES.md.
 
 from __future__ import annotations
 
+import gc
 import importlib
+import json
 import math
 import os
+import time
+from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
 import re
@@ -424,6 +428,435 @@ def filter_speculative_candidates(
     return mask, kept_counts
 
 
+def _exl3_trellis_arena_enabled() -> bool:
+    """Contiguous per-shape trellis arenas (default ON). Set 0 to use legacy allocs."""
+    return os.environ.get("VLLM_EXL3_TRELLIS_ARENA", "1") != "0"
+
+
+def _exl3_mem_waterfall_enabled() -> bool:
+    return os.environ.get("VLLM_EXL3_MEM_WATERFALL", "0") == "1"
+
+
+def _read_proc_meminfo_gib(*keys: str) -> dict[str, float]:
+    out: dict[str, float] = {}
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            wanted = set(keys)
+            for line in fh:
+                name, _, rest = line.partition(":")
+                if name in wanted:
+                    out[name] = int(rest.strip().split()[0]) / (1024.0 * 1024.0)
+    except OSError:
+        pass
+    return out
+
+
+def _exl3_mem_snapshot(tag: str, layer: Any | None = None) -> dict[str, Any]:
+    """Host + process + torch CUDA memory snapshot for materialization tracing."""
+    snap: dict[str, Any] = {"tag": tag, "ts": time.time()}
+    snap.update(_read_proc_meminfo_gib("MemAvailable", "AnonPages", "Cached"))
+    try:
+        with open("/proc/self/status", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    snap["VmRSS_GiB"] = int(line.split()[1]) / (1024.0 * 1024.0)
+                elif line.startswith("VmSize:"):
+                    snap["VmSize_GiB"] = int(line.split()[1]) / (1024.0 * 1024.0)
+    except OSError:
+        pass
+    try:
+        with open("/proc/self/smaps_rollup", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("Pss:"):
+                    snap["Pss_GiB"] = int(line.split()[1]) / (1024.0 * 1024.0)
+                    break
+    except OSError:
+        pass
+    if _TORCH_AVAILABLE and torch is not None and torch.cuda.is_available():
+        try:
+            snap["cuda_allocated_GiB"] = torch.cuda.memory_allocated() / (1024.0**3)
+            snap["cuda_reserved_GiB"] = torch.cuda.memory_reserved() / (1024.0**3)
+        except Exception:
+            pass
+    if layer is not None:
+        snap["trellis_storage_count"] = _count_trellis_storages(layer)
+        snap["trellis_final_bytes"] = _trellis_nbytes(layer)
+        staging = getattr(layer, "_exl3_trellis_staging", None)
+        if staging:
+            snap["trellis_staging_bytes"] = sum(
+                int(t.numel()) * int(t.element_size())
+                for proj_map in staging.values()
+                for t in proj_map.values()
+                if t is not None
+            )
+    path = os.environ.get("VLLM_EXL3_MEM_WATERFALL_PATH", "")
+    if path:
+        try:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(snap, sort_keys=True) + "\n")
+        except OSError:
+            pass
+    return snap
+
+
+def _count_trellis_storages(layer: Any) -> int:
+    """Unique trellis backing storages (arena tensors when present)."""
+    if not _TORCH_AVAILABLE or torch is None:
+        return 0
+    ptrs: set[int] = set()
+    arena_lists = (
+        getattr(layer, "_exl3_gate_trellis_arenas", None),
+        getattr(layer, "_exl3_up_trellis_arenas", None),
+        getattr(layer, "_exl3_down_trellis_arenas", None),
+    )
+    has_arenas = False
+    for arenas in arena_lists:
+        if not arenas:
+            continue
+        has_arenas = True
+        for arena in arenas:
+            try:
+                ptrs.add(int(arena.untyped_storage().data_ptr()))
+            except Exception:
+                continue
+    if has_arenas:
+        return len(ptrs)
+    for name in ("gate_trellis", "up_trellis", "down_trellis"):
+        plist = getattr(layer, name, None)
+        if plist is None:
+            continue
+        for p in plist:
+            if p is None or int(getattr(p, "numel", lambda: 0)()) == 0:
+                continue
+            try:
+                ptrs.add(int(p.untyped_storage().data_ptr()))
+            except Exception:
+                continue
+    return len(ptrs)
+
+
+def _trellis_nbytes(layer: Any) -> int:
+    total = 0
+    for name in ("gate_trellis", "up_trellis", "down_trellis"):
+        plist = getattr(layer, name, None)
+        if plist is None:
+            continue
+        for p in plist:
+            if p is None or int(getattr(p, "numel", lambda: 0)()) == 0:
+                continue
+            total += int(p.numel()) * int(p.element_size())
+    # Arenas may be counted twice if we also sum views; prefer arena bytes when present.
+    arena_bytes = 0
+    for aname in (
+        "_exl3_gate_trellis_arenas",
+        "_exl3_up_trellis_arenas",
+        "_exl3_down_trellis_arenas",
+    ):
+        for arena in getattr(layer, aname, []) or []:
+            arena_bytes += int(arena.numel()) * int(arena.element_size())
+    return arena_bytes if arena_bytes else total
+
+
+def _proj_from_shard_id(shard_id: str) -> str:
+    if shard_id == "w1":
+        return "gate"
+    if shard_id == "w3":
+        return "up"
+    if shard_id == "w2":
+        return "down"
+    raise ValueError(f"unknown EXL3 shard_id={shard_id}")
+
+
+def _try_prescan_trellis_shapes(
+    layer: Any,
+    num_experts: int,
+) -> dict[str, dict[int, tuple[int, ...]]] | None:
+    """Header-only shape scan from the on-disk checkpoint (no tensor materialize).
+
+    Uses ``VLLM_ENGRAM_MODEL_DIR`` / ``VLLM_EXL3_MODEL_DIR`` and the layer's
+    ``layer_name``/``prefix`` to locate ``layers.N.ffn.experts.*`` trellis keys.
+    Local expert ids map linearly onto a global contiguous block when
+    ``layer.starting_expert_offset`` / EP metadata is present; otherwise assume
+    local id == global id (offline tests).
+    """
+    model_dir = os.environ.get("VLLM_ENGRAM_MODEL_DIR") or os.environ.get(
+        "VLLM_EXL3_MODEL_DIR"
+    )
+    if not model_dir:
+        return None
+    try:
+        from safetensors import safe_open
+    except Exception:
+        return None
+    index_path = os.path.join(model_dir, "model.safetensors.index.json")
+    if not os.path.isfile(index_path):
+        return None
+    try:
+        with open(index_path, encoding="utf-8") as fh:
+            weight_map = json.load(fh).get("weight_map", {})
+    except Exception:
+        return None
+    layer_name = str(
+        getattr(layer, "layer_name", None)
+        or getattr(layer, "prefix", None)
+        or ""
+    )
+    # Expect ...layers.N.ffn.experts or layers.N
+    import re as _re
+
+    m = _re.search(r"layers\.(\d+)", layer_name)
+    if not m:
+        return None
+    layer_id = int(m.group(1))
+    offset = int(
+        getattr(layer, "starting_expert_offset", None)
+        or getattr(layer, "expert_id_offset", None)
+        or 0
+    )
+    # EP linear placement: local e <-> global offset+e
+    prefix = f"layers.{layer_id}.ffn.experts."
+    shapes: dict[str, dict[int, tuple[int, ...]]] = {
+        "gate": {},
+        "up": {},
+        "down": {},
+    }
+    proj_map = {"w1": "gate", "w3": "up", "w2": "down"}
+    # Gather keys per local expert.
+    for local_e in range(int(num_experts)):
+        global_e = offset + local_e
+        for wp, proj in proj_map.items():
+            key = f"{prefix}{global_e}.{wp}.trellis"
+            shard = weight_map.get(key)
+            if shard is None:
+                return None  # incomplete map; fall back to stage-pack
+            path = os.path.join(model_dir, shard)
+            try:
+                with safe_open(path, framework="pt") as f:
+                    shape = tuple(int(x) for x in f.get_slice(key).get_shape())
+            except Exception:
+                return None
+            shapes[proj][local_e] = shape
+    return shapes
+
+
+def prepare_trellis_arena_plan(
+    layer: Any,
+    shapes_by_proj: dict[str, dict[int, tuple[int, ...]]],
+) -> dict[str, Any]:
+    """Pre-allocate contiguous per-shape arenas and map expert_id -> slot.
+
+    ``shapes_by_proj`` maps proj in {gate,up,down} -> {expert_id: exact_shape}.
+    Subsequent ``_load_exl3`` trellis loads copy directly into the planned slot
+    (safetensors -> FINAL) without retaining a full-layer staging set.
+    """
+    if not _TORCH_AVAILABLE or torch is None:
+        raise RuntimeError("torch required for trellis arenas")
+    dest_device = layer.w13_suh.device
+    proj_to_plist = {
+        "gate": layer.gate_trellis,
+        "up": layer.up_trellis,
+        "down": layer.down_trellis,
+    }
+    proj_to_attr = {
+        "gate": "_exl3_gate_trellis_arenas",
+        "up": "_exl3_up_trellis_arenas",
+        "down": "_exl3_down_trellis_arenas",
+    }
+    plan: dict[str, dict[tuple[int, ...], dict[str, Any]]] = {}
+    eid_index: dict[str, dict[int, tuple[tuple[int, ...], int]]] = {
+        "gate": {},
+        "up": {},
+        "down": {},
+    }
+    stats: dict[str, Any] = {
+        "planned": True,
+        "arenas": {},
+        "allocations_after": 0,
+        "final_bytes": 0,
+        "temp_peak_bytes": 0,
+    }
+    for proj, plist in proj_to_plist.items():
+        by_shape: dict[tuple[int, ...], list[int]] = defaultdict(list)
+        for eid, shape in sorted((shapes_by_proj.get(proj) or {}).items()):
+            by_shape[tuple(int(x) for x in shape)].append(int(eid))
+        arenas: list[Parameter] = []
+        plan[proj] = {}
+        n_experts = int(len(plist))
+        for shape, eids in by_shape.items():
+            n = len(eids)
+            arena = torch.empty((n, *shape), dtype=torch.int16, device=dest_device)
+            meta = {
+                "arena": arena,
+                "eid_to_idx": {eid: i for i, eid in enumerate(eids)},
+            }
+            plan[proj][shape] = meta
+            for i, eid in enumerate(eids):
+                if not (0 <= eid < n_experts):
+                    raise RuntimeError(f"EXL3 arena plan expert out of range: {eid}")
+                view = arena[i]
+                new_p = Parameter(view, requires_grad=False)
+                new_p.weight_loader = getattr(plist[eid], "weight_loader", None)
+                new_p._exl3_owner = layer
+                plist[eid] = new_p
+                eid_index[proj][eid] = (shape, i)
+            arenas.append(Parameter(arena, requires_grad=False))
+            stats["arenas"].setdefault(proj, []).append(
+                {"shape": list(shape), "n": n, "bytes": int(arena.nbytes)}
+            )
+            stats["allocations_after"] += 1
+            stats["final_bytes"] += int(arena.nbytes)
+        setattr(layer, proj_to_attr[proj], arenas)
+    layer._exl3_trellis_arena_plan = plan
+    layer._exl3_trellis_eid_index = eid_index
+    layer._exl3_trellis_staging = {"gate": {}, "up": {}, "down": {}}
+    layer._exl3_trellis_arena_stats = stats
+    layer._exl3_trellis_temp_peak_bytes = 0
+    return stats
+
+
+def _direct_fill_trellis_slot(
+    layer: Any,
+    proj: str,
+    expert_id: int,
+    src: "torch.Tensor",
+) -> None:
+    """Copy one trellis into its pre-planned arena slot; drop ``src`` ASAP."""
+    eid_index = getattr(layer, "_exl3_trellis_eid_index", None)
+    plan = getattr(layer, "_exl3_trellis_arena_plan", None)
+    if not eid_index or not plan:
+        raise RuntimeError("EXL3 direct fill requires prepare_trellis_arena_plan")
+    if expert_id not in eid_index[proj]:
+        raise RuntimeError(
+            f"EXL3 arena plan missing {proj} expert={expert_id} shape={tuple(src.shape)}"
+        )
+    shape, idx = eid_index[proj][expert_id]
+    if tuple(int(x) for x in src.shape) != shape:
+        raise RuntimeError(
+            f"EXL3 arena slot shape mismatch {proj} expert={expert_id}: "
+            f"got {tuple(src.shape)} planned {shape}"
+        )
+    arena = plan[proj][shape]["arena"]
+    transient = int(src.numel()) * int(src.element_size())
+    layer._exl3_trellis_temp_peak_bytes = max(
+        int(getattr(layer, "_exl3_trellis_temp_peak_bytes", 0)), transient
+    )
+    if src.device == arena.device and src.dtype == torch.int16:
+        arena[idx].copy_(src if src.is_contiguous() else src.contiguous())
+    else:
+        arena[idx].copy_(
+            src.to(device=arena.device, dtype=torch.int16, non_blocking=False)
+        )
+
+
+def _pack_trellis_arenas(layer: Any) -> dict[str, Any]:
+    """Pack staged per-expert trellis tensors into contiguous per-shape arenas.
+
+    Each expert keeps an exact-shape view (no padding/truncation). Heterogeneous
+    K is preserved by grouping only equal shapes into the same arena.
+
+    Prefer ``prepare_trellis_arena_plan`` + direct fill to avoid holding a full
+    staging set beside the final arenas (UMA source+dest coexistence).
+    """
+    if not _TORCH_AVAILABLE or torch is None:
+        raise RuntimeError("torch required for trellis arenas")
+    # Already planned+filled: just report stats.
+    if getattr(layer, "_exl3_trellis_arena_plan", None) is not None:
+        stats = dict(getattr(layer, "_exl3_trellis_arena_stats", {}) or {})
+        stats["packed"] = True
+        stats["mode"] = "direct_plan"
+        stats["temp_peak_bytes"] = int(
+            getattr(layer, "_exl3_trellis_temp_peak_bytes", 0)
+        )
+        layer._exl3_trellis_arena_stats = stats
+        return stats
+
+    staging: dict[str, dict[int, torch.Tensor]] = getattr(
+        layer, "_exl3_trellis_staging", None
+    ) or {}
+    if not staging:
+        return {"packed": False, "reason": "no_staging"}
+
+    dest_device = layer.w13_suh.device
+    stats: dict[str, Any] = {
+        "packed": True,
+        "mode": "post_stage_pack",
+        "arenas": {},
+        "allocations_after": 0,
+        "final_bytes": 0,
+        "temp_peak_bytes": 0,
+    }
+    temp_bytes = 0
+    for proj_map in staging.values():
+        for t in proj_map.values():
+            temp_bytes += int(t.numel()) * int(t.element_size())
+    stats["temp_peak_bytes"] = temp_bytes
+
+    proj_to_plist = {
+        "gate": layer.gate_trellis,
+        "up": layer.up_trellis,
+        "down": layer.down_trellis,
+    }
+    proj_to_attr = {
+        "gate": "_exl3_gate_trellis_arenas",
+        "up": "_exl3_up_trellis_arenas",
+        "down": "_exl3_down_trellis_arenas",
+    }
+
+    for proj, plist in proj_to_plist.items():
+        by_shape: dict[tuple[int, ...], list[tuple[int, torch.Tensor]]] = defaultdict(
+            list
+        )
+        for eid, tensor in sorted((staging.get(proj) or {}).items()):
+            if tensor is None or int(tensor.numel()) == 0:
+                continue
+            if tensor.dtype != torch.int16:
+                tensor = tensor.to(dtype=torch.int16)
+            shape = tuple(int(x) for x in tensor.shape)
+            by_shape[shape].append((int(eid), tensor))
+
+        arenas: list[Parameter] = []
+        n_experts = int(len(plist))
+        for shape, items in by_shape.items():
+            n = len(items)
+            arena = torch.empty(
+                (n, *shape), dtype=torch.int16, device=dest_device
+            )
+            for i, (eid, src) in enumerate(items):
+                if not (0 <= eid < n_experts):
+                    raise RuntimeError(f"EXL3 arena expert id out of range: {eid}")
+                if src.device == dest_device and src.dtype == torch.int16:
+                    arena[i].copy_(src if src.is_contiguous() else src.contiguous())
+                else:
+                    arena[i].copy_(
+                        src.to(device=dest_device, dtype=torch.int16, non_blocking=False)
+                    )
+                view = arena[i]
+                new_p = Parameter(view, requires_grad=False)
+                new_p.weight_loader = getattr(plist[eid], "weight_loader", None)
+                new_p._exl3_owner = layer
+                plist[eid] = new_p
+                staging[proj].pop(eid, None)
+                del src
+            arenas.append(Parameter(arena, requires_grad=False))
+            stats["arenas"].setdefault(proj, []).append(
+                {"shape": list(shape), "n": n, "bytes": int(arena.nbytes)}
+            )
+            stats["allocations_after"] += 1
+            stats["final_bytes"] += int(arena.nbytes)
+            # Free host pages for this shape group before the next alloc on UMA.
+            gc.collect()
+        setattr(layer, proj_to_attr[proj], arenas)
+
+    layer._exl3_trellis_staging = {"gate": {}, "up": {}, "down": {}}
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+    return stats
+
+
 def _narrow_tp(tensor: torch.Tensor, dim: int, tp_rank: int, tp_size: int) -> torch.Tensor:
     if tp_size <= 1:
         return tensor
@@ -704,7 +1137,7 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
     except Exception:
         exllamav3_ext = None
 
-    device = layer.w13_trellis.device
+    device = layer.w13_suh.device
     n_exp = len(inners)
     # Gate/up input rotations are immutable after load. Cache this compatibility
     # fact once so fat-prefill dispatch never calls torch.equal on CUDA tensors
@@ -1844,20 +2277,16 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 "EXL3 trellis tiles are 16-wide; "
                 f"hidden={hidden_size} intermediate_local={intermediate_size_per_partition}"
             )
+        # Default/base K from config. Real DSV4.1 4.75bpw packs are mixed-K
+        # even within a single expert (w1/w2/w3 can differ). Trellis storage is
+        # therefore ragged and sized on load from the checkpoint tensor itself.
         k_words = self.bits * 16
         in_tiles = hidden_size // 16
         out_tiles = intermediate_size_per_partition // 16
 
         extra = {k: v for k, v in extra_weight_attrs.items() if k != "weight_loader"}
 
-        # w13_* : stacked [expert, {gate=0, up=1}, ...] so the stock
-        # expert_params_mapping (experts.w13_ + suffix) hits these names.
-        w13_trellis = Parameter(
-            torch.empty(
-                num_experts, 2, in_tiles, out_tiles, k_words, dtype=torch.int16
-            ),
-            requires_grad=False,
-        )
+        # Suh/svh/markers stay stacked (shape independent of packed K).
         w13_suh = Parameter(
             torch.empty(num_experts, 2, hidden_size, dtype=torch.float16),
             requires_grad=False,
@@ -1874,12 +2303,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         )
         w13_mul1 = Parameter(
             torch.zeros(num_experts, 2, 1, dtype=torch.int32),
-            requires_grad=False,
-        )
-        w2_trellis = Parameter(
-            torch.empty(
-                num_experts, out_tiles, in_tiles, k_words, dtype=torch.int16
-            ),
             requires_grad=False,
         )
         w2_suh = Parameter(
@@ -1901,6 +2324,42 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
 
+        # Dummy named parameters so expert_params_mapping still resolves
+        # ``w13_trellis`` / ``w2_trellis``. Real trellis payloads live in the
+        # ragged ParameterLists below and are replaced with exact shapes on load.
+        w13_trellis = Parameter(torch.empty(0, dtype=torch.int16), requires_grad=False)
+        w2_trellis = Parameter(torch.empty(0, dtype=torch.int16), requires_grad=False)
+
+        gate_trellis = torch.nn.ParameterList(
+            [
+                Parameter(torch.empty(0, dtype=torch.int16), requires_grad=False)
+                for _ in range(num_experts)
+            ]
+        )
+        up_trellis = torch.nn.ParameterList(
+            [
+                Parameter(torch.empty(0, dtype=torch.int16), requires_grad=False)
+                for _ in range(num_experts)
+            ]
+        )
+        down_trellis = torch.nn.ParameterList(
+            [
+                Parameter(torch.empty(0, dtype=torch.int16), requires_grad=False)
+                for _ in range(num_experts)
+            ]
+        )
+        layer.gate_trellis = gate_trellis
+        layer.up_trellis = up_trellis
+        layer.down_trellis = down_trellis
+        # Staging for arena pack: exact per-expert tensors held briefly on host,
+        # then copied into contiguous per-shape arenas in process_weights.
+        layer._exl3_trellis_staging = {"gate": {}, "up": {}, "down": {}}
+        layer._exl3_gate_trellis_arenas = []
+        layer._exl3_up_trellis_arenas = []
+        layer._exl3_down_trellis_arenas = []
+        layer._exl3_trellis_arena_stats = {}
+        layer._exl3_trellis_alloc_count_before = 0
+
         packed = {
             "w13_trellis": w13_trellis,
             "w13_suh": w13_suh,
@@ -1918,13 +2377,47 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             set_weight_attrs(param, extra)
             param.weight_loader = self._load_exl3
             param._exl3_owner = layer
+        for plist in (gate_trellis, up_trellis, down_trellis):
+            for param in plist:
+                set_weight_attrs(param, extra)
+                param.weight_loader = self._load_exl3
+                param._exl3_owner = layer
         if hasattr(layer, "w13_weight") or hasattr(layer, "w2_weight"):
             raise RuntimeError("EXL3 create_weights must not allocate dense expert weights")
 
         layer._exl3_hidden_size = hidden_size
         layer._exl3_intermediate_local = intermediate_size_per_partition
-        layer._exl3_k_words = k_words
+        layer._exl3_in_tiles = in_tiles
+        layer._exl3_out_tiles = out_tiles
+        layer._exl3_k_words = k_words  # config default only; actual K is per-trellis
         layer._exl3_bits = self.bits
+        layer._exl3_mixed_k = False
+        layer._exl3_n_experts = int(num_experts)
+        # Linear EP placement offset for checkpoint prescan (local->global).
+        if not hasattr(layer, "starting_expert_offset"):
+            try:
+                from vllm.distributed.parallel_state import get_ep_group
+
+                ep = get_ep_group()
+                layer.starting_expert_offset = int(ep.rank) * int(num_experts)
+            except Exception:
+                layer.starting_expert_offset = 0
+        # Header-only shape scan (no allocation yet). Arenas are created on the
+        # first trellis load after the module has been moved to its exec device,
+        # so a later layer.to(device) cannot clone views apart.
+        layer._exl3_trellis_shapes_pending = None
+        if (
+            _exl3_trellis_arena_enabled()
+            and os.environ.get("VLLM_EXL3_ARENA_PRESCAN", "1") != "0"
+        ):
+            shapes = _try_prescan_trellis_shapes(layer, int(num_experts))
+            if shapes is not None:
+                layer._exl3_trellis_shapes_pending = shapes
+                logger.info(
+                    "EXL3 trellis arena PRESCAN shapes ready for %s experts "
+                    "(alloc deferred until first load)",
+                    num_experts,
+                )
         # vLLM's generic RoutedExperts.load_weights treats any 3-D checkpoint
         # tensor as fused stacked experts and unbinds it per expert; an EXL3
         # per-expert trellis is 3-D by construction. Route this layer's tensors
@@ -1953,68 +2446,214 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 return False if return_success else None
             expert_id = local_id
 
-        tp_rank, tp_size = _resolve_tp_geometry(owner, layer)
+        owner_mod = owner if owner is not None else getattr(param, "_exl3_owner", None)
+        tp_rank, tp_size = _resolve_tp_geometry(owner_mod, param)
         suffix = _suffix_from_mapped_name(weight_name)
-        loaded = loaded_weight.detach().contiguous()
+        # Avoid an early full-tensor .contiguous() copy. On GB10 UMA that
+        # transient host copy sits beside the eventual device payload and was
+        # observed to push MemAvailable under the 16 GiB abort cliff.
+        loaded = loaded_weight.detach()
         if suffix in ("mcg", "mul1"):
             # Codebook markers are scalars ([] or [1]); keep the value per expert
             # tensor so process_weights_after_loading can pick the codebook.
+            if owner_mod is None:
+                raise RuntimeError("EXL3 marker load missing owner module")
             if shard_id in ("w1", "w3"):
-                dest = param.data[expert_id, 0 if shard_id == "w1" else 1]
+                dest = getattr(owner_mod, "w13_" + suffix).data[
+                    expert_id, 0 if shard_id == "w1" else 1
+                ]
             elif shard_id == "w2":
-                dest = param.data[expert_id]
+                dest = getattr(owner_mod, "w2_" + suffix).data[expert_id]
             else:
                 raise ValueError(f"unknown EXL3 shard_id={shard_id}")
             dest.fill_(int(loaded.reshape(-1)[0].item()) if loaded.numel() else 0)
             return True if return_success else None
+
+        if suffix == "trellis":
+            # Exact checkpoint shape per expert. With arenas enabled, stage on
+            # host and pack into contiguous per-shape arenas later (views keep
+            # heterogeneous K / expert IDs). Legacy path allocates one Parameter
+            # per expert immediately.
+            if owner_mod is None:
+                raise RuntimeError("EXL3 trellis load missing owner module")
+            if _exl3_mem_waterfall_enabled():
+                _exl3_mem_snapshot("BEFORE_SOURCE", owner_mod)
+            if shard_id in ("w1", "w3"):
+                sharded = shard_exl3_col(loaded, suffix, tp_rank, tp_size)
+                plist = owner_mod.gate_trellis if shard_id == "w1" else owner_mod.up_trellis
+            elif shard_id == "w2":
+                sharded = shard_exl3_row(loaded, suffix, tp_rank, tp_size)
+                plist = owner_mod.down_trellis
+            else:
+                raise ValueError(f"unknown EXL3 shard_id={shard_id}")
+            if _exl3_mem_waterfall_enabled():
+                _exl3_mem_snapshot("AFTER_SOURCE_OPEN", owner_mod)
+            # Validate tile geometry against the layer's hidden/intermediate
+            # before paying for a device materialization.
+            in_tiles = int(getattr(owner_mod, "_exl3_in_tiles", 0))
+            out_tiles = int(getattr(owner_mod, "_exl3_out_tiles", 0))
+            if shard_id in ("w1", "w3"):
+                expect_prefix = (in_tiles, out_tiles)
+            else:
+                expect_prefix = (out_tiles, in_tiles)
+            if tuple(sharded.shape[:2]) != expect_prefix:
+                raise RuntimeError(
+                    f"EXL3 trellis tile mismatch {weight_name} shard={shard_id} "
+                    f"expert={expert_id}: got {tuple(sharded.shape)} "
+                    f"expected prefix {expect_prefix}+K_words"
+                )
+            if int(sharded.shape[-1]) % 16 != 0:
+                raise RuntimeError(
+                    f"EXL3 trellis K_words not multiple of 16: {tuple(sharded.shape)}"
+                )
+
+            use_arena = _exl3_trellis_arena_enabled()
+            if use_arena:
+                proj = _proj_from_shard_id(shard_id)
+                owner_mod._exl3_trellis_alloc_count_before = int(
+                    getattr(owner_mod, "_exl3_trellis_alloc_count_before", 0)
+                ) + 1
+                # Materialize deferred prescan plan on the exec device once.
+                pending = getattr(owner_mod, "_exl3_trellis_shapes_pending", None)
+                if (
+                    pending is not None
+                    and getattr(owner_mod, "_exl3_trellis_arena_plan", None) is None
+                ):
+                    prepare_trellis_arena_plan(owner_mod, pending)
+                    owner_mod._exl3_trellis_shapes_pending = None
+                    logger.info(
+                        "EXL3 trellis arenas allocated on %s: arenas=%s final_bytes=%s",
+                        owner_mod.w13_suh.device,
+                        owner_mod._exl3_trellis_arena_stats.get("allocations_after"),
+                        owner_mod._exl3_trellis_arena_stats.get("final_bytes"),
+                    )
+                # Preferred path: plan exists -> copy straight into FINAL slot.
+                if getattr(owner_mod, "_exl3_trellis_arena_plan", None) is not None:
+                    if _exl3_mem_waterfall_enabled():
+                        _exl3_mem_snapshot("AFTER_DEST_ALLOC", owner_mod)
+                        _exl3_mem_snapshot("AFTER_READ", owner_mod)
+                        _exl3_mem_snapshot("AFTER_LAYOUT_CONVERSION", owner_mod)
+                    _direct_fill_trellis_slot(owner_mod, proj, int(expert_id), sharded)
+                    if _exl3_mem_waterfall_enabled():
+                        _exl3_mem_snapshot("AFTER_COPY_TO_FINAL", owner_mod)
+                    del loaded, sharded, loaded_weight
+                    if _exl3_mem_waterfall_enabled():
+                        _exl3_mem_snapshot("AFTER_TEMP_DELETE", owner_mod)
+                        _exl3_mem_snapshot("AFTER_GC", owner_mod)
+                    return True if return_success else None
+
+                # Fallback: stage on host; pack in process_weights_after_loading.
+                if _exl3_mem_waterfall_enabled():
+                    _exl3_mem_snapshot("AFTER_DEST_ALLOC", owner_mod)
+                staged = sharded.detach()
+                if staged.device.type != "cpu":
+                    staged = staged.cpu()
+                if staged.dtype != torch.int16:
+                    staged = staged.to(dtype=torch.int16)
+                if not staged.is_contiguous():
+                    staged = staged.contiguous()
+                if _exl3_mem_waterfall_enabled():
+                    _exl3_mem_snapshot("AFTER_READ", owner_mod)
+                    _exl3_mem_snapshot("AFTER_LAYOUT_CONVERSION", owner_mod)
+                if not hasattr(owner_mod, "_exl3_trellis_staging"):
+                    owner_mod._exl3_trellis_staging = {
+                        "gate": {},
+                        "up": {},
+                        "down": {},
+                    }
+                owner_mod._exl3_trellis_staging[proj][int(expert_id)] = staged
+                if _exl3_mem_waterfall_enabled():
+                    _exl3_mem_snapshot("AFTER_COPY_TO_FINAL", owner_mod)
+                del loaded, sharded, loaded_weight
+                if _exl3_mem_waterfall_enabled():
+                    _exl3_mem_snapshot("AFTER_TEMP_DELETE", owner_mod)
+                return True if return_success else None
+
+            # Legacy: one independent Parameter allocation per expert.
+            dest_device = owner_mod.w13_suh.device
+            if _exl3_mem_waterfall_enabled():
+                _exl3_mem_snapshot("AFTER_DEST_ALLOC", owner_mod)
+            if (
+                sharded.dtype == torch.int16
+                and sharded.device == dest_device
+                and sharded.is_contiguous()
+            ):
+                payload = sharded
+            else:
+                payload = sharded.to(
+                    device=dest_device, dtype=torch.int16, non_blocking=False
+                ).contiguous()
+            if _exl3_mem_waterfall_enabled():
+                _exl3_mem_snapshot("AFTER_READ", owner_mod)
+                _exl3_mem_snapshot("AFTER_LAYOUT_CONVERSION", owner_mod)
+                _exl3_mem_snapshot("AFTER_COPY_TO_FINAL", owner_mod)
+            new_p = Parameter(payload, requires_grad=False)
+            new_p.weight_loader = self._load_exl3
+            new_p._exl3_owner = owner_mod
+            plist[expert_id] = new_p
+            owner_mod._exl3_trellis_alloc_count_before = int(
+                getattr(owner_mod, "_exl3_trellis_alloc_count_before", 0)
+            ) + 1
+            del loaded, sharded, payload, loaded_weight
+            if _exl3_mem_waterfall_enabled():
+                _exl3_mem_snapshot("AFTER_TEMP_DELETE", owner_mod)
+            return True if return_success else None
+
+        # suh / svh remain stacked (K-independent).
+        if owner_mod is None:
+            raise RuntimeError("EXL3 scale load missing owner module")
         if shard_id in ("w1", "w3"):
             shard_idx = 0 if shard_id == "w1" else 1
             sharded = shard_exl3_col(loaded, suffix, tp_rank, tp_size)
-            dest = param.data[expert_id, shard_idx]
+            dest = getattr(owner_mod, "w13_" + suffix).data[expert_id, shard_idx]
         elif shard_id == "w2":
             sharded = shard_exl3_row(loaded, suffix, tp_rank, tp_size)
-            dest = param.data[expert_id]
+            dest = getattr(owner_mod, "w2_" + suffix).data[expert_id]
         else:
             raise ValueError(f"unknown EXL3 shard_id={shard_id}")
 
+        if not sharded.is_contiguous():
+            sharded = sharded.contiguous()
         if tuple(dest.shape) != tuple(sharded.shape):
-            import os as _os
-            if _os.environ.get("VLLM_EXL3_ALLOW_SHAPE_MISMATCH", "0") != "1":
-                raise RuntimeError(
-                    f"EXL3 load shape mismatch {weight_name} shard={shard_id} "
-                    f"expert={expert_id}: dest {tuple(dest.shape)} != "
-                    f"loaded {tuple(sharded.shape)}. Set "
-                    f"VLLM_EXL3_ALLOW_SHAPE_MISMATCH=1 for diagnostic "
-                    f"loading with partial weight copy."
-                )
-            if dest.ndim != sharded.ndim:
-                # Rank mismatches cannot be coordinate-mapped; reject before
-                # zero-filling so a failed load leaves the destination intact.
-                raise RuntimeError(
-                    f"EXL3 diagnostic load requires matching rank for "
-                    f"{weight_name} shard={shard_id} expert={expert_id}: "
-                    f"dest {dest.ndim}D {tuple(dest.shape)} vs loaded "
-                    f"{sharded.ndim}D {tuple(sharded.shape)}."
-                )
-            logger.warning(
-                "EXL3 shape mismatch (DIAGNOSTIC) %s shard=%s expert=%s: "
-                "dest %s != loaded %s — zero-filling, coordinate-copying "
-                "per-dimension overlap. Model outputs WILL be incorrect.",
-                weight_name, shard_id, expert_id,
-                tuple(dest.shape), tuple(sharded.shape),
+            raise RuntimeError(
+                f"EXL3 load shape mismatch {weight_name} shard={shard_id} "
+                f"expert={expert_id}: dest {tuple(dest.shape)} != "
+                f"loaded {tuple(sharded.shape)}"
             )
-            dest.zero_()
-            slices = tuple(
-                slice(0, min(d, s)) for d, s in zip(dest.shape, sharded.shape)
-            )
-            dest[slices].copy_(sharded[slices].to(dest.dtype))
-            return True if return_success else None
         dest.copy_(sharded)
+        del loaded, sharded, loaded_weight
         return True if return_success else None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if not hasattr(layer, "w13_trellis"):
+        if not hasattr(layer, "gate_trellis"):
             return
+        # Pack staged trellis tensors into contiguous per-shape arenas before
+        # building LinearEXL3 handles. Views preserve exact heterogeneous K.
+        # Direct-fill plans have empty staging but still need stats finalized.
+        staging = getattr(layer, "_exl3_trellis_staging", None) or {}
+        staged_n = sum(len(m) for m in staging.values() if isinstance(m, dict))
+        has_plan = getattr(layer, "_exl3_trellis_arena_plan", None) is not None
+        if _exl3_trellis_arena_enabled() and (staged_n > 0 or has_plan):
+            if _exl3_mem_waterfall_enabled():
+                _exl3_mem_snapshot("BEFORE_ARENA_PACK", layer)
+            alloc_before = int(getattr(layer, "_exl3_trellis_alloc_count_before", 0))
+            alloc_before = max(alloc_before, staged_n)
+            stats = _pack_trellis_arenas(layer)
+            stats["allocations_before"] = alloc_before
+            layer._exl3_trellis_arena_stats = stats
+            if _exl3_mem_waterfall_enabled():
+                _exl3_mem_snapshot("AFTER_ARENA_PACK", layer)
+                _exl3_mem_snapshot("AFTER_GC", layer)
+            if not self._logged:
+                logger.info(
+                    "EXL3 trellis arenas: before_allocs=%s after_arenas=%s "
+                    "final_bytes=%s temp_peak_bytes=%s",
+                    stats.get("allocations_before"),
+                    stats.get("allocations_after"),
+                    stats.get("final_bytes"),
+                    stats.get("temp_peak_bytes"),
+                )
+
         # Bind owner for any late loads; stitch LinearEXL3 handles.
         for name in (
             "w13_trellis",
@@ -2028,36 +2667,59 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             "w2_mcg",
             "w2_mul1",
         ):
-            getattr(layer, name)._exl3_owner = layer
+            if hasattr(layer, name):
+                getattr(layer, name)._exl3_owner = layer
+        for plist in (layer.gate_trellis, layer.up_trellis, layer.down_trellis):
+            for param in plist:
+                param._exl3_owner = layer
+                param.weight_loader = self._load_exl3
         _check_moe_codebook_markers(layer.w13_mcg, layer.w13_mul1, "w13")
         _check_moe_codebook_markers(layer.w2_mcg, layer.w2_mul1, "w2")
 
-        n_exp = int(layer.w13_trellis.shape[0])
+        n_exp = int(len(layer.gate_trellis))
         inners: list[dict[str, Any]] = []
+        k_values: list[int] = []
         for e in range(n_exp):
+            gt = layer.gate_trellis[e]
+            ut = layer.up_trellis[e]
+            dt = layer.down_trellis[e]
+            if gt.numel() == 0 or ut.numel() == 0 or dt.numel() == 0:
+                raise RuntimeError(
+                    f"EXL3 mixed-K load incomplete for local expert {e}: "
+                    f"gate={tuple(gt.shape)} up={tuple(ut.shape)} down={tuple(dt.shape)}"
+                )
             gate = make_linear_exl3(
-                layer.w13_trellis[e, 0],
+                gt,
                 layer.w13_suh[e, 0],
                 layer.w13_svh[e, 0],
                 _moe_marker_or_none(layer.w13_mcg[e, 0]),
                 _moe_marker_or_none(layer.w13_mul1[e, 0]),
             )
             up = make_linear_exl3(
-                layer.w13_trellis[e, 1],
+                ut,
                 layer.w13_suh[e, 1],
                 layer.w13_svh[e, 1],
                 _moe_marker_or_none(layer.w13_mcg[e, 1]),
                 _moe_marker_or_none(layer.w13_mul1[e, 1]),
             )
             down = make_linear_exl3(
-                layer.w2_trellis[e],
+                dt,
                 layer.w2_suh[e],
                 layer.w2_svh[e],
                 _moe_marker_or_none(layer.w2_mcg[e]),
                 _moe_marker_or_none(layer.w2_mul1[e]),
             )
             inners.append({"gate": gate, "up": up, "down": down})
+            k_values.extend(
+                [
+                    int(gt.shape[-1]) // 16,
+                    int(ut.shape[-1]) // 16,
+                    int(dt.shape[-1]) // 16,
+                ]
+            )
         layer._exl3_inners = inners
+        mixed_k = len(set(k_values)) > 1
+        layer._exl3_mixed_k = mixed_k
         # Codebook flags (mcg, mul1) per projection for the fused kernel launch;
         # every expert in a layer must agree.
         if inners:
@@ -2079,10 +2741,15 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             layer._exl3_codebook_flags = flags
         fused_ok = False
         fused_err = None
-        # Native dispatch has its own environment control and must still build
-        # pointer tables when the legacy EXL3_FUSED_MOE switch is disabled.
+        # Fused/native MoE launches take a single K for gate/up/down across the
+        # whole layer. Heterogeneous packed K must use the LinearEXL3 loop.
         backend = get_moe_kernel_backend()
-        if fused_moe_enabled() or backend == "native":
+        if mixed_k:
+            fused_err = f"mixed_packed_K={sorted(set(k_values))}"
+            layer._exl3_ptrs = None
+            layer._exl3_fused_temps = None
+            layer._exl3_fused_concurrency = 0
+        elif fused_moe_enabled() or backend == "native":
             try:
                 has_native = backend == "native" and native_moe_kernel_available()
                 has_exllamav3 = _exllamav3_moe_available()
@@ -2118,15 +2785,23 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 logger.info(
                     "EXL3 MCG trellis engaged for routed experts: bits=%s "
                     "experts_local=%s hidden=%s intermediate_local=%s "
-                    "fused_moe=python_loop (%s) "
+                    "fused_moe=python_loop (%s) mixed_k=%s "
                     "(no BF16 expert reconstruct at load)",
                     self.bits,
                     n_exp,
                     layer._exl3_hidden_size,
                     layer._exl3_intermediate_local,
                     fused_err or "EXL3_FUSED_MOE=0",
+                    mixed_k,
                 )
             self._logged = True
+        # Release transient load leftovers between MoE layers on UMA hosts.
+        gc.collect()
+        if torch is not None and torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
     def apply(
         self,
