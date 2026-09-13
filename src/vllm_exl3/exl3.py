@@ -1835,7 +1835,13 @@ def _fat_scratch(
 
 def _fat_kernel_available() -> bool:
     native_c = _load_native_exl3_ext()
-    return bool(native_c and hasattr(native_c, "exl3_fat_gemm"))
+    if not bool(native_c and hasattr(native_c, "exl3_fat_gemm")):
+        return False
+    # exl3_fat_gemm requires sm_80+ (ldsm4 + m16n8k16); on Volta the
+    # reconstruct+hgemm fallback covers fat experts.
+    if os.environ.get("VLLM_EXL3_SM70") == "1":
+        return False
+    return True
 
 
 def apply_exl3_batched_fat(
@@ -2518,6 +2524,12 @@ class Exl3Config(QuantizationConfig):
     @classmethod
     def get_min_capability(cls) -> int:
         # LinearEXL3 uses CUDA >= Ampere; GB10 is SM121.
+        # VLLM_EXL3_SM70=1: Volta (sm_70) fork — the sm70 GEMV/tiled
+        # kernels in exllamav3-sm70 cover decode; fat GEMM is routed
+        # to reconstruct+hgemm on cc < 8.
+        import os
+        if os.environ.get("VLLM_EXL3_SM70") == "1":
+            return 70
         return 80
 
     @staticmethod
