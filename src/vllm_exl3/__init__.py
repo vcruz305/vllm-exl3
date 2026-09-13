@@ -109,12 +109,23 @@ def runtime_diagnostics():
         "tensor_level_mixed_k_within_layer": True,
         "heterogeneous_dispatch": "python_loop",
         "uniform_k_dispatch": "fused_when_available",
+        "cudagraph_qualified": False,
+        "recommended_first_boot": "eager",
+        "arena_prescan_placement_contract": "linear_contiguous_global_expert_ids",
+        "legacy_shape_overlap_diagnostic": False,
+        "legacy_shape_overlap_note": (
+            "The old opt-in partial-copy trellis diagnostic is superseded by exact-shape "
+            "per-expert trellis allocation. Non-trellis scale/marker shape mismatches "
+            "remain hard failures."
+        ),
         "note": (
             "K7/K8 are accepted for ExLlamaV3 execution. The custom native p2b "
             "path remains K2-K4. Routed experts store exact per-expert trellis "
             "shapes (including intra-expert w1/w2/w3 K disagreement). "
             "Heterogeneous packed K within a layer forces the LinearEXL3 "
-            "python_loop; uniform-K layers still use the fused fast path."
+            "python_loop; uniform-K layers still use the fused fast path. "
+            "The heterogeneous path is correctness-first and should remain eager "
+            "until CUDA-graph qualification is completed."
         ),
     }
     record["tp_geometry"] = {
