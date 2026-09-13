@@ -35,6 +35,7 @@ def register() -> None:
     from . import exl3
     from .deepseek_v41 import install_deepseek_v41_compat
     from .k78_compat import install_k78_config_compat
+    from .mixed_k_guard import install_mixed_k_prescan_guard
     from .runtime_policy import install_native_row_policy
     from .tp_geometry_compat import install_tp_geometry_compat
     from .uva_offload import install_uva_expert_validation
@@ -48,6 +49,11 @@ def register() -> None:
     # RoutedExperts.moe_config.moe_parallel_config. Resolve that before falling
     # back to process-wide TP state so EP ranks keep whole expert matrices.
     install_tp_geometry_compat(exl3)
+
+    # The low-memory mixed-K arena prescan assumes a contiguous linear expert
+    # range. Disable that optimization for non-linear placement/EPLB and let the
+    # authoritative vLLM loader mapping drive expert ownership instead.
+    install_mixed_k_prescan_guard(exl3)
 
     # Install model-family compatibility before runtime policy wrappers inspect
     # the quantization config. vLLM still owns the DeepSeek V4.1 architecture.
@@ -112,6 +118,9 @@ def runtime_diagnostics():
         "cudagraph_qualified": False,
         "recommended_first_boot": "eager",
         "arena_prescan_placement_contract": "linear_contiguous_global_expert_ids",
+        "arena_prescan_guard_installed": bool(
+            getattr(exl3, "_vllm_exl3_mixed_k_prescan_guard_installed", False)
+        ),
         "legacy_shape_overlap_diagnostic": False,
         "legacy_shape_overlap_note": (
             "The old opt-in partial-copy trellis diagnostic is superseded by exact-shape "
