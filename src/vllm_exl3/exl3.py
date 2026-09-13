@@ -2310,6 +2310,12 @@ def apply_exl3_experts(
             import exllamav3_ext
 
             use_fused = hasattr(exllamav3_ext, "exl3_moe")
+            # exl3_moe is the sm80 block-pipelined kernel; on Volta it
+            # would launch with mma/cp.async PTX the device cannot run.
+            # Fall through to the per-expert path, which routes through
+            # the sm70 GEMV/tiled kernels.
+            if use_fused and int(exllamav3_ext.g_get_cc(x.device.index)) < 8:
+                use_fused = False
         except Exception:
             use_fused = False
     if use_fused:
