@@ -104,6 +104,7 @@ void perform_cpu_reduce_avx512(PGContext*, size_t, uint32_t, uint32_t, uint8_t*,
         root / "cpu/moe_mul1.cpp",
         """#include "moe_mul1.h"
 #include <cstdlib>
+#include <stdexcept>
 int64_t exl3_moe_cpu_make_layer(
     const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
     const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
@@ -125,6 +126,8 @@ void exl3_moe_cpu_set_prof(bool) {}
 bool exl3_moe_cpu_has_avx2() { return false; }
 bool exl3_moe_cpu_has_avx512_vnni() { return false; }
 bool exl3_moe_cpu_has_avx512_vbmi() { return false; }
+bool exl3_moe_cpu_has_avx512_bw() { return false; }
+int64_t exl3_moe_cpu_pool_stress(int, int, int, int) { throw std::runtime_error("CPU MoE is disabled in this ARM64 build"); }
 """,
     )
 
