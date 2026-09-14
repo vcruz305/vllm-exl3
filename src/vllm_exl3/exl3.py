@@ -714,6 +714,15 @@ def prepare_trellis_arena_plan(
     return stats
 
 
+# Direct-copy component extracted from PR14; no device-policy/MADV changes.
+_DIRECT_FILL_STATS = {"DIRECT_FILL_CALLS": 0, "DIRECT_FILL_BYTES": 0}
+
+
+def direct_fill_stats() -> dict[str, int]:
+    """Return current direct fill call count and byte transfer volume."""
+    return dict(_DIRECT_FILL_STATS)
+
+
 def _direct_fill_trellis_slot(
     layer: Any,
     proj: str,
@@ -740,12 +749,16 @@ def _direct_fill_trellis_slot(
     layer._exl3_trellis_temp_peak_bytes = max(
         int(getattr(layer, "_exl3_trellis_temp_peak_bytes", 0)), transient
     )
-    if src.device == arena.device and src.dtype == torch.int16:
-        arena[idx].copy_(src if src.is_contiguous() else src.contiguous())
-    else:
-        arena[idx].copy_(
-            src.to(device=arena.device, dtype=torch.int16, non_blocking=False)
-        )
+    # PR14's direct H2D copy, kept separate from its broader policy changes.
+    # Keep conversion on the source device; never allocate src.to(cuda) beside
+    # the final arena. Blocking copy establishes completion before release.
+    if src.dtype != torch.int16:
+        src = src.to(dtype=torch.int16)
+    if not src.is_contiguous():
+        src = src.contiguous()
+    arena[idx].copy_(src, non_blocking=False)
+    _DIRECT_FILL_STATS["DIRECT_FILL_CALLS"] += 1
+    _DIRECT_FILL_STATS["DIRECT_FILL_BYTES"] += transient
 
 
 def _pack_trellis_arenas(layer: Any) -> dict[str, Any]:
