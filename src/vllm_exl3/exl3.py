@@ -2362,6 +2362,9 @@ class Exl3Config(QuantizationConfig):
         # Attention-family bits (some packs quantize attention output
         # projections at higher precision than the body).
         self.head_bits = int(kwargs.pop("head_bits", 0) or 0)
+        # Batched (bmm) layer prefixes → per-rank slice counts; set by
+        # the model before layer construction (see create_weights).
+        self.bmm_prefixes = dict(kwargs.pop("bmm_prefixes", {}) or {})
         self.codebook = str(codebook)
         self.scope = str(scope)
         # Optional per-layer override, e.g. {"42": 3, "27": 3}. Layers absent
@@ -2550,6 +2553,7 @@ class Exl3Config(QuantizationConfig):
         skip = {
             "bits",
             "head_bits",
+            "bmm_prefixes",
             "codebook",
             "scope",
             "quant_method",
@@ -2633,6 +2637,13 @@ class Exl3Config(QuantizationConfig):
             return Exl3MoEMethod(
                 layer.moe_config, self, bits=self.bits_for_prefix(prefix)
             )
+        # Quantized LM head: the checkpoint carries head.trellis etc.
+        # (VocabParallelEmbedding isn't LinearBase, so it needs its own
+        # branch). The pack quantizes it at head_bits.
+        _lp = getattr(layer, "prefix", "") or ""
+        if _lp.endswith("lm_head"):
+            _hb = getattr(self, "head_bits", 0) or self.bits
+            return Exl3LinearMethod(self, bits=_hb)
         if isinstance(layer, LinearBase):
             # Check if this LinearBase should use non_routed_exl3
             if self._matches_non_routed_exl3(prefix):
@@ -2654,7 +2665,8 @@ class Exl3Config(QuantizationConfig):
                 bits = self.bits
                 hb = getattr(self, "head_bits", 0)
                 if hb and ("/attn." in prefix or ".attn." in prefix
-                           or "compressor." in prefix):
+                           or "compressor." in prefix
+                           or "shared_experts." in prefix):
                     bits = hb
                 return Exl3LinearMethod(self, bits=bits)
             if getattr(self, "non_routed_dtype_policy", "") == "bf16_as_stored":
@@ -4175,6 +4187,28 @@ class Exl3LinearMethod(LinearMethodBase):
                     f"EXL3 bf16 shards are not supported with TP size > 1; tp_size={tp_size}"
                 )
 
+        # Batched (bmm) layers: the model registers prefixes whose
+        # checkpoint tensors are per-slice (slice.N.*). The slice
+        # count (per rank) comes from Exl3Config.bmm_prefixes — set
+        # by the model before layer construction (layer attrs set
+        # after construction are too late: create_weights runs inside
+        # the constructor).
+        bmm_slices = 0
+        _prefix = getattr(layer, "prefix", "") or ""
+        _bmm_map = getattr(self, "bmm_prefixes", None) or getattr(
+            self.quant_config, "bmm_prefixes", {}
+        )
+        for _pat, _n in _bmm_map.items():
+            if _prefix.endswith(_pat):
+                bmm_slices = int(_n)
+                break
+        is_bmm = bmm_slices > 1 or bool(getattr(layer, "is_bmm", False))
+        layer._exl3_linear_is_bmm = is_bmm
+        layer._exl3_bmm_slices = bmm_slices
+        import os
+        if os.environ.get("EXL3_BMM_DEBUG"):
+            import sys
+            print(f"[bmm] prefix={_prefix!r} map={_bmm_map!r} slices={bmm_slices} is_bmm={is_bmm}", file=sys.stderr, flush=True)
         # K words per shard
         k_words = self.bits * 16
 
@@ -4187,12 +4221,21 @@ class Exl3LinearMethod(LinearMethodBase):
         in_per_partition = _exl3_pad128(true_in)
         output_partition_sizes = [_exl3_pad128(s) for s in true_out_sizes]
         padded = in_per_partition != true_in or output_partition_sizes != true_out_sizes
-        if padded and (bf16_shards or n_shards > 1):
+        # Tile-aligned padding (pad < 16 rows/cols) is safe under TP:
+        # the padded region is zeroed below and never contributes to
+        # the output (padded svh rows are zero). Larger pads remain
+        # unsupported.
+        _pad_rows = sum(output_partition_sizes) - sum(true_out_sizes)
+        _pad_in = in_per_partition - true_in
+        # Tile-aligned: the pad is a whole number of 16-wide tiles —
+        # the padded region decodes as complete zero tiles.
+        _tile_aligned_pad = padded and _pad_rows % 16 == 0 and _pad_in % 16 == 0
+        if padded and not _tile_aligned_pad and (bf16_shards or n_shards > 1):
             raise NotImplementedError(
                 "EXL3 padded linear geometry is supported for single-shard layers "
                 f"without bf16 shards only: in={true_in} out={true_out_sizes}"
             )
-        if padded:
+        if padded and not _tile_aligned_pad:
             _, _pad_tp = _resolve_tp_geometry(layer)
             if int(_pad_tp) > 1:
                 raise NotImplementedError(
@@ -4227,8 +4270,12 @@ class Exl3LinearMethod(LinearMethodBase):
             requires_grad=False,
         )
         # Per-shard suh (one per shard, each covers this rank's input partition)
+        # Batched (bmm) layers: each slice has its OWN suh (verified:
+        # per-slice suh tensors are distinct) — allocate one row per
+        # slice instead of one per shard.
+        _suh_rows = bmm_slices if is_bmm and bmm_slices > n_shards else n_shards
         suh_param = Parameter(
-            torch.empty(n_shards, in_per_partition, dtype=torch.float16),
+            torch.empty(_suh_rows, in_per_partition, dtype=torch.float16),
             requires_grad=False,
         )
         # Per-shard svh (one per shard, concatenated)
@@ -4253,6 +4300,12 @@ class Exl3LinearMethod(LinearMethodBase):
             requires_grad=False,
         )
 
+        if padded:
+            # Padded region never loaded — zero it so padded rows/cols
+            # contribute nothing (padded svh = 0 → zero output).
+            trellis_param.zero_()
+            suh_param.zero_()
+            svh_param.zero_()
         layer.register_parameter("trellis", trellis_param)
         layer.register_parameter("suh", suh_param)
         layer.register_parameter("svh", svh_param)
@@ -4274,8 +4327,6 @@ class Exl3LinearMethod(LinearMethodBase):
         # Batched (bmm) layers: the checkpoint's slice tensors are
         # rank-local (the slice structure accounts for TP) — the
         # loader must NOT apply TP narrowing to them.
-        is_bmm = bool(getattr(layer, "is_bmm", False))
-        layer._exl3_linear_is_bmm = is_bmm
         for suffix, p in (
             ("trellis", trellis_param),
             ("suh", suh_param),
@@ -4292,6 +4343,7 @@ class Exl3LinearMethod(LinearMethodBase):
                 layer,
                 is_qkv_parallel,
                 is_bmm=is_bmm,
+                bmm_slices=bmm_slices,
             )
         weight_param.weight_loader = self._make_weight_loader(
             "weight",
@@ -4325,6 +4377,7 @@ class Exl3LinearMethod(LinearMethodBase):
         layer=None,
         is_qkv_parallel=False,
         is_bmm=False,
+        bmm_slices=0,
     ):
         """Create a weight_loader closure for EXL3 linear parameters."""
 
@@ -4408,9 +4461,44 @@ class Exl3LinearMethod(LinearMethodBase):
                     shard_idx = shard_map[loaded_shard_id]
                 elif isinstance(loaded_shard_id, int):
                     shard_idx = loaded_shard_id
+            # Rank-local slice tensors (batched/bmm layers): the model
+            # passes the LOCAL slice index; the param holds gpr
+            # consecutive per-slice segments. Handle before the
+            # n_shards range check (local idx can exceed n_shards=1).
+            _ld0 = int(loaded_weight.shape[0]) if loaded_weight.dim() >= 1 else 0
+            if (
+                is_bmm
+                and shard_idx < bmm_slices
+                and suffix in ("svh", "suh", "trellis", "mul1", "mcg")
+            ):
+                _seg = _ld0  # per-slice segment length
+                if suffix == "svh":
+                    dest = param.data[shard_idx * _seg : (shard_idx + 1) * _seg]
+                    if tuple(dest.shape) == tuple(loaded_weight.shape):
+                        dest.copy_(loaded_weight)
+                        return
+                elif suffix == "suh":
+                    dest = param.data[shard_idx]
+                    if tuple(dest.shape) == tuple(loaded_weight.shape):
+                        dest.copy_(loaded_weight)
+                        return
+                elif suffix in ("mul1", "mcg"):
+                    # Markers: (n_shards, 1) param; both local slices'
+                    # markers carry the same codebook value — write row 0.
+                    param.data[0] = loaded_weight.reshape(1)
+                    return
+                else:  # trellis
+                    _tiles = loaded_weight.shape[1]
+                    _start = shard_idx * _tiles
+                    dest = param.data[:, _start : _start + _tiles, :]
+                    if tuple(dest.shape) == tuple(loaded_weight.shape):
+                        dest.copy_(loaded_weight)
+                        return
             if shard_idx >= n_shards:
                 raise ValueError(
-                    f"shard_idx={shard_idx} out of range for n_shards={n_shards}"
+                    f"shard_idx={shard_idx} out of range for n_shards={n_shards}; "
+                    f"suffix={suffix} loaded={tuple(loaded_weight.shape)} "
+                    f"param={tuple(param.shape)} prefix={getattr(layer, '_exl3_prefix', '?')}"
                 )
 
             # Special handling for weight (bf16 staging) and markers
@@ -4469,36 +4557,80 @@ class Exl3LinearMethod(LinearMethodBase):
             # Normal EXL3 suffix handling (trellis, suh, svh)
             loaded = loaded_weight.detach().contiguous()
 
-            # Batched (bmm) layers: the checkpoint's slice tensors are
-            # rank-local — the slice structure accounts for TP. Skip the
-            # TP narrowing; the dest segment arithmetic below handles
-            # placement.
-            if is_bmm:
-                if suffix == "svh":
-                    dest = param.data  # single-shard param; full write
-                    if tuple(dest.shape) != tuple(loaded.shape):
-                        raise RuntimeError(
-                            f"EXL3 bmm svh shape mismatch: dest {tuple(dest.shape)} != "
-                            f"loaded {tuple(loaded.shape)}"
-                        )
-                    dest.copy_(loaded)
-                    return
-                # suh/trellis/markers fall through to the standard path
-                # (suh/trellis cover the full input, unsharded for
-                # ColumnParallel bmm layers; markers span all shards).
-
             expected_out = output_partition_sizes[shard_idx]
-            if is_qkv_parallel and not is_row_parallel:
-                total_out = (
-                    int(loaded.shape[1]) * 16
-                    if suffix == "trellis"
-                    else int(loaded.shape[0])
+
+            # Rank-local slice tensors (batched/bmm layers): when the
+            # loaded tensor is smaller than the shard's expected out,
+            # it is ONE slice's worth — already rank-local (the slice
+            # structure accounts for TP). Write it at the slice's
+            # segment within the shard: offset = shard_idx * loaded_len.
+            total_out = (
+                int(loaded.shape[1]) * 16
+                if suffix == "trellis"
+                else int(loaded.shape[0])
+            )
+            # round(): expected_out may be padded (tile-aligned pad);
+            # the loaded tensor covers the unpadded geometry — integer
+            # division would skew the shard count (129280//32384=3).
+            shard_tp_size = max(1, round(total_out / expected_out))
+            shard_tp_rank = tp_rank // max(1, tp_size // shard_tp_size)
+
+            # Rank-local slice tensors (batched/bmm layers): when the
+            # loaded tensor is smaller than the shard's expected out,
+            # it is ONE slice's worth — already rank-local (the slice
+            # structure accounts for TP). Write it at the slice's
+            # segment within the shard: offset = shard_idx * loaded_len.
+            _ld0 = int(loaded.shape[0]) if loaded.dim() >= 1 else 0
+            if 0 < _ld0 < expected_out and expected_out % _ld0 == 0:
+                if suffix == "svh":
+                    dest = param.data[shard_idx * _ld0 : (shard_idx + 1) * _ld0]
+                    if tuple(dest.shape) == tuple(loaded.shape):
+                        dest.copy_(loaded)
+                        return
+                elif suffix == "suh":
+                    dest = param.data[shard_idx]
+                    if tuple(dest.shape) == tuple(loaded.shape):
+                        dest.copy_(loaded)
+                        return
+                elif suffix == "trellis":
+                    _tiles = loaded.shape[1]
+                    _start = shard_idx * _tiles
+                    dest = param.data[:, _start : _start + _tiles, :]
+                    if tuple(dest.shape) == tuple(loaded.shape):
+                        dest.copy_(loaded)
+                        return
+
+            # Vocab-parallel full tensor (quantized LM head): the
+            # checkpoint ships the unsharded tensor; narrow to this
+            # rank's contiguous range and write into the padded param
+            # (the pad region was zeroed at allocation).
+            if (
+                _ld0 > 0
+                and not is_row_parallel
+                and (
+                    _ld0 >= param.shape[0] * (tp_size - 1)
+                    and _ld0 % tp_size == 0
+                    or (
+                        suffix == "trellis"
+                        and loaded.shape[1] >= param.shape[1] * (tp_size - 1)
+                        and loaded.shape[1] % tp_size == 0
+                    )
                 )
-                shard_tp_size = max(1, total_out // expected_out)
-                shard_tp_rank = tp_rank // max(1, tp_size // shard_tp_size)
-            else:
-                shard_tp_size = tp_size
-                shard_tp_rank = tp_rank
+            ):
+                if suffix == "trellis":
+                    _tiles = loaded.shape[1] // tp_size
+                    dest = param.data[:, :_tiles, :]
+                    _src = loaded[:, _tiles * tp_rank : _tiles * (tp_rank + 1), :]
+                    if tuple(dest.shape) == tuple(_src.shape):
+                        dest.copy_(_src)
+                        return
+                else:
+                    _per = _ld0 // tp_size
+                    dest = param.data[:_per]
+                    _src = loaded[_per * tp_rank : _per * (tp_rank + 1)]
+                    if tuple(dest.shape) == tuple(_src.shape):
+                        dest.copy_(_src)
+                        return
 
             # Apply TP slicing based on layer type
             if is_row_parallel:
@@ -4538,7 +4670,9 @@ class Exl3LinearMethod(LinearMethodBase):
                 raise RuntimeError(
                     f"EXL3 linear load shape mismatch shard={shard_idx} "
                     f"suffix={suffix}: dest {tuple(dest.shape)} != "
-                    f"loaded {tuple(sharded.shape)}"
+                    f"loaded {tuple(sharded.shape)}; "
+                    f"prefix={getattr(layer, '_exl3_prefix', '?')} "
+                    f"bits={getattr(self, 'bits', '?')} hb={getattr(self, 'head_bits', '?')}"
                 )
             dest.copy_(sharded)
             if dest.device.type == "cuda" and torch is not None:
