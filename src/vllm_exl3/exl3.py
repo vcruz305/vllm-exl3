@@ -2359,6 +2359,9 @@ class Exl3Config(QuantizationConfig):
     ) -> None:
         super().__init__()
         self.bits = int(bits)
+        # Attention-family bits (some packs quantize attention output
+        # projections at higher precision than the body).
+        self.head_bits = int(kwargs.pop("head_bits", 0) or 0)
         self.codebook = str(codebook)
         self.scope = str(scope)
         # Optional per-layer override, e.g. {"42": 3, "27": 3}. Layers absent
@@ -2546,6 +2549,7 @@ class Exl3Config(QuantizationConfig):
     def from_config(cls, config: dict[str, Any]) -> "Exl3Config":
         skip = {
             "bits",
+            "head_bits",
             "codebook",
             "scope",
             "quant_method",
@@ -2558,6 +2562,7 @@ class Exl3Config(QuantizationConfig):
         }
         inst = cls(
             bits=int(config.get("bits", 4)),
+            head_bits=int(config.get("head_bits", 0)),
             codebook=str(config.get("codebook", "mcg")),
             scope=str(config.get("scope", "glm53_routed_experts_only")),
             non_routed_exl3=config.get("non_routed_exl3"),
@@ -2642,7 +2647,16 @@ class Exl3Config(QuantizationConfig):
             if not self.non_routed_exl3 and getattr(
                     self, "non_routed_dtype_policy", "") != "bf16_as_stored":
                 layer._exl3_prefix = prefix
-                return Exl3LinearMethod(self, bits=self.bits)
+                # Packs distinguish attention-family bits (head_bits)
+                # from the global bits; attention/compressor linears
+                # take head_bits when declared (verified against the
+                # checkpoint: wq_a/wkv trellis k_words=80 = 5bpw).
+                bits = self.bits
+                hb = getattr(self, "head_bits", 0)
+                if hb and ("/attn." in prefix or ".attn." in prefix
+                           or "compressor." in prefix):
+                    bits = hb
+                return Exl3LinearMethod(self, bits=bits)
             if getattr(self, "non_routed_dtype_policy", "") == "bf16_as_stored":
                 return UnquantizedLinearMethod()
             d = self._non_routed_delegate()
