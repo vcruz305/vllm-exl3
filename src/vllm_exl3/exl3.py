@@ -4578,7 +4578,17 @@ class Exl3LinearMethod(LinearMethodBase):
             # structure accounts for TP). Write it at the slice's
             # segment within the shard: offset = shard_idx * loaded_len.
             _ld0 = int(loaded.shape[0]) if loaded.dim() >= 1 else 0
-            if 0 < _ld0 < expected_out and expected_out % _ld0 == 0:
+            # The output-side size of the loaded tensor: trellis dim 1
+            # (out-tiles × 16); svh/suh dim 0. Comparing the trellis's
+            # dim 0 (in-tiles) against expected_out is dimensionally
+            # wrong — it misroutes merged-layer shard writes (the wkv
+            # trellis landed inside the wq_a region).
+            _out_side = (
+                int(loaded.shape[1]) * 16
+                if suffix == "trellis" and loaded.dim() >= 2
+                else _ld0
+            )
+            if 0 < _out_side < expected_out and expected_out % _out_side == 0:
                 if suffix == "svh":
                     dest = param.data[shard_idx * _ld0 : (shard_idx + 1) * _ld0]
                     if tuple(dest.shape) == tuple(loaded.shape):
@@ -4601,8 +4611,14 @@ class Exl3LinearMethod(LinearMethodBase):
             # checkpoint ships the unsharded tensor; narrow to this
             # rank's contiguous range and write into the padded param
             # (the pad region was zeroed at allocation).
+            # Gated on the LM head: without the gate this branch
+            # catches EVERY tp_size=1 trellis call and routes merged
+            # layers' shard-1 writes into the shard-0 region (the
+            # wkv partition landed at [0:32] and was overwritten).
+            _lp_name = str(getattr(layer, "_exl3_prefix", "") or getattr(layer, "prefix", ""))
             if (
-                _ld0 > 0
+                _lp_name.endswith("lm_head")
+                and _ld0 > 0
                 and not is_row_parallel
                 and (
                     _ld0 >= param.shape[0] * (tp_size - 1)
