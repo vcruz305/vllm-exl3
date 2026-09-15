@@ -1,0 +1,32 @@
+{
+  "coding": {
+    "chat_template_kwargs": {
+      "thinking": false,
+      "reasoning_effort": "low"
+    },
+    "temperature": 0,
+    "seed": 17,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write a Python function named stable_unique that returns unique hashable list items in their original order. Include type hints, a short docstring, and three assert tests. Return only one Python code block."
+      }
+    ],
+    "max_tokens": 384
+  },
+  "long_form": {
+    "chat_template_kwargs": {
+      "thinking": false,
+      "reasoning_effort": "low"
+    },
+    "temperature": 0,
+    "seed": 17,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write a detailed technical explanation of why a model server can have fast token generation but slow time to first token. Explain prompt processing, memory bandwidth, disk reads, concurrency, and practical measurements. Use at least 600 words."
+      }
+    ],
+    "max_tokens": 512
+  }
+}

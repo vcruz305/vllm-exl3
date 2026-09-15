@@ -1,0 +1,5 @@
+{
+  "repository": "https://github.com/turboderp-org/exllamav3",
+  "revision": "be57335b087e4f001c5caae061544df3c06ba01e",
+  "note": "Only the serving kernel include closure is bundled; local modifications are recorded by source hashes."
+}
