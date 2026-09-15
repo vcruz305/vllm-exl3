@@ -2601,8 +2601,9 @@ class Exl3Config(QuantizationConfig):
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+        from vllm.model_executor.layers.fused_moe import FusedMoE
 
-        if isinstance(layer, RoutedExperts):
+        if isinstance(layer, (RoutedExperts, FusedMoE)):
             # Draft/MTP blocks construct with plain layers.N prefixes (the
             # mtp_block name appears only in parameter paths), so gate by
             # declared layer index, never by name.
@@ -2633,6 +2634,15 @@ class Exl3Config(QuantizationConfig):
                 bits = self._bits_for_non_routed(prefix)
                 layer._exl3_prefix = prefix
                 return Exl3LinearMethod(self, bits=bits)
+            # Packs quantized end-to-end by exllamav3 carry no
+            # non_routed_exl3 spec: every dense linear has trellis
+            # tensors in the checkpoint. Default those to exl3 with
+            # the global bits; packs that keep dense layers native
+            # set non_routed_exl3.exclude or ship no trellis for them.
+            if not self.non_routed_exl3 and getattr(
+                    self, "non_routed_dtype_policy", "") != "bf16_as_stored":
+                layer._exl3_prefix = prefix
+                return Exl3LinearMethod(self, bits=self.bits)
             if getattr(self, "non_routed_dtype_policy", "") == "bf16_as_stored":
                 return UnquantizedLinearMethod()
             d = self._non_routed_delegate()
