@@ -1243,12 +1243,6 @@ def make_linear_exl3(
     """Build a LinearEXL3 over already-sharded packed tensors. No BF16 expand."""
     if out_dtype is None and torch is not None:
         out_dtype = torch.float16
-    import os as _os
-    if _os.environ.get("EXL3_APPLY_DEBUG"):
-        import sys as _sys
-        print(f"[apply] make_linear_exl3: suh={tuple(suh.shape)} svh={tuple(svh.shape)} "
-              f"trellis={tuple(trellis.shape)} in={int(suh.numel())} out={int(svh.numel())}",
-              file=_sys.stderr, flush=True)
     cls = load_linear_exl3_cls()
     return cls(
         config=None,
@@ -4212,9 +4206,6 @@ class Exl3LinearMethod(LinearMethodBase):
         layer._exl3_linear_is_bmm = is_bmm
         layer._exl3_bmm_slices = bmm_slices
         import os
-        if os.environ.get("EXL3_BMM_DEBUG"):
-            import sys
-            print(f"[bmm] prefix={_prefix!r} map={_bmm_map!r} slices={bmm_slices} is_bmm={is_bmm}", file=sys.stderr, flush=True)
         # K words per shard
         k_words = self.bits * 16
 
