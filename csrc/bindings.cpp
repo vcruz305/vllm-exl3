@@ -166,6 +166,19 @@ at::Tensor p2b_fused_moe(const at::Tensor& x, at::Tensor& out,
                             ids, rw, kg, ku, kd, mcg, intermediate_size, swiglu_limit);
 }
 
+at::Tensor p2b_fused_moe_mk(const at::Tensor& x, at::Tensor& out,
+                            const at::Tensor& gt, const at::Tensor& gu, const at::Tensor& gv,
+                            const at::Tensor& ut, const at::Tensor& uu, const at::Tensor& uv,
+                            const at::Tensor& dt, const at::Tensor& du, const at::Tensor& dv,
+                            const at::Tensor& ids, const at::Tensor& rw,
+                            const at::Tensor& k_gate_tbl, const at::Tensor& k_up_tbl,
+                            const at::Tensor& k_down_tbl, int64_t n_local, bool mcg,
+                            int64_t intermediate_size, float swiglu_limit) {
+    return p2b_fused_moe_mk_cuda(x, out, gt, gu, gv, ut, uu, uv, dt, du, dv,
+                                 ids, rw, k_gate_tbl, k_up_tbl, k_down_tbl,
+                                 n_local, mcg, intermediate_size, swiglu_limit);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dequant_trellis", &dequant_trellis,
           "Decode an EXL3 trellis tensor into an fp16 weight matrix");
@@ -189,10 +202,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("expert_indices"), py::arg("routing_weights"), py::arg("K_gate"),
           py::arg("K_up"), py::arg("K_down"), py::arg("mcg"),
           py::arg("intermediate_size") = 2048, py::arg("swiglu_limit") = 0.0f);
+    m.def("p2b_fused_moe_mk", &p2b_fused_moe_mk,
+          "Fused cooperative MoE decode with per-expert K tables (mixed-K packs)",
+          py::arg("x"), py::arg("out"),
+          py::arg("gate_trellis_ptrs"), py::arg("gate_suh_ptrs"), py::arg("gate_svh_ptrs"),
+          py::arg("up_trellis_ptrs"), py::arg("up_suh_ptrs"), py::arg("up_svh_ptrs"),
+          py::arg("down_trellis_ptrs"), py::arg("down_suh_ptrs"), py::arg("down_svh_ptrs"),
+          py::arg("expert_indices"), py::arg("routing_weights"),
+          py::arg("k_gate_tbl"), py::arg("k_up_tbl"), py::arg("k_down_tbl"),
+          py::arg("n_local"), py::arg("mcg"),
+          py::arg("intermediate_size") = 2048, py::arg("swiglu_limit") = 0.0f);
+
     // ABI 3 adds dynamic 128-aligned hidden/intermediate geometry to the
     // cooperative p2b MoE path. Python must gate new geometries on this value
     // so an older ABI-2 binary can never be used for DeepSeek V4.1.
     m.attr("P2B_MOE_ABI_VERSION") = 3;
+    // ABI 4 adds the per-expert mixed-K entry p2b_fused_moe_mk (int8 K
+    // tables + n_local sentinel); the uniform-K path above stays byte-identical.
+    // The re-assignment below wins over the ABI-3 line above and keeps this
+    // file's diff against the staged original additions-only.
+    m.attr("P2B_MOE_ABI_VERSION") = 4;
+    m.attr("P2B_MOE_MIXED_K") = true;
+
     m.def("exl3_fat_gemm", &exl3_fat_gemm, "Native EXL3 fat GEMM for large prefill rows",
           py::arg("a"), py::arg("packed"), py::arg("out"), py::arg("svh"),
           py::arg("K"), py::arg("mcg"), py::arg("mul1"));
