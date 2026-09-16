@@ -33,6 +33,7 @@ __all__ = [
 def register() -> None:
     # Importing the module executes its register_quantization_config decorator.
     from . import exl3
+    from .align_pad_compat import install_align_pad_compat
     from .deepseek_v41 import install_deepseek_v41_compat
     from .k78_compat import install_k78_config_compat
     from .mixed_k_guard import install_mixed_k_prescan_guard
@@ -66,6 +67,11 @@ def register() -> None:
     install_deepseek_v41_compat(exl3)
     install_native_row_policy(exl3)
     install_uva_expert_validation(exl3)
+
+    # Packs re-laid for zero-copy loading carry __align_pad__ gap fillers that no
+    # module owns; vLLM's AutoWeightsLoader raises on them mid-stream. Ignore that
+    # one prefix, so a genuinely missing weight still fails loudly.
+    install_align_pad_compat(exl3)
 
 
 def runtime_diagnostics():
@@ -137,6 +143,9 @@ def runtime_diagnostics():
         "arena_prescan_placement_contract": "linear_contiguous_global_expert_ids",
         "arena_prescan_guard_installed": bool(
             getattr(exl3, "_vllm_exl3_mixed_k_prescan_guard_installed", False)
+        ),
+        "align_pad_compat_installed": bool(
+            getattr(exl3, "_vllm_exl3_align_pad_compat_installed", False)
         ),
         "legacy_shape_overlap_diagnostic": False,
         "legacy_shape_overlap_note": (
