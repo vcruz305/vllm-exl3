@@ -631,11 +631,24 @@ def _try_prescan_trellis_shapes(
             if shard is None:
                 return None  # incomplete map; fall back to stage-pack
             path = os.path.join(model_dir, shard)
-            try:
-                with safe_open(path, framework="pt") as f:
-                    shape = tuple(int(x) for x in f.get_slice(key).get_shape())
-            except Exception:
-                return None
+            from .tensor_metadata import current_tensor_metadata_provider
+            provider = current_tensor_metadata_provider()
+            if provider is not None:
+                # Authoritative metadata is supplied before construction by the
+                # selected loader. Failure must propagate, never silently stage.
+                desc = provider(path, key)
+                shape = tuple(desc.shape)
+                if (desc.dtype != "I16" or len(shape) != 3
+                        or any(type(x) is not int or x <= 0 for x in shape)
+                        or shape[-1] % 16 or not 2 <= shape[-1] // 16 <= 8
+                        or math.prod(shape) * 2 != desc.nbytes):
+                    raise ValueError("invalid EXL3 planned tensor metadata: " + key)
+            else:
+                try:
+                    with safe_open(path, framework="pt") as f:
+                        shape = tuple(int(x) for x in f.get_slice(key).get_shape())
+                except Exception:
+                    return None
             shapes[proj][local_e] = shape
     return shapes
 
@@ -886,9 +899,7 @@ def _direct_fill_trellis_slot(
     )
     # PR14's direct H2D copy, kept separate from its broader policy changes.
     # Keep conversion on the source device; never allocate src.to(cuda) beside
-    # the final arena. Blocking copy_(non_blocking=False) already waits for
-    # the memcpy; an extra current_stream().synchronize() drained the pipeline
-    # once per expert (~576 times/layer) without making madvise safer.
+    # the final arena. Blocking copy establishes completion before release.
     if src.dtype != torch.int16:
         src = src.to(dtype=torch.int16)
     if not src.is_contiguous():
@@ -1303,22 +1314,14 @@ def apply_exl3_python_loop(
     tokens, hidden = x2d.shape
     if out is None:
         out = torch.zeros(tokens, hidden, dtype=torch.float32, device=x2d.device)
-    unique = torch.unique(ids)
-    for raw in unique.tolist():
-        e_raw = int(raw)
-        if e_raw < 0:
-            continue
-        e = e_raw
-        if expert_map is not None:
-            mapped = int(expert_map[e].item()) if expert_map.numel() > e else e
-            if mapped < 0:
-                continue
-            e = mapped
+    local_ids = map_topk_to_local(ids, len(inners), expert_map).reshape_as(ids)
+    for raw in torch.unique(local_ids).tolist():
+        e = int(raw)
         if e >= len(inners):
             continue
         if only_experts is not None and e not in only_experts:
             continue
-        token_idx, k_pos = (ids == int(raw)).nonzero(as_tuple=True)
+        token_idx, k_pos = (local_ids == e).nonzero(as_tuple=True)
         h = x2d.index_select(0, token_idx)
         pack = inners[e]
         gate = pack["gate"].forward(h.contiguous().half(), {}, out_dtype=torch.float32)
@@ -1335,6 +1338,8 @@ def apply_exl3_python_loop(
 
 def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]]) -> None:
     """Pointer tables + fused temps, once after load. No per-token alloc."""
+    if getattr(layer, "_exl3_mixed_store", None) is not None:
+        raise ValueError("EXL3 mixed-K cannot build uniform-K fused pointer tables")
     try:
         exllamav3_ext = load_exllamav3_ext()
     except Exception:
@@ -1491,6 +1496,10 @@ def _apply_native_fused_moe(
     routing weight, preventing an out-of-bounds read while preserving fallback
     semantics.
     """
+    if getattr(layer, "_exl3_mixed_store", None) is not None:
+        return None
+    if getattr(layer, "_exl3_codebook_flags", None) != (True, False) * 3:
+        return None
     module = _load_native_exl3_ext()
     if module is None or not _native_moe_dimensions_supported(
         x2d, layer, inners, limit
@@ -1798,7 +1807,9 @@ def apply_exl3_fused_moe(
     expert_map: torch.Tensor | None,
     limit: float | None = None,
 ) -> torch.Tensor:
-    """One exl3_moe launch per layer. Experts with count > 128 fall back to LinearEXL3."""
+    """One exl3_moe launch per uniform-K layer, with fat-expert fallback."""
+    if getattr(layer, "_exl3_mixed_store", None) is not None:
+        raise ValueError("EXL3 mixed-K cannot use the uniform-K fused/fat entry point")
     tokens, hidden = x2d.shape
     n_exp = len(inners)
 
@@ -2012,6 +2023,12 @@ def apply_exl3_experts(
     fused: bool | None = None,
 ) -> torch.Tensor:
     """Shipped routed-expert apply. `fused=None` honors EXL3_FUSED_MOE."""
+    if getattr(layer, "_exl3_mixed_store", None) is not None:
+        from .tensor_mixed_k import apply_mixed_reference
+
+        if fused is True:
+            raise RuntimeError("EXL3 mixed-K currently supports eager reference execution only")
+        return apply_mixed_reference(x, topk_ids, topk_weights, layer, limit=limit)
     if _EXL3_PREFILL_SYNC:
         _prefill_sync(int(x.numel() // x.shape[-1]))
     inners = getattr(layer, "_exl3_inners", None)
@@ -2532,6 +2549,26 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ) -> None:
         del params_dtype
+        from .tensor_mixed_k import create_mixed_weights, tensor_mixed_k_enabled
+
+        if tensor_mixed_k_enabled():
+            # Only the opt-in exact-width store needs 128-aligned local dims; the
+            # default uniform-K path keeps main's 16-alignment contract untouched.
+            from .deepseek_v41 import exllamav3_fused_geometry_supported
+
+            if not exllamav3_fused_geometry_supported(
+                hidden_size, intermediate_size_per_partition
+            ):
+                raise ValueError(
+                    "EXL3 routed transforms require 128-aligned local dimensions; "
+                    f"hidden={hidden_size} intermediate_local={intermediate_size_per_partition}. "
+                    "Use whole-expert EP or an aligned TP partition; no padding/truncation is safe."
+                )
+            create_mixed_weights(
+                self, layer, num_experts, hidden_size,
+                intermediate_size_per_partition, extra_weight_attrs,
+            )
+            return
         if hidden_size % 16 or intermediate_size_per_partition % 16:
             raise ValueError(
                 "EXL3 trellis tiles are 16-wide; "
@@ -2678,6 +2715,15 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     "(alloc deferred until first load)",
                     num_experts,
                 )
+        from .tensor_metadata import current_tensor_metadata_provider
+        if current_tensor_metadata_provider() is not None:
+            if _exl3_trellis_arena_enabled() and layer._exl3_trellis_shapes_pending is not None:
+                layer._exl3_require_direct_fill = True
+            else:
+                logger.warning(
+                    "EXL3 constructor plan missing for %s; continuing without direct-fill (draft/MTP)",
+                    getattr(layer, "prefix", None) or getattr(layer, "layer_name", "?"),
+                )
         # vLLM's generic RoutedExperts.load_weights treats any 3-D checkpoint
         # tensor as fused stacked experts and unbinds it per expert; an EXL3
         # per-expert trellis is 3-D by construction. Route this layer's tensors
@@ -2713,6 +2759,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             # (shard_exl3_col/row would quarter already-whole expert tensors).
             tp_rank, tp_size = 0, 1
         suffix = _suffix_from_mapped_name(weight_name)
+        store = getattr(owner, "_exl3_mixed_store", None)
+        if store is not None:
+            store.check_expert_map(getattr(owner, "expert_map", None))
+            store.load(expert_id, shard_id, suffix, loaded_weight, param.device)
+            return True if return_success else None
         # Avoid an early full-tensor .contiguous() copy. On GB10 UMA that
         # transient host copy sits beside the eventual device payload and was
         # observed to push MemAvailable under the 16 GiB abort cliff.
@@ -2772,6 +2823,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 )
 
             use_arena = _exl3_trellis_arena_enabled()
+            if getattr(owner_mod, "_exl3_require_direct_fill", False) and not use_arena:
+                raise RuntimeError("attested EXL3 direct-fill cannot disable final arenas")
             if use_arena:
                 proj = _proj_from_shard_id(shard_id)
                 owner_mod._exl3_trellis_alloc_count_before = int(
@@ -2806,6 +2859,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                         _exl3_mem_snapshot("AFTER_GC", owner_mod)
                     return True if return_success else None
 
+                if getattr(owner_mod, "_exl3_require_direct_fill", False):
+                    raise RuntimeError("attested EXL3 direct-fill plan missing; CPU staging is forbidden")
                 # Fallback: stage on host; pack in process_weights_after_loading.
                 _fb = int(sharded.numel()) * int(sharded.element_size())
                 _DIRECT_FILL_STATS["DIRECT_FILL_FALLBACK_CALLS"] += 1
@@ -2906,6 +2961,16 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         return True if return_success else None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        store = getattr(layer, "_exl3_mixed_store", None)
+        if store is not None:
+            layer._exl3_inners = store.build_inners(make_linear_exl3)
+            layer._exl3_ptrs = None
+            logger.info(
+                "EXL3 tensor-mixed-K: exact-width whole experts=%d, eager reference loop; "
+                "native/fused/fat dispatch disabled (GPU qualification pending)",
+                store.num_experts,
+            )
+            return
         if not hasattr(layer, "gate_trellis"):
             return
         # Pack staged trellis tensors into contiguous per-shape arenas before
