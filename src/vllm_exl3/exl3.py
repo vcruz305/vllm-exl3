@@ -886,17 +886,14 @@ def _direct_fill_trellis_slot(
     )
     # PR14's direct H2D copy, kept separate from its broader policy changes.
     # Keep conversion on the source device; never allocate src.to(cuda) beside
-    # the final arena. Blocking copy establishes completion before release.
+    # the final arena. Blocking copy_(non_blocking=False) already waits for
+    # the memcpy; an extra current_stream().synchronize() drained the pipeline
+    # once per expert (~576 times/layer) without making madvise safer.
     if src.dtype != torch.int16:
         src = src.to(dtype=torch.int16)
     if not src.is_contiguous():
         src = src.contiguous()
     arena[idx].copy_(src, non_blocking=False)
-    if arena.device.type == "cuda" and torch is not None:
-        try:
-            torch.cuda.current_stream().synchronize()
-        except Exception:
-            pass
     _madv_dontneed_cpu_tensor(src)
     _DIRECT_FILL_STATS["DIRECT_FILL_CALLS"] += 1
     _DIRECT_FILL_STATS["DIRECT_FILL_BYTES"] += transient
