@@ -24,9 +24,13 @@ work, Copyright (c) 2025 Turboderp, MIT. See THIRD_PARTY_NOTICES.md.
 
 from __future__ import annotations
 
+import gc
 import importlib
+import json
 import math
 import os
+import time
+from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
 import re
@@ -104,6 +108,7 @@ MUL1_MARKER_SIGNED_INT32 = -2082680531
 EXL3_SUFFIXES = ("trellis", "suh", "svh", "mcg", "mul1")
 SWIGLU_LIMIT_DEFAULT = 10.0
 TEMP_ROWS_FUSED = 2048
+_COOP = os.environ.get("VLLM_EXL3_COOP", "0") == "1"
 try:
     FAT_EXPERT_THRESHOLD = max(0, int(os.environ.get("VLLM_EXL3_FAT_THRESHOLD", "256")))
 except (TypeError, ValueError):
@@ -424,6 +429,692 @@ def filter_speculative_candidates(
     return mask, kept_counts
 
 
+def _exl3_trellis_arena_enabled() -> bool:
+    """Contiguous per-shape trellis arenas (default ON). Set 0 to use legacy allocs."""
+    return os.environ.get("VLLM_EXL3_TRELLIS_ARENA", "1") != "0"
+
+
+def _exl3_mem_waterfall_enabled() -> bool:
+    return os.environ.get("VLLM_EXL3_MEM_WATERFALL", "0") == "1"
+
+
+def _read_proc_meminfo_gib(*keys: str) -> dict[str, float]:
+    out: dict[str, float] = {}
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            wanted = set(keys)
+            for line in fh:
+                name, _, rest = line.partition(":")
+                if name in wanted:
+                    out[name] = int(rest.strip().split()[0]) / (1024.0 * 1024.0)
+    except OSError:
+        pass
+    return out
+
+
+def _exl3_mem_snapshot(tag: str, layer: Any | None = None) -> dict[str, Any]:
+    """Host + process + torch CUDA memory snapshot for materialization tracing."""
+    snap: dict[str, Any] = {"tag": tag, "ts": time.time()}
+    snap.update(_read_proc_meminfo_gib("MemAvailable", "AnonPages", "Cached"))
+    try:
+        with open("/proc/self/status", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    snap["VmRSS_GiB"] = int(line.split()[1]) / (1024.0 * 1024.0)
+                elif line.startswith("VmSize:"):
+                    snap["VmSize_GiB"] = int(line.split()[1]) / (1024.0 * 1024.0)
+    except OSError:
+        pass
+    try:
+        with open("/proc/self/smaps_rollup", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("Pss:"):
+                    snap["Pss_GiB"] = int(line.split()[1]) / (1024.0 * 1024.0)
+                    break
+    except OSError:
+        pass
+    if _TORCH_AVAILABLE and torch is not None and torch.cuda.is_available():
+        try:
+            snap["cuda_allocated_GiB"] = torch.cuda.memory_allocated() / (1024.0**3)
+            snap["cuda_reserved_GiB"] = torch.cuda.memory_reserved() / (1024.0**3)
+        except Exception:
+            pass
+    if layer is not None:
+        snap["trellis_storage_count"] = _count_trellis_storages(layer)
+        snap["trellis_final_bytes"] = _trellis_nbytes(layer)
+        staging = getattr(layer, "_exl3_trellis_staging", None)
+        if staging:
+            snap["trellis_staging_bytes"] = sum(
+                int(t.numel()) * int(t.element_size())
+                for proj_map in staging.values()
+                for t in proj_map.values()
+                if t is not None
+            )
+    path = os.environ.get("VLLM_EXL3_MEM_WATERFALL_PATH", "")
+    if path:
+        try:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(snap, sort_keys=True) + "\n")
+        except OSError:
+            pass
+    return snap
+
+
+def _count_trellis_storages(layer: Any) -> int:
+    """Unique trellis backing storages (arena tensors when present)."""
+    if not _TORCH_AVAILABLE or torch is None:
+        return 0
+    ptrs: set[int] = set()
+    arena_lists = (
+        getattr(layer, "_exl3_gate_trellis_arenas", None),
+        getattr(layer, "_exl3_up_trellis_arenas", None),
+        getattr(layer, "_exl3_down_trellis_arenas", None),
+    )
+    has_arenas = False
+    for arenas in arena_lists:
+        if not arenas:
+            continue
+        has_arenas = True
+        for arena in arenas:
+            try:
+                ptrs.add(int(arena.untyped_storage().data_ptr()))
+            except Exception:
+                continue
+    if has_arenas:
+        return len(ptrs)
+    for name in ("gate_trellis", "up_trellis", "down_trellis"):
+        plist = getattr(layer, name, None)
+        if plist is None:
+            continue
+        for p in plist:
+            if p is None or int(getattr(p, "numel", lambda: 0)()) == 0:
+                continue
+            try:
+                ptrs.add(int(p.untyped_storage().data_ptr()))
+            except Exception:
+                continue
+    return len(ptrs)
+
+
+def _trellis_nbytes(layer: Any) -> int:
+    total = 0
+    for name in ("gate_trellis", "up_trellis", "down_trellis"):
+        plist = getattr(layer, name, None)
+        if plist is None:
+            continue
+        for p in plist:
+            if p is None or int(getattr(p, "numel", lambda: 0)()) == 0:
+                continue
+            total += int(p.numel()) * int(p.element_size())
+    # Arenas may be counted twice if we also sum views; prefer arena bytes when present.
+    arena_bytes = 0
+    for aname in (
+        "_exl3_gate_trellis_arenas",
+        "_exl3_up_trellis_arenas",
+        "_exl3_down_trellis_arenas",
+    ):
+        for arena in getattr(layer, aname, []) or []:
+            arena_bytes += int(arena.numel()) * int(arena.element_size())
+    return arena_bytes if arena_bytes else total
+
+
+def _proj_from_shard_id(shard_id: str) -> str:
+    if shard_id == "w1":
+        return "gate"
+    if shard_id == "w3":
+        return "up"
+    if shard_id == "w2":
+        return "down"
+    raise ValueError(f"unknown EXL3 shard_id={shard_id}")
+
+
+
+
+# _PRESCAN_CACHE: one safetensors header parse per shard per process, not one
+# safe_open per expert key (11,520 re-parses per rank otherwise). Shapes are
+# immutable per (path, mtime, size).
+_PRESCAN_CACHE: dict = {}
+
+
+def _prescan_shape(model_dir: str, shard: str, key: str):
+    path = os.path.join(model_dir, shard)
+    try:
+        st = os.stat(path)
+        ck = (path, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+    tbl = _PRESCAN_CACHE.get(ck)
+    if tbl is None:
+        from safetensors import safe_open
+        tbl = {}
+        try:
+            with safe_open(path, framework="pt") as f:
+                for k in f.keys():
+                    if k.endswith(".trellis"):
+                        tbl[k] = tuple(int(x) for x in f.get_slice(k).get_shape())
+        except Exception:
+            return None
+        _PRESCAN_CACHE[ck] = tbl
+    return tbl.get(key)
+
+
+def _try_prescan_trellis_shapes(
+    layer: Any,
+    num_experts: int,
+) -> dict[str, dict[int, tuple[int, ...]]] | None:
+    """Header-only shape scan from the on-disk checkpoint (no tensor materialize).
+
+    Uses ``VLLM_ENGRAM_MODEL_DIR`` / ``VLLM_EXL3_MODEL_DIR`` and the layer's
+    ``layer_name``/``prefix`` to locate ``layers.N.ffn.experts.*`` trellis keys.
+    Local expert ids map linearly onto a global contiguous block when
+    ``layer.starting_expert_offset`` / EP metadata is present; otherwise assume
+    local id == global id (offline tests).
+    """
+    model_dir = os.environ.get("VLLM_ENGRAM_MODEL_DIR") or os.environ.get(
+        "VLLM_EXL3_MODEL_DIR"
+    )
+    if not model_dir:
+        return None
+    try:
+        from safetensors import safe_open
+    except Exception:
+        return None
+    index_path = os.path.join(model_dir, "model.safetensors.index.json")
+    if not os.path.isfile(index_path):
+        return None
+    try:
+        with open(index_path, encoding="utf-8") as fh:
+            weight_map = json.load(fh).get("weight_map", {})
+    except Exception:
+        return None
+    layer_name = str(
+        getattr(layer, "layer_name", None)
+        or getattr(layer, "prefix", None)
+        or ""
+    )
+    # Expect ...layers.N.ffn.experts or layers.N
+    import re as _re
+
+    m = _re.search(r"layers\.(\d+)", layer_name)
+    if not m:
+        return None
+    layer_id = int(m.group(1))
+    offset = int(
+        getattr(layer, "starting_expert_offset", None)
+        or getattr(layer, "expert_id_offset", None)
+        or 0
+    )
+    # EP linear placement: local e <-> global offset+e
+    prefix = f"layers.{layer_id}.ffn.experts."
+    shapes: dict[str, dict[int, tuple[int, ...]]] = {
+        "gate": {},
+        "up": {},
+        "down": {},
+    }
+    proj_map = {"w1": "gate", "w3": "up", "w2": "down"}
+    # Gather keys per local expert.
+    for local_e in range(int(num_experts)):
+        global_e = offset + local_e
+        for wp, proj in proj_map.items():
+            key = f"{prefix}{global_e}.{wp}.trellis"
+            shard = weight_map.get(key)
+            if shard is None:
+                return None  # incomplete map; fall back to stage-pack
+            shape = _prescan_shape(model_dir, shard, key)  # _PRESCAN_CACHE
+            if shape is None:
+                return None
+            shapes[proj][local_e] = shape
+    return shapes
+
+
+def _uva_trellis_placement_requested(layer: Any) -> bool:
+    """True when the packed routed-expert payload must live in pinned host memory.
+
+    Either the recipe demanded it (VLLM_EXL3_REQUIRE_UVA_EXPERTS=1) or vLLM's
+    UVA offloader already marked the layer's trellis placeholders at
+    construction time. In both cases the real payload allocated here must not
+    silently land on the accelerator.
+    """
+    from .uva_offload import uva_expert_offload_required
+
+    if uva_expert_offload_required():
+        return True
+    placeholder = getattr(layer, "w13_trellis", None)
+    return bool(getattr(placeholder, "_vllm_is_uva_offloaded", False))
+
+
+def _pinned_host_empty(shape: tuple[int, ...], dtype: "torch.dtype") -> "torch.Tensor":
+    return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+
+
+def _alloc_trellis_arena(
+    layer: Any, shape: tuple[int, ...], dest_device: "torch.device"
+) -> "torch.Tensor":
+    """Allocate one trellis arena on ``dest_device`` or, for UVA runs, as an
+    accelerator view of pinned host memory (vLLM's zero-copy placement)."""
+    if not _uva_trellis_placement_requested(layer):
+        return torch.empty(shape, dtype=torch.int16, device=dest_device)
+    from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+    host = _pinned_host_empty(tuple(int(x) for x in shape), torch.int16)
+    view = get_accelerator_view_from_cpu_tensor(host)
+    # Keep the pinned storage alive for as long as the layer exists.
+    keep = layer.__dict__.setdefault("_exl3_uva_host_arenas", [])
+    keep.append(host)
+    view._vllm_is_uva_offloaded = True
+    return view
+
+
+def _arena_parameter(arena: "torch.Tensor") -> "Parameter":
+    p = Parameter(arena, requires_grad=False)
+    if getattr(arena, "_vllm_is_uva_offloaded", False):
+        p._vllm_is_uva_offloaded = True
+    return p
+
+
+def prepare_trellis_arena_plan(
+    layer: Any,
+    shapes_by_proj: dict[str, dict[int, tuple[int, ...]]],
+) -> dict[str, Any]:
+    """Pre-allocate contiguous per-shape arenas and map expert_id -> slot.
+
+    ``shapes_by_proj`` maps proj in {gate,up,down} -> {expert_id: exact_shape}.
+    Subsequent ``_load_exl3`` trellis loads copy directly into the planned slot
+    (safetensors -> FINAL) without retaining a full-layer staging set.
+    """
+    if not _TORCH_AVAILABLE or torch is None:
+        raise RuntimeError("torch required for trellis arenas")
+    dest_device = layer.w13_suh.device
+    proj_to_plist = {
+        "gate": layer.gate_trellis,
+        "up": layer.up_trellis,
+        "down": layer.down_trellis,
+    }
+    proj_to_attr = {
+        "gate": "_exl3_gate_trellis_arenas",
+        "up": "_exl3_up_trellis_arenas",
+        "down": "_exl3_down_trellis_arenas",
+    }
+    plan: dict[str, dict[tuple[int, ...], dict[str, Any]]] = {}
+    eid_index: dict[str, dict[int, tuple[tuple[int, ...], int]]] = {
+        "gate": {},
+        "up": {},
+        "down": {},
+    }
+    stats: dict[str, Any] = {
+        "planned": True,
+        "arenas": {},
+        "allocations_after": 0,
+        "final_bytes": 0,
+        "temp_peak_bytes": 0,
+    }
+    for proj, plist in proj_to_plist.items():
+        by_shape: dict[tuple[int, ...], list[int]] = defaultdict(list)
+        for eid, shape in sorted((shapes_by_proj.get(proj) or {}).items()):
+            by_shape[tuple(int(x) for x in shape)].append(int(eid))
+        arenas: list[Parameter] = []
+        plan[proj] = {}
+        n_experts = int(len(plist))
+        for shape, eids in by_shape.items():
+            n = len(eids)
+            arena = _alloc_trellis_arena(layer, (n, *shape), dest_device)
+            meta = {
+                "arena": arena,
+                "eid_to_idx": {eid: i for i, eid in enumerate(eids)},
+            }
+            plan[proj][shape] = meta
+            for i, eid in enumerate(eids):
+                if not (0 <= eid < n_experts):
+                    raise RuntimeError(f"EXL3 arena plan expert out of range: {eid}")
+                view = arena[i]
+                new_p = Parameter(view, requires_grad=False)
+                new_p.weight_loader = getattr(plist[eid], "weight_loader", None)
+                new_p._exl3_owner = layer
+                plist[eid] = new_p
+                eid_index[proj][eid] = (shape, i)
+            arenas.append(_arena_parameter(arena))
+            stats["arenas"].setdefault(proj, []).append(
+                {"shape": list(shape), "n": n, "bytes": int(arena.nbytes)}
+            )
+            stats["allocations_after"] += 1
+            stats["final_bytes"] += int(arena.nbytes)
+        setattr(layer, proj_to_attr[proj], arenas)
+    layer._exl3_trellis_arena_plan = plan
+    layer._exl3_trellis_eid_index = eid_index
+    layer._exl3_trellis_staging = {"gate": {}, "up": {}, "down": {}}
+    layer._exl3_trellis_arena_stats = stats
+    layer._exl3_trellis_temp_peak_bytes = 0
+    return stats
+
+
+# Process-wide direct-fill counters (prove the real load hits this path).
+_DIRECT_FILL_STATS = {
+    "DIRECT_FILL_CALLS": 0,
+    "DIRECT_FILL_BYTES": 0,
+    "DIRECT_FILL_FALLBACK_CALLS": 0,
+    "DIRECT_FILL_FALLBACK_BYTES": 0,
+    "DIRECT_FILL_DEVICE": "",
+    "MADV_AFTER_H2D_CALLS": 0,
+    "MADV_AFTER_H2D_BYTES": 0,
+}
+
+
+def direct_fill_stats() -> dict[str, Any]:
+    """Return current direct fill call count and byte transfer volume."""
+    return dict(_DIRECT_FILL_STATS)
+
+
+def _find_containing_vma(addr: int) -> tuple[int, int, str] | None:
+    """Return (vma_start, vma_end, pathname) for addr from /proc/self/maps."""
+    try:
+        with open("/proc/self/maps", "r", encoding="utf-8") as fh:
+            for line in fh:
+                # e.g. 7f..-7f.. rw-p 00000000 00:00 0  [/path]
+                parts = line.split()
+                if not parts:
+                    continue
+                span = parts[0]
+                if "-" not in span:
+                    continue
+                lo_s, hi_s = span.split("-", 1)
+                lo, hi = int(lo_s, 16), int(hi_s, 16)
+                if lo <= addr < hi:
+                    path = parts[-1] if len(parts) >= 6 and parts[-1].startswith("/") else ""
+                    return lo, hi, path
+    except Exception:
+        return None
+    return None
+
+
+def _madv_dontneed_cpu_tensor(src: "torch.Tensor") -> bool:
+    """Advise kernel to drop COW pages of a *consumed tensor view* after H2D.
+
+    Range is the VIEW byte span (``data_ptr`` + ``numel*element_size``), never
+    the base ``untyped_storage()`` span — advising the storage can discard
+    pages of later unconsumed views of a fused shard (P1).
+
+    Further bounded to the containing VMA, and only applied for file-backed
+    ``*.safetensors`` mappings (the MAP_PRIVATE COW case). Non-contiguous
+    tensors and heap mappings are skipped. Toggle off with
+    ``VLLM_EXL3_MADV_AFTER_H2D=0``.
+    """
+    if os.environ.get("VLLM_EXL3_MADV_AFTER_H2D", "1") == "0":
+        return False
+    if not _TORCH_AVAILABLE or torch is None:
+        return False
+    if not torch.is_tensor(src) or src.device.type != "cpu" or src.numel() == 0:
+        return False
+    # Do not advise spans that contain gaps between elements.
+    if not src.is_contiguous():
+        return False
+    try:
+        import ctypes
+
+        view_start = int(src.data_ptr())
+        view_nbytes = int(src.numel()) * int(src.element_size())
+        if view_start == 0 or view_nbytes <= 0:
+            return False
+        view_end = view_start + view_nbytes
+        vma = _find_containing_vma(view_start)
+        if vma is None:
+            return False
+        vma_lo, vma_hi, vma_path = vma
+        # Only reclaim safetensors MAP_PRIVATE file pages — not arbitrary heap.
+        if not vma_path.endswith(".safetensors"):
+            return False
+        safe_start = max(view_start, vma_lo)
+        safe_end = min(view_end, vma_hi)
+        page = os.sysconf("SC_PAGESIZE")
+        # Page-align INWARD only — never touch adjacent views / heap.
+        start = safe_start + ((page - (safe_start % page)) % page)
+        end = safe_end - (safe_end % page)
+        if end <= start:
+            return False
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        libc.madvise.restype = ctypes.c_int
+        advised = end - start
+        rc = libc.madvise(ctypes.c_void_p(start), ctypes.c_size_t(advised), 4)
+        if rc == 0:
+            _DIRECT_FILL_STATS["MADV_AFTER_H2D_CALLS"] += 1
+            _DIRECT_FILL_STATS["MADV_AFTER_H2D_BYTES"] += advised
+            return True
+    except Exception:
+        return False
+    return False
+
+
+
+# _P1_POPULATE: install PTEs for the mmap'd safetensors view on the CPU side before the
+# H2D copy. Source views are MAP_PRIVATE file pages (safe_open pt backend); without this
+# the copy takes one fault per 4 KiB page (~80 MB/s observed on GB10).
+_P1_LIBC = None
+_P1_MODE = os.environ.get("VLLM_EXL3_PREFETCH", "populate")   # populate | willneed | clone | off
+_P1_LOOKAHEAD = int(os.environ.get("VLLM_EXL3_PREFETCH_LOOKAHEAD_MB", "128")) << 20
+_P1_STATS = {"calls": 0, "bytes": 0, "secs": 0.0, "errno": 0, "clone_fallbacks": 0}
+_MADV_WILLNEED, _MADV_POPULATE_READ = 3, 22
+
+
+def _p1_libc():
+    global _P1_LIBC
+    if _P1_LIBC is None:
+        import ctypes
+        lib = ctypes.CDLL("libc.so.6", use_errno=True)
+        lib.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        lib.madvise.restype = ctypes.c_int
+        _P1_LIBC = lib
+    return _P1_LIBC
+
+
+def _p1_prefault(src: "torch.Tensor") -> "torch.Tensor":
+    """Return a tensor whose pages are resident: ``src`` after MADV_POPULATE_READ
+    (+ MADV_WILLNEED lookahead into the following bytes of the same mapping), or a
+    clone() if madvise is refused (kernel < 5.14) / mode=clone."""
+    if _P1_MODE == "off" or src.device.type != "cpu" or not src.is_contiguous():
+        return src
+    n = int(src.numel()) * int(src.element_size())
+    if n == 0:
+        return src
+    import ctypes
+    page = 4096
+    start = int(src.data_ptr()) & ~(page - 1)            # round DOWN: always inside the file mapping
+    end = (int(src.data_ptr()) + n) & ~(page - 1)        # round DOWN: never past the mapping end
+    t0 = time.monotonic()
+    if _P1_MODE in ("populate", "willneed") and end > start:
+        lib = _p1_libc()
+        adv = _MADV_POPULATE_READ if _P1_MODE == "populate" else _MADV_WILLNEED
+        rc = lib.madvise(ctypes.c_void_p(start), ctypes.c_size_t(end - start), adv)
+        if rc == 0:
+            if _P1_LOOKAHEAD > 0:
+                # async readahead of what follows this view (safetensors lays data out in key
+                # order, and keys are iterated sorted). ENOMEM past the mapping end is harmless.
+                lib.madvise(ctypes.c_void_p(end), ctypes.c_size_t(_P1_LOOKAHEAD), _MADV_WILLNEED)
+            _P1_STATS["calls"] += 1; _P1_STATS["bytes"] += end - start
+            _P1_STATS["secs"] += time.monotonic() - t0
+            return src
+        _P1_STATS["errno"] = ctypes.get_errno()
+    out = src.clone()                                    # CPU memcpy -> CPU faults w/ fault-around + readahead
+    _P1_STATS["clone_fallbacks"] += 1
+    _P1_STATS["secs"] += time.monotonic() - t0
+    return out
+
+
+
+
+# _BOUNCE2: never let the GB10 copy engine translate file-backed pageable pages
+# through ATS (~250 MB/s measured). CPU memcpy into a pinned two-slot bounce
+# first (5-27 GB/s), then async H2D. Gate: direct 201/251 MB/s cold/warm vs
+# bounce 5.1/27.2 GB/s cold/warm on shard-05 trellis views.
+_BOUNCE_STATE = {"buf": None, "evt": [None, None], "slot": 0}
+
+
+def _bounce_copy(dst: "torch.Tensor", src: "torch.Tensor") -> None:
+    n = int(src.numel()) * int(src.element_size())
+    st = _BOUNCE_STATE
+    if st["buf"] is None or st["buf"].numel() < n:
+        st["buf"] = torch.empty(n, dtype=torch.uint8, device="cpu", pin_memory=True)
+        st["evt"] = [torch.cuda.Event(), torch.cuda.Event()]
+        st["slot"] = 0
+    i = st["slot"]
+    st["evt"][i].synchronize()  # previous H2D from this slot retired
+    bv = st["buf"][:n].view(src.dtype).view(src.shape)
+    bv.copy_(src)               # CPU memcpy: page cache -> pinned
+    dst.copy_(bv, non_blocking=True)
+    st["evt"][i].record()
+    st["slot"] = i ^ 1
+
+
+def _direct_fill_trellis_slot(
+    layer: Any,
+    proj: str,
+    expert_id: int,
+    src: "torch.Tensor",
+) -> None:
+    """Copy one trellis into its pre-planned arena slot; drop ``src`` ASAP."""
+    eid_index = getattr(layer, "_exl3_trellis_eid_index", None)
+    plan = getattr(layer, "_exl3_trellis_arena_plan", None)
+    if not eid_index or not plan:
+        raise RuntimeError("EXL3 direct fill requires prepare_trellis_arena_plan")
+    if expert_id not in eid_index[proj]:
+        raise RuntimeError(
+            f"EXL3 arena plan missing {proj} expert={expert_id} shape={tuple(src.shape)}"
+        )
+    shape, idx = eid_index[proj][expert_id]
+    if tuple(int(x) for x in src.shape) != shape:
+        raise RuntimeError(
+            f"EXL3 arena slot shape mismatch {proj} expert={expert_id}: "
+            f"got {tuple(src.shape)} planned {shape}"
+        )
+    arena = plan[proj][shape]["arena"]
+    transient = int(src.numel()) * int(src.element_size())
+    layer._exl3_trellis_temp_peak_bytes = max(
+        int(getattr(layer, "_exl3_trellis_temp_peak_bytes", 0)), transient
+    )
+    # PR14's direct H2D copy, kept separate from its broader policy changes.
+    # Keep conversion on the source device; never allocate src.to(cuda) beside
+    # the final arena. Blocking copy establishes completion before release.
+    if src.dtype != torch.int16:
+        src = src.to(dtype=torch.int16)
+    if not src.is_contiguous():
+        src = src.contiguous()
+    src = _p1_prefault(src)  # _P1_POPULATE feeds the CPU memcpy on cold cache
+    _bounce_copy(arena[idx], src)  # _BOUNCE2: pinned bounce, no per-tensor sync
+    _madv_dontneed_cpu_tensor(src)
+    _DIRECT_FILL_STATS["DIRECT_FILL_CALLS"] += 1
+    _DIRECT_FILL_STATS["DIRECT_FILL_BYTES"] += transient
+    _DIRECT_FILL_STATS["DIRECT_FILL_DEVICE"] = str(arena.device)
+
+
+def _pack_trellis_arenas(layer: Any) -> dict[str, Any]:
+    """Pack staged per-expert trellis tensors into contiguous per-shape arenas.
+
+    Each expert keeps an exact-shape view (no padding/truncation). Heterogeneous
+    K is preserved by grouping only equal shapes into the same arena.
+
+    Prefer ``prepare_trellis_arena_plan`` + direct fill to avoid holding a full
+    staging set beside the final arenas (UMA source+dest coexistence).
+    """
+    if not _TORCH_AVAILABLE or torch is None:
+        raise RuntimeError("torch required for trellis arenas")
+    # Already planned+filled: just report stats.
+    if getattr(layer, "_exl3_trellis_arena_plan", None) is not None:
+        stats = dict(getattr(layer, "_exl3_trellis_arena_stats", {}) or {})
+        stats["packed"] = True
+        stats["mode"] = "direct_plan"
+        stats["temp_peak_bytes"] = int(
+            getattr(layer, "_exl3_trellis_temp_peak_bytes", 0)
+        )
+        layer._exl3_trellis_arena_stats = stats
+        return stats
+
+    staging: dict[str, dict[int, torch.Tensor]] = getattr(
+        layer, "_exl3_trellis_staging", None
+    ) or {}
+    if not staging:
+        return {"packed": False, "reason": "no_staging"}
+
+    dest_device = layer.w13_suh.device
+    stats: dict[str, Any] = {
+        "packed": True,
+        "mode": "post_stage_pack",
+        "arenas": {},
+        "allocations_after": 0,
+        "final_bytes": 0,
+        "temp_peak_bytes": 0,
+    }
+    temp_bytes = 0
+    for proj_map in staging.values():
+        for t in proj_map.values():
+            temp_bytes += int(t.numel()) * int(t.element_size())
+    stats["temp_peak_bytes"] = temp_bytes
+
+    proj_to_plist = {
+        "gate": layer.gate_trellis,
+        "up": layer.up_trellis,
+        "down": layer.down_trellis,
+    }
+    proj_to_attr = {
+        "gate": "_exl3_gate_trellis_arenas",
+        "up": "_exl3_up_trellis_arenas",
+        "down": "_exl3_down_trellis_arenas",
+    }
+
+    for proj, plist in proj_to_plist.items():
+        by_shape: dict[tuple[int, ...], list[tuple[int, torch.Tensor]]] = defaultdict(
+            list
+        )
+        for eid, tensor in sorted((staging.get(proj) or {}).items()):
+            if tensor is None or int(tensor.numel()) == 0:
+                continue
+            if tensor.dtype != torch.int16:
+                tensor = tensor.to(dtype=torch.int16)
+            shape = tuple(int(x) for x in tensor.shape)
+            by_shape[shape].append((int(eid), tensor))
+
+        arenas: list[Parameter] = []
+        n_experts = int(len(plist))
+        for shape, items in by_shape.items():
+            n = len(items)
+            arena = _alloc_trellis_arena(layer, (n, *shape), dest_device)
+            for i, (eid, src) in enumerate(items):
+                if not (0 <= eid < n_experts):
+                    raise RuntimeError(f"EXL3 arena expert id out of range: {eid}")
+                if src.device == dest_device and src.dtype == torch.int16:
+                    arena[i].copy_(src if src.is_contiguous() else src.contiguous())
+                else:
+                    arena[i].copy_(
+                        src.to(device=dest_device, dtype=torch.int16, non_blocking=False)
+                    )
+                view = arena[i]
+                new_p = Parameter(view, requires_grad=False)
+                new_p.weight_loader = getattr(plist[eid], "weight_loader", None)
+                new_p._exl3_owner = layer
+                plist[eid] = new_p
+                staging[proj].pop(eid, None)
+                del src
+            arenas.append(_arena_parameter(arena))
+            stats["arenas"].setdefault(proj, []).append(
+                {"shape": list(shape), "n": n, "bytes": int(arena.nbytes)}
+            )
+            stats["allocations_after"] += 1
+            stats["final_bytes"] += int(arena.nbytes)
+            # Free host pages for this shape group before the next alloc on UMA.
+            if os.environ.get("EXL3_STAGING_GC", "0") == "1":
+                gc.collect()  # _WAVETIME: opt-in (was per-group always)
+        setattr(layer, proj_to_attr[proj], arenas)
+
+    layer._exl3_trellis_staging = {"gate": {}, "up": {}, "down": {}}
+    if os.environ.get("EXL3_STAGING_GC", "0") == "1":
+        gc.collect()  # _WAVETIME: opt-in
+    if torch.cuda.is_available() and os.environ.get("EXL3_STAGING_GC", "0") == "1":
+        try:
+            torch.cuda.empty_cache()  # _WAVETIME: opt-in (was per-layer always)
+        except Exception:
+            pass
+    logger.info("WAVETIME pack layer=%s secs=%.2f", getattr(layer, "layer_id", "?"), time.monotonic() - _wt0)
+    return stats
+
+
 def _narrow_tp(tensor: torch.Tensor, dim: int, tp_rank: int, tp_size: int) -> torch.Tensor:
     if tp_size <= 1:
         return tensor
@@ -605,6 +1296,59 @@ def _exl3_moe_accepts_num_active(fn) -> bool:
     return "num_active" in doc or "arg29" in doc or doc.count("arg") >= 30
 
 
+# Positional arity of exllamav3's exl3_moe binding by release. The binding has no
+# parameter names, so the pybind docstring ("arg0: ..., arg34: ...") is the contract.
+EXL3_MOE_ARITY_147 = 30  # ..., act_limit, num_active            (exllamav3 <= 1.4.x)
+EXL3_MOE_ARITY_150 = 35  # + output_scratch, fused_base, count_lo, count_hi, m_tile (>= 1.5.0)
+
+
+def _exl3_moe_arity(fn) -> int | None:
+    """Number of positional arguments the bound exl3_moe takes, or None if unreadable."""
+    import re
+
+    doc = getattr(fn, "__doc__", None) or ""
+    idx = [int(m) for m in re.findall(r"\barg(\d+)\s*:", doc)]
+    if idx:
+        return max(idx) + 1
+    try:
+        import inspect
+
+        params = inspect.signature(fn).parameters.values()
+        if any(p.kind == p.VAR_POSITIONAL for p in params):
+            return None
+        return len(params)
+    except (TypeError, ValueError):
+        return None
+
+
+def _exl3_moe_temp_rows(temps) -> int:
+    """Row capacity of the fused temp buffers ([concurrency, rows, width]); the module
+    default when a caller hands in placeholders instead of tensors."""
+    first = temps[0] if temps else None
+    shape = getattr(first, "shape", None)
+    if shape is not None and len(shape) >= 2:
+        return int(shape[-2])
+    return int(TEMP_ROWS_FUSED)
+
+
+def _exl3_moe_tail(fn, temp_rows: int) -> tuple:
+    """Trailing arguments exllamav3 1.5.0 added to exl3_moe, or () for older bindings.
+
+    1.5.0 appended output_scratch and fused_base (fp32 slot scratch plus slot table for
+    its deterministic-accumulation mode; None keeps the atomic scatter-add this plugin
+    relies on), count_lo and count_hi (the per-expert row-count band this launch owns,
+    1..temp rows covers every expert the fused kernel can take) and m_tile (kernel row
+    tile; 16 is the only instance the pre-1.5.0 kernel had). These values reproduce the
+    1.4.x all-fused launch, so the plugin's dispatch, fat-expert cap and temp buffers are
+    unchanged. Measured on one GB10 with Qwen3.8-Flash-Next 3.05 bpw: 52.05 tok/s at MTP
+    k=3 on 1.5.0 against 52.22 on 1.4.7, 28.54 against 27.77 without a draft.
+    """
+    arity = _exl3_moe_arity(fn)
+    if arity is not None and arity >= EXL3_MOE_ARITY_150:
+        return (None, None, 1, int(temp_rows), 16)
+    return ()
+
+
 def pin_exl3_expert_map(
     layer: torch.nn.Module, device: torch.device
 ) -> torch.Tensor | None:
@@ -704,7 +1448,7 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
     except Exception:
         exllamav3_ext = None
 
-    device = layer.w13_trellis.device
+    device = layer.w13_suh.device
     n_exp = len(inners)
     # Gate/up input rotations are immutable after load. Cache this compatibility
     # fact once so fat-prefill dispatch never calls torch.equal on CUDA tensors
@@ -1241,6 +1985,59 @@ def apply_exl3_fused_moe(
         safe_local = local.clamp(min=0, max=max(n_exp - 1, 0))
         fat_route = (local < n_exp) & fat.index_select(0, safe_local)
 
+    # exl3_moe_coop fast path (exllamav3 >= 1.5.0): decode-shaped batches only —
+    # the slot scratch is capped at 256, i.e. tokens <= 42 at topk 6, which covers
+    # single-stream speculation and light-concurrency traffic. Larger batches and
+    # fat routes fall through to the stock path below.
+    if (
+        _COOP
+        and tokens * topk <= 256
+        and hasattr(exllamav3_ext, "exl3_moe_coop")
+        and not (fat_possible and bool(fat.any().item()))
+    ):
+        flags = getattr(layer, "_exl3_codebook_flags", (True, False, True, False, True, False))
+        mcg, mul1 = bool(flags[0]), bool(flags[1])
+        inter_dim = int(temps[2].shape[-1])
+        if (
+            all(bool(flags[i]) == mcg and bool(flags[i + 1]) == mul1 for i in range(0, 6, 2))
+            and hidden % 128 == 0
+            and inter_dim % 128 == 0
+        ):
+            k = int(getattr(layer, "_exl3_k", 4))
+            slots = tokens * topk
+            smax = 4 * slots  # split-k partial rows, per tests/test_moe_coop.py
+            dev = x2d.device
+            sel_c = local.reshape(tokens, topk).to(torch.int64).contiguous()
+            rw_c = flat_weight.reshape(tokens, topk).contiguous()
+            had_g = torch.empty((slots, hidden), dtype=torch.float16, device=dev)
+            had_u = torch.empty_like(had_g)
+            gu_g = torch.empty((smax, 1, inter_dim), dtype=torch.float16, device=dev)
+            gu_u = torch.empty_like(gu_g)
+            act_out = torch.empty_like(gu_g)
+            d_out = torch.empty((smax, 1, hidden), dtype=torch.float32, device=dev)
+            ctr = torch.zeros(
+                smax * (inter_dim // 128) + tokens * (hidden // 128) + 2 * smax + 3,
+                dtype=torch.int32,
+                device=dev,
+            )
+            # Kernel contract: min_expert=-1 disables range filtering and
+            # indexes pointer tables by raw sel. Plugin sentinels are
+            # n_exp (non-local / EP). Pass [0, n_exp) so those routes
+            # contribute zero instead of OOB.
+            exllamav3_ext.exl3_moe_coop(
+                xh, sel_c, rw_c, 0, int(n_exp), hidden,
+                ptrs["gate_trellis"], ptrs["gate_suh"], ptrs["gate_svh"],
+                ptrs["up_trellis"], ptrs["up_suh"], ptrs["up_svh"],
+                ptrs["down_trellis"], ptrs["down_suh"], ptrs["down_svh"],
+                None, None, None,
+                k, k, k, mcg, mul1, MOE_ACT_SILU,
+                float(limit) if (limit is not None and limit > 0) else 0.0,
+                True,
+                had_g, had_u, gu_g, gu_u, act_out, d_out, ctr, out,
+                None, None,
+            )
+            return out
+
     # The standard kernel handles non-fat routes. Fat routes are represented by
     # the invalid sentinel with zero weight here and are dispatched exactly once
     # below through the fat GEMM path.
@@ -1288,8 +2085,12 @@ def apply_exl3_fused_moe(
         *getattr(layer, "_exl3_codebook_flags", (True, False, True, False, True, False)),
         float(limit) if (limit is not None and limit > 0) else 0.0,
     )
+    # exllamav3 >= 1.5.0 takes five more positional arguments after num_active.
+    tail = _exl3_moe_tail(fn, _exl3_moe_temp_rows(temps))
+    if tail and n_active_host is None:
+        n_active_host = -1
     if n_active_host is not None:
-        fn(*args, n_active_host)
+        fn(*args, n_active_host, *tail)
     else:
         fn(*args)
 
@@ -1785,6 +2586,25 @@ def _exl3_routed_experts_loader(layer: torch.nn.Module):
     return load_weights
 
 
+
+
+def _marker_row_host(marker: torch.Tensor) -> torch.Tensor:
+    """_BATCHED_MARKERS: one host transfer for the whole marker block."""
+    return marker.detach().reshape(-1).to("cpu", non_blocking=False)
+
+
+def _marker_or_none_host(host_row: torch.Tensor, idx: int):
+    v = int(host_row[idx].item()) if 0 <= idx < host_row.numel() else 0
+    return v if v != 0 else None
+
+
+def _marker_tensor_or_none_host(host_row: torch.Tensor, idx: int, device):
+    v = int(host_row[idx].item()) if 0 <= idx < host_row.numel() else 0
+    if v == 0:
+        return None
+    return torch.tensor([v], dtype=torch.int32, device=device)
+
+
 def _moe_marker_or_none(marker: torch.Tensor):
     """A codebook marker tensor if it was loaded (non-zero), else None."""
     return marker if int(marker.reshape(-1)[0].item()) != 0 else None
@@ -1844,20 +2664,16 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 "EXL3 trellis tiles are 16-wide; "
                 f"hidden={hidden_size} intermediate_local={intermediate_size_per_partition}"
             )
+        # Default/base K from config. Real DSV4.1 4.75bpw packs are mixed-K
+        # even within a single expert (w1/w2/w3 can differ). Trellis storage is
+        # therefore ragged and sized on load from the checkpoint tensor itself.
         k_words = self.bits * 16
         in_tiles = hidden_size // 16
         out_tiles = intermediate_size_per_partition // 16
 
         extra = {k: v for k, v in extra_weight_attrs.items() if k != "weight_loader"}
 
-        # w13_* : stacked [expert, {gate=0, up=1}, ...] so the stock
-        # expert_params_mapping (experts.w13_ + suffix) hits these names.
-        w13_trellis = Parameter(
-            torch.empty(
-                num_experts, 2, in_tiles, out_tiles, k_words, dtype=torch.int16
-            ),
-            requires_grad=False,
-        )
+        # Suh/svh/markers stay stacked (shape independent of packed K).
         w13_suh = Parameter(
             torch.empty(num_experts, 2, hidden_size, dtype=torch.float16),
             requires_grad=False,
@@ -1874,12 +2690,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         )
         w13_mul1 = Parameter(
             torch.zeros(num_experts, 2, 1, dtype=torch.int32),
-            requires_grad=False,
-        )
-        w2_trellis = Parameter(
-            torch.empty(
-                num_experts, out_tiles, in_tiles, k_words, dtype=torch.int16
-            ),
             requires_grad=False,
         )
         w2_suh = Parameter(
@@ -1901,6 +2711,42 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
 
+        # Dummy named parameters so expert_params_mapping still resolves
+        # ``w13_trellis`` / ``w2_trellis``. Real trellis payloads live in the
+        # ragged ParameterLists below and are replaced with exact shapes on load.
+        w13_trellis = Parameter(torch.empty(0, dtype=torch.int16), requires_grad=False)
+        w2_trellis = Parameter(torch.empty(0, dtype=torch.int16), requires_grad=False)
+
+        gate_trellis = torch.nn.ParameterList(
+            [
+                Parameter(torch.empty(0, dtype=torch.int16), requires_grad=False)
+                for _ in range(num_experts)
+            ]
+        )
+        up_trellis = torch.nn.ParameterList(
+            [
+                Parameter(torch.empty(0, dtype=torch.int16), requires_grad=False)
+                for _ in range(num_experts)
+            ]
+        )
+        down_trellis = torch.nn.ParameterList(
+            [
+                Parameter(torch.empty(0, dtype=torch.int16), requires_grad=False)
+                for _ in range(num_experts)
+            ]
+        )
+        layer.gate_trellis = gate_trellis
+        layer.up_trellis = up_trellis
+        layer.down_trellis = down_trellis
+        # Staging for arena pack: exact per-expert tensors held briefly on host,
+        # then copied into contiguous per-shape arenas in process_weights.
+        layer._exl3_trellis_staging = {"gate": {}, "up": {}, "down": {}}
+        layer._exl3_gate_trellis_arenas = []
+        layer._exl3_up_trellis_arenas = []
+        layer._exl3_down_trellis_arenas = []
+        layer._exl3_trellis_arena_stats = {}
+        layer._exl3_trellis_alloc_count_before = 0
+
         packed = {
             "w13_trellis": w13_trellis,
             "w13_suh": w13_suh,
@@ -1918,13 +2764,47 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             set_weight_attrs(param, extra)
             param.weight_loader = self._load_exl3
             param._exl3_owner = layer
+        for plist in (gate_trellis, up_trellis, down_trellis):
+            for param in plist:
+                set_weight_attrs(param, extra)
+                param.weight_loader = self._load_exl3
+                param._exl3_owner = layer
         if hasattr(layer, "w13_weight") or hasattr(layer, "w2_weight"):
             raise RuntimeError("EXL3 create_weights must not allocate dense expert weights")
 
         layer._exl3_hidden_size = hidden_size
         layer._exl3_intermediate_local = intermediate_size_per_partition
-        layer._exl3_k_words = k_words
+        layer._exl3_in_tiles = in_tiles
+        layer._exl3_out_tiles = out_tiles
+        layer._exl3_k_words = k_words  # config default only; actual K is per-trellis
         layer._exl3_bits = self.bits
+        layer._exl3_mixed_k = False
+        layer._exl3_n_experts = int(num_experts)
+        # Linear EP placement offset for checkpoint prescan (local->global).
+        if not hasattr(layer, "starting_expert_offset"):
+            try:
+                from vllm.distributed.parallel_state import get_ep_group
+
+                ep = get_ep_group()
+                layer.starting_expert_offset = int(ep.rank) * int(num_experts)
+            except Exception:
+                layer.starting_expert_offset = 0
+        # Header-only shape scan (no allocation yet). Arenas are created on the
+        # first trellis load after the module has been moved to its exec device,
+        # so a later layer.to(device) cannot clone views apart.
+        layer._exl3_trellis_shapes_pending = None
+        if (
+            _exl3_trellis_arena_enabled()
+            and os.environ.get("VLLM_EXL3_ARENA_PRESCAN", "1") != "0"
+        ):
+            shapes = _try_prescan_trellis_shapes(layer, int(num_experts))
+            if shapes is not None:
+                layer._exl3_trellis_shapes_pending = shapes
+                logger.info(
+                    "EXL3 trellis arena PRESCAN shapes ready for %s experts "
+                    "(alloc deferred until first load)",
+                    num_experts,
+                )
         # vLLM's generic RoutedExperts.load_weights treats any 3-D checkpoint
         # tensor as fused stacked experts and unbinds it per expert; an EXL3
         # per-expert trellis is 3-D by construction. Route this layer's tensors
@@ -1953,30 +2833,189 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 return False if return_success else None
             expert_id = local_id
 
-        tp_rank, tp_size = _resolve_tp_geometry(owner, layer)
+        owner_mod = owner if owner is not None else getattr(param, "_exl3_owner", None)
+        tp_rank, tp_size = _resolve_tp_geometry(owner_mod, param)
+        if getattr(owner_mod, "use_ep", False):
+            # Expert parallel: experts are whole; feature slicing must not run
+            # (shard_exl3_col/row would quarter already-whole expert tensors).
+            tp_rank, tp_size = 0, 1
         suffix = _suffix_from_mapped_name(weight_name)
-        loaded = loaded_weight.detach().contiguous()
+        # Avoid an early full-tensor .contiguous() copy. On GB10 UMA that
+        # transient host copy sits beside the eventual device payload and was
+        # observed to push MemAvailable under the 16 GiB abort cliff.
+        loaded = loaded_weight.detach()
         if suffix in ("mcg", "mul1"):
             # Codebook markers are scalars ([] or [1]); keep the value per expert
             # tensor so process_weights_after_loading can pick the codebook.
+            if owner_mod is None:
+                raise RuntimeError("EXL3 marker load missing owner module")
             if shard_id in ("w1", "w3"):
-                dest = param.data[expert_id, 0 if shard_id == "w1" else 1]
+                dest = getattr(owner_mod, "w13_" + suffix).data[
+                    expert_id, 0 if shard_id == "w1" else 1
+                ]
             elif shard_id == "w2":
-                dest = param.data[expert_id]
+                dest = getattr(owner_mod, "w2_" + suffix).data[expert_id]
             else:
                 raise ValueError(f"unknown EXL3 shard_id={shard_id}")
             dest.fill_(int(loaded.reshape(-1)[0].item()) if loaded.numel() else 0)
             return True if return_success else None
+
+        if suffix == "trellis":
+            # Exact checkpoint shape per expert. With arenas enabled, stage on
+            # host and pack into contiguous per-shape arenas later (views keep
+            # heterogeneous K / expert IDs). Legacy path allocates one Parameter
+            # per expert immediately.
+            if owner_mod is None:
+                raise RuntimeError("EXL3 trellis load missing owner module")
+            if _exl3_mem_waterfall_enabled():
+                _exl3_mem_snapshot("BEFORE_SOURCE", owner_mod)
+            if shard_id in ("w1", "w3"):
+                sharded = shard_exl3_col(loaded, suffix, tp_rank, tp_size)
+                plist = owner_mod.gate_trellis if shard_id == "w1" else owner_mod.up_trellis
+            elif shard_id == "w2":
+                sharded = shard_exl3_row(loaded, suffix, tp_rank, tp_size)
+                plist = owner_mod.down_trellis
+            else:
+                raise ValueError(f"unknown EXL3 shard_id={shard_id}")
+            if _exl3_mem_waterfall_enabled():
+                _exl3_mem_snapshot("AFTER_SOURCE_OPEN", owner_mod)
+            # Validate tile geometry against the layer's hidden/intermediate
+            # before paying for a device materialization.
+            in_tiles = int(getattr(owner_mod, "_exl3_in_tiles", 0))
+            out_tiles = int(getattr(owner_mod, "_exl3_out_tiles", 0))
+            if shard_id in ("w1", "w3"):
+                expect_prefix = (in_tiles, out_tiles)
+            else:
+                expect_prefix = (out_tiles, in_tiles)
+            if tuple(sharded.shape[:2]) != expect_prefix:
+                raise RuntimeError(
+                    f"EXL3 trellis tile mismatch {weight_name} shard={shard_id} "
+                    f"expert={expert_id}: got {tuple(sharded.shape)} "
+                    f"expected prefix {expect_prefix}+K_words"
+                )
+            if int(sharded.shape[-1]) % 16 != 0:
+                raise RuntimeError(
+                    f"EXL3 trellis K_words not multiple of 16: {tuple(sharded.shape)}"
+                )
+
+            use_arena = _exl3_trellis_arena_enabled()
+            if use_arena:
+                proj = _proj_from_shard_id(shard_id)
+                owner_mod._exl3_trellis_alloc_count_before = int(
+                    getattr(owner_mod, "_exl3_trellis_alloc_count_before", 0)
+                ) + 1
+                # Materialize deferred prescan plan on the exec device once.
+                pending = getattr(owner_mod, "_exl3_trellis_shapes_pending", None)
+                if (
+                    pending is not None
+                    and getattr(owner_mod, "_exl3_trellis_arena_plan", None) is None
+                ):
+                    prepare_trellis_arena_plan(owner_mod, pending)
+                    owner_mod._exl3_trellis_shapes_pending = None
+                    logger.info(
+                        "EXL3 trellis arenas allocated on %s: arenas=%s final_bytes=%s",
+                        owner_mod.w13_suh.device,
+                        owner_mod._exl3_trellis_arena_stats.get("allocations_after"),
+                        owner_mod._exl3_trellis_arena_stats.get("final_bytes"),
+                    )
+                # Preferred path: plan exists -> copy straight into FINAL slot.
+                if getattr(owner_mod, "_exl3_trellis_arena_plan", None) is not None:
+                    if _exl3_mem_waterfall_enabled():
+                        _exl3_mem_snapshot("AFTER_DEST_ALLOC", owner_mod)
+                        _exl3_mem_snapshot("AFTER_READ", owner_mod)
+                        _exl3_mem_snapshot("AFTER_LAYOUT_CONVERSION", owner_mod)
+                    _direct_fill_trellis_slot(owner_mod, proj, int(expert_id), sharded)
+                    if _exl3_mem_waterfall_enabled():
+                        _exl3_mem_snapshot("AFTER_COPY_TO_FINAL", owner_mod)
+                    del loaded, sharded, loaded_weight
+                    if _exl3_mem_waterfall_enabled():
+                        _exl3_mem_snapshot("AFTER_TEMP_DELETE", owner_mod)
+                        _exl3_mem_snapshot("AFTER_GC", owner_mod)
+                    return True if return_success else None
+
+                # Fallback: stage on host; pack in process_weights_after_loading.
+                _fb = int(sharded.numel()) * int(sharded.element_size())
+                _DIRECT_FILL_STATS["DIRECT_FILL_FALLBACK_CALLS"] += 1
+                _DIRECT_FILL_STATS["DIRECT_FILL_FALLBACK_BYTES"] += _fb
+                logger.warning(
+                    "EXL3 trellis staging fallback (no arena plan) layer=%s "
+                    "proj=%s expert=%s — host Anon coexistence risk on UMA",
+                    getattr(owner_mod, "layer_name", None)
+                    or getattr(owner_mod, "prefix", "?"),
+                    proj,
+                    expert_id,
+                )
+                if _exl3_mem_waterfall_enabled():
+                    _exl3_mem_snapshot("AFTER_DEST_ALLOC", owner_mod)
+                staged = sharded.detach()
+                if staged.device.type != "cpu":
+                    staged = staged.cpu()
+                if staged.dtype != torch.int16:
+                    staged = staged.to(dtype=torch.int16)
+                if not staged.is_contiguous():
+                    staged = staged.contiguous()
+                if _exl3_mem_waterfall_enabled():
+                    _exl3_mem_snapshot("AFTER_READ", owner_mod)
+                    _exl3_mem_snapshot("AFTER_LAYOUT_CONVERSION", owner_mod)
+                if not hasattr(owner_mod, "_exl3_trellis_staging"):
+                    owner_mod._exl3_trellis_staging = {
+                        "gate": {},
+                        "up": {},
+                        "down": {},
+                    }
+                owner_mod._exl3_trellis_staging[proj][int(expert_id)] = staged
+                if _exl3_mem_waterfall_enabled():
+                    _exl3_mem_snapshot("AFTER_COPY_TO_FINAL", owner_mod)
+                del loaded, sharded, loaded_weight
+                if _exl3_mem_waterfall_enabled():
+                    _exl3_mem_snapshot("AFTER_TEMP_DELETE", owner_mod)
+                return True if return_success else None
+
+            # Legacy: one independent Parameter allocation per expert.
+            dest_device = owner_mod.w13_suh.device
+            if _exl3_mem_waterfall_enabled():
+                _exl3_mem_snapshot("AFTER_DEST_ALLOC", owner_mod)
+            if (
+                sharded.dtype == torch.int16
+                and sharded.device == dest_device
+                and sharded.is_contiguous()
+            ):
+                payload = sharded
+            else:
+                payload = sharded.to(
+                    device=dest_device, dtype=torch.int16, non_blocking=False
+                ).contiguous()
+            if _exl3_mem_waterfall_enabled():
+                _exl3_mem_snapshot("AFTER_READ", owner_mod)
+                _exl3_mem_snapshot("AFTER_LAYOUT_CONVERSION", owner_mod)
+                _exl3_mem_snapshot("AFTER_COPY_TO_FINAL", owner_mod)
+            new_p = Parameter(payload, requires_grad=False)
+            new_p.weight_loader = self._load_exl3
+            new_p._exl3_owner = owner_mod
+            plist[expert_id] = new_p
+            owner_mod._exl3_trellis_alloc_count_before = int(
+                getattr(owner_mod, "_exl3_trellis_alloc_count_before", 0)
+            ) + 1
+            del loaded, sharded, payload, loaded_weight
+            if _exl3_mem_waterfall_enabled():
+                _exl3_mem_snapshot("AFTER_TEMP_DELETE", owner_mod)
+            return True if return_success else None
+
+        # suh / svh remain stacked (K-independent).
+        if owner_mod is None:
+            raise RuntimeError("EXL3 scale load missing owner module")
         if shard_id in ("w1", "w3"):
             shard_idx = 0 if shard_id == "w1" else 1
             sharded = shard_exl3_col(loaded, suffix, tp_rank, tp_size)
-            dest = param.data[expert_id, shard_idx]
+            dest = getattr(owner_mod, "w13_" + suffix).data[expert_id, shard_idx]
         elif shard_id == "w2":
             sharded = shard_exl3_row(loaded, suffix, tp_rank, tp_size)
-            dest = param.data[expert_id]
+            dest = getattr(owner_mod, "w2_" + suffix).data[expert_id]
         else:
             raise ValueError(f"unknown EXL3 shard_id={shard_id}")
 
+        if not sharded.is_contiguous():
+            sharded = sharded.contiguous()
         if tuple(dest.shape) != tuple(sharded.shape):
             raise RuntimeError(
                 f"EXL3 load shape mismatch {weight_name} shard={shard_id} "
@@ -1984,11 +3023,45 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 f"loaded {tuple(sharded.shape)}"
             )
         dest.copy_(sharded)
+        if dest.device.type == "cuda" and torch is not None:
+            try:
+                torch.cuda.current_stream().synchronize()
+            except Exception:
+                pass
+        _madv_dontneed_cpu_tensor(sharded)
+        del loaded, sharded, loaded_weight
         return True if return_success else None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if not hasattr(layer, "w13_trellis"):
+        if not hasattr(layer, "gate_trellis"):
             return
+        # Pack staged trellis tensors into contiguous per-shape arenas before
+        # building LinearEXL3 handles. Views preserve exact heterogeneous K.
+        # Direct-fill plans have empty staging but still need stats finalized.
+        staging = getattr(layer, "_exl3_trellis_staging", None) or {}
+        staged_n = sum(len(m) for m in staging.values() if isinstance(m, dict))
+        has_plan = getattr(layer, "_exl3_trellis_arena_plan", None) is not None
+        if _exl3_trellis_arena_enabled() and (staged_n > 0 or has_plan):
+            if _exl3_mem_waterfall_enabled():
+                _exl3_mem_snapshot("BEFORE_ARENA_PACK", layer)
+            alloc_before = int(getattr(layer, "_exl3_trellis_alloc_count_before", 0))
+            alloc_before = max(alloc_before, staged_n)
+            stats = _pack_trellis_arenas(layer)
+            stats["allocations_before"] = alloc_before
+            layer._exl3_trellis_arena_stats = stats
+            if _exl3_mem_waterfall_enabled():
+                _exl3_mem_snapshot("AFTER_ARENA_PACK", layer)
+                _exl3_mem_snapshot("AFTER_GC", layer)
+            if not self._logged:
+                logger.info(
+                    "EXL3 trellis arenas: before_allocs=%s after_arenas=%s "
+                    "final_bytes=%s temp_peak_bytes=%s",
+                    stats.get("allocations_before"),
+                    stats.get("allocations_after"),
+                    stats.get("final_bytes"),
+                    stats.get("temp_peak_bytes"),
+                )
+
         # Bind owner for any late loads; stitch LinearEXL3 handles.
         for name in (
             "w13_trellis",
@@ -2002,36 +3075,67 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             "w2_mcg",
             "w2_mul1",
         ):
-            getattr(layer, name)._exl3_owner = layer
+            if hasattr(layer, name):
+                getattr(layer, name)._exl3_owner = layer
+        for plist in (layer.gate_trellis, layer.up_trellis, layer.down_trellis):
+            for param in plist:
+                param._exl3_owner = layer
+                param.weight_loader = self._load_exl3
         _check_moe_codebook_markers(layer.w13_mcg, layer.w13_mul1, "w13")
         _check_moe_codebook_markers(layer.w2_mcg, layer.w2_mul1, "w2")
 
-        n_exp = int(layer.w13_trellis.shape[0])
+        n_exp = int(len(layer.gate_trellis))
         inners: list[dict[str, Any]] = []
+        k_values: list[int] = []
+        # _BATCHED_MARKERS: prefetch every marker block once (4 host
+        # transfers) instead of 6 .item() syncs per expert (288/layer).
+        w13_mcg_h = _marker_row_host(layer.w13_mcg)
+        w13_mul1_h = _marker_row_host(layer.w13_mul1)
+        w2_mcg_h = _marker_row_host(layer.w2_mcg)
+        w2_mul1_h = _marker_row_host(layer.w2_mul1)
+        w13_ncol = 2  # [n_exp, 2, 1]
         for e in range(n_exp):
+            gt = layer.gate_trellis[e]
+            ut = layer.up_trellis[e]
+            dt = layer.down_trellis[e]
+            if gt.numel() == 0 or ut.numel() == 0 or dt.numel() == 0:
+                raise RuntimeError(
+                    f"EXL3 mixed-K load incomplete for local expert {e}: "
+                    f"gate={tuple(gt.shape)} up={tuple(ut.shape)} down={tuple(dt.shape)}"
+                )
             gate = make_linear_exl3(
-                layer.w13_trellis[e, 0],
+                gt,
                 layer.w13_suh[e, 0],
                 layer.w13_svh[e, 0],
-                _moe_marker_or_none(layer.w13_mcg[e, 0]),
-                _moe_marker_or_none(layer.w13_mul1[e, 0]),
+                _marker_tensor_or_none_host(w13_mcg_h, e * w13_ncol + 0, gt.device),
+                _marker_tensor_or_none_host(w13_mul1_h, e * w13_ncol + 0, gt.device),
             )
             up = make_linear_exl3(
-                layer.w13_trellis[e, 1],
+                ut,
                 layer.w13_suh[e, 1],
                 layer.w13_svh[e, 1],
-                _moe_marker_or_none(layer.w13_mcg[e, 1]),
-                _moe_marker_or_none(layer.w13_mul1[e, 1]),
+                _marker_tensor_or_none_host(w13_mcg_h, e * w13_ncol + 1, ut.device),
+                _marker_tensor_or_none_host(w13_mul1_h, e * w13_ncol + 1, ut.device),
             )
             down = make_linear_exl3(
-                layer.w2_trellis[e],
+                dt,
                 layer.w2_suh[e],
                 layer.w2_svh[e],
-                _moe_marker_or_none(layer.w2_mcg[e]),
-                _moe_marker_or_none(layer.w2_mul1[e]),
+                _marker_tensor_or_none_host(w2_mcg_h, e, dt.device),
+                _marker_tensor_or_none_host(w2_mul1_h, e, dt.device),
             )
             inners.append({"gate": gate, "up": up, "down": down})
+            k_values.extend(
+                [
+                    int(gt.shape[-1]) // 16,
+                    int(ut.shape[-1]) // 16,
+                    int(dt.shape[-1]) // 16,
+                ]
+            )
         layer._exl3_inners = inners
+        logger.info("WAVETIME finalize layer=%s secs=%.2f", getattr(layer, "layer_id", "?"), time.monotonic() - _ft0)
+        mixed_k = len(set(k_values)) > 1
+        layer._exl3_mixed_k = mixed_k
         # Codebook flags (mcg, mul1) per projection for the fused kernel launch;
         # every expert in a layer must agree.
         if inners:
@@ -2053,10 +3157,15 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             layer._exl3_codebook_flags = flags
         fused_ok = False
         fused_err = None
-        # Native dispatch has its own environment control and must still build
-        # pointer tables when the legacy EXL3_FUSED_MOE switch is disabled.
+        # Fused/native MoE launches take a single K for gate/up/down across the
+        # whole layer. Heterogeneous packed K must use the LinearEXL3 loop.
         backend = get_moe_kernel_backend()
-        if fused_moe_enabled() or backend == "native":
+        if mixed_k:
+            fused_err = f"mixed_packed_K={sorted(set(k_values))}"
+            layer._exl3_ptrs = None
+            layer._exl3_fused_temps = None
+            layer._exl3_fused_concurrency = 0
+        elif fused_moe_enabled() or backend == "native":
             try:
                 has_native = backend == "native" and native_moe_kernel_available()
                 has_exllamav3 = _exllamav3_moe_available()
@@ -2092,15 +3201,23 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 logger.info(
                     "EXL3 MCG trellis engaged for routed experts: bits=%s "
                     "experts_local=%s hidden=%s intermediate_local=%s "
-                    "fused_moe=python_loop (%s) "
+                    "fused_moe=python_loop (%s) mixed_k=%s "
                     "(no BF16 expert reconstruct at load)",
                     self.bits,
                     n_exp,
                     layer._exl3_hidden_size,
                     layer._exl3_intermediate_local,
                     fused_err or "EXL3_FUSED_MOE=0",
+                    mixed_k,
                 )
             self._logged = True
+        # Release transient load leftovers between MoE layers on UMA hosts.
+        gc.collect()
+        if torch is not None and torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
     def apply(
         self,
@@ -2204,6 +3321,65 @@ def ngram_dequant_rows_torch(
     return out
 
 
+NGRAM_TABLE_ENV = "VLLM_EXL3_NGRAM_TABLE"
+
+
+class _NgramDiskTable:
+    """The packed n-gram table as the checkpoint's own CPU views, one per shard.
+    Rows are gathered on the host; with memory-mapped views that is a page-cache
+    read, so the table costs no device memory and no anonymous RAM."""
+
+    def __init__(self, views: list[torch.Tensor], rows_per_shard: int) -> None:
+        self.views = views
+        self.rows_per_shard = int(rows_per_shard)
+        self.num_rows = sum(int(v.shape[0]) for v in views)
+
+    def gather(self, uids_cpu: torch.Tensor) -> torch.Tensor:
+        if len(self.views) == 1:
+            return self.views[0].index_select(0, uids_cpu)
+        shard = uids_cpu // self.rows_per_shard
+        local = uids_cpu - shard * self.rows_per_shard
+        out = torch.empty((uids_cpu.numel(), self.views[0].shape[1]), dtype=self.views[0].dtype)
+        for s in shard.unique().tolist():
+            m = shard == s
+            out[m] = self.views[s].index_select(0, local[m])
+        return out
+
+
+def _ngram_view_owner(param: Parameter) -> torch.nn.Module:
+    """The embedding layer a disk-mode shard parameter belongs to (set at create time)."""
+    owner = getattr(param, "_exl3_ngram_owner", None)
+    if owner is None:
+        raise RuntimeError("EXL3 n-gram (disk): shard parameter has no owning layer")
+    return owner
+
+
+def _check_ngram_disk_graph_mode() -> None:
+    """Disk mode synchronizes with the host inside the model forward; refuse the CUDA
+    graph modes that would capture that, and say what to pass instead."""
+    try:
+        from vllm.config import get_current_vllm_config
+
+        cfg = get_current_vllm_config().compilation_config
+    except Exception:
+        return
+    mode = getattr(cfg, "cudagraph_mode", None)
+    name = getattr(mode, "name", str(mode))
+    ops = list(getattr(cfg, "splitting_ops", None) or [])
+    if "FULL" in name:
+        raise RuntimeError(
+            f"{NGRAM_TABLE_ENV}=disk needs PIECEWISE CUDA graphs with the lookup kept "
+            "eager; got cudagraph_mode=%s. Pass --compilation-config with "
+            '{"cudagraph_mode": "PIECEWISE", "splitting_ops": [<the attention ops>, '
+            '"vllm::exl3_ngram_lookup_out"]}' % name
+        )
+    if ops and "vllm::exl3_ngram_lookup_out" not in ops:
+        raise RuntimeError(
+            f"{NGRAM_TABLE_ENV}=disk: add \"vllm::exl3_ngram_lookup_out\" to splitting_ops so "
+            "the host gather runs outside the piecewise graphs"
+        )
+
+
 class Exl3EmbeddingMethod(QuantizeMethodBase):
     """Row-wise EXL3 embedding table in exllamav3's n-gram format.
 
@@ -2227,12 +3403,29 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
         self.rows_per_shard = int(spec["rows_per_shard"])
         self.num_heads = int(spec["num_heads"])
         self.words = ngram_words_per_row(self.bits)
+        # Checkpoint layout: ``shard_<i>.trellis`` (default) or one ``trellis`` tensor
+        # holding the whole table (the layout exllamav3 1.5.0-era packs ship).
+        self.sharded = bool(spec.get("sharded", True))
+        if not self.sharded and self.num_shards != 1:
+            raise ValueError(
+                "ngram_embedding: an unsharded table must declare num_shards=1, "
+                f"got {self.num_shards}"
+            )
         kernel = os.environ.get("VLLM_EXL3_NGRAM_KERNEL", "ext").strip().lower()
         if kernel not in ("ext", "torch"):
             raise ValueError(
                 f"VLLM_EXL3_NGRAM_KERNEL must be 'ext' or 'torch', got {kernel!r}"
             )
         self.kernel = kernel
+        # Where the packed table lives. ``resident``: one int16 device tensor (32.6 GiB
+        # for the Qwen3.8-Flash-Next 5-bit table). ``disk``: the loader keeps the
+        # checkpoint's memory-mapped views and every lookup gathers the rows it needs on
+        # the host, so the table costs page cache, not device memory. See
+        # ``_embedding_impl_disk`` for what that requires of the CUDA graph mode.
+        table_mode = os.environ.get(NGRAM_TABLE_ENV, "resident").strip().lower()
+        if table_mode not in ("resident", "disk"):
+            raise ValueError(f"{NGRAM_TABLE_ENV} must be 'resident' or 'disk', got {table_mode!r}")
+        self.table_mode = table_mode
         self._ext = None
 
     def create_weights(
@@ -2263,16 +3456,28 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
         if int(tp_size) != 1:
             raise RuntimeError("EXL3 n-gram embedding supports tensor parallel size 1 only")
 
-        table = torch.empty(
-            self.num_shards, self.rows_per_shard, self.words, dtype=torch.int16
-        )
+        if self.table_mode == "resident":
+            table = torch.empty(
+                self.num_shards, self.rows_per_shard, self.words, dtype=torch.int16
+            )
+        else:
+            # Nothing resident: the loader keeps the checkpoint views (``_exl3_ngram_views``)
+            # and the parameters below are name anchors for vLLM's weight loader only.
+            table = None
+            layer._exl3_ngram_views = [None] * self.num_shards
         loaded: set[int] = set()
         for i in range(self.num_shards):
-            shard = torch.nn.Module()
-            p = Parameter(table[i], requires_grad=False)
+            data = table[i] if table is not None else torch.empty(0, dtype=torch.int16)
+            p = Parameter(data, requires_grad=False)
             p.weight_loader = self._make_shard_loader(i, loaded)
-            shard.register_parameter("trellis", p)
-            layer.add_module(f"shard_{i}", shard)
+            if table is None:
+                p._exl3_ngram_owner = layer
+            if self.sharded:
+                shard = torch.nn.Module()
+                shard.register_parameter("trellis", p)
+                layer.add_module(f"shard_{i}", shard)
+            else:
+                layer.register_parameter("trellis", p)
         aux = {
             "head_bias": Parameter(
                 torch.zeros(self.num_heads, NGRAM_ROW_DIM, dtype=torch.float16),
@@ -2299,6 +3504,7 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
 
     def _make_shard_loader(self, index: int, loaded: set[int]):
         rows, words, bits = self.rows_per_shard, self.words, self.bits
+        disk = self.table_mode == "disk"
 
         def weight_loader(param: Parameter, loaded_weight: torch.Tensor, loaded_shard_id=None):
             del loaded_shard_id
@@ -2307,7 +3513,15 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
                     f"EXL3 n-gram shard {index}: expected int16 ({rows}, {words}) for "
                     f"K={bits}, got {loaded_weight.dtype} {tuple(loaded_weight.shape)}"
                 )
-            param.data.copy_(loaded_weight)
+            if disk:
+                # vLLM's safetensors iterator hands over a zero-copy view of the mapped
+                # file; holding it keeps the mapping alive and no row is read until a
+                # lookup touches it. A tensor that is not a plain CPU view (a loader
+                # that copied, or another device) is kept as-is and still works.
+                owner = _ngram_view_owner(param)
+                owner._exl3_ngram_views[index] = loaded_weight.detach()
+            else:
+                param.data.copy_(loaded_weight)
             loaded.add(index)
 
         return weight_loader
@@ -2330,7 +3544,7 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         table = getattr(layer, "_exl3_ngram_table", None)
-        if table is None:
+        if table is None and not hasattr(layer, "_exl3_ngram_views"):
             return
         loaded = layer._exl3_ngram_loaded
         missing = [i for i in range(self.num_shards) if i not in loaded]
@@ -2345,7 +3559,8 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
         ]
         if aux_missing:
             raise RuntimeError(f"EXL3 n-gram table: aux tensors never loaded: {aux_missing}")
-        if layer.shard_0.trellis.data_ptr() != table.data_ptr():
+        first = layer.shard_0.trellis if self.sharded else layer.trellis
+        if table is not None and first.data_ptr() != table.data_ptr():
             raise RuntimeError(
                 "EXL3 n-gram shard parameters no longer alias the packed table; refusing to serve"
             )
@@ -2362,7 +3577,16 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
                 f"EXL3 n-gram head layout inconsistent with the table: offsets={offs} "
                 f"sizes={sizes} rows={total_rows}"
             )
-        layer._exl3_ngram_rows = table.view(-1, self.words)
+        if table is not None:
+            layer._exl3_ngram_rows = table.view(-1, self.words)
+        else:
+            views = layer._exl3_ngram_views
+            if any(v is None for v in views):
+                raise RuntimeError("EXL3 n-gram table (disk): a shard view was never captured")
+            layer._exl3_ngram_rows = None
+            layer._exl3_ngram_disk = _NgramDiskTable(views, self.rows_per_shard)
+            layer._exl3_ngram_head_offsets_cpu = layer.head_offsets.data.detach().cpu().contiguous()
+            _check_ngram_disk_graph_mode()
         layer._exl3_ngram_head_offsets = layer.head_offsets.data.contiguous()
         layer._exl3_ngram_head_bias = layer.head_bias.data.contiguous()
         layer._exl3_opaque_name = _exl3_register_opaque_layer(layer, "ngram")
@@ -2377,10 +3601,12 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
                 )
                 self.kernel = "torch"
         logger.info(
-            "EXL3 n-gram embedding ready: %d shards x %d rows, K=%d, %d heads, "
-            "%.2f GiB packed, kernel=%s",
-            self.num_shards, self.rows_per_shard, self.bits, self.num_heads,
-            table.numel() * 2 / 2**30, self.kernel,
+            "EXL3 n-gram embedding ready: %d shards x %d rows (%s), K=%d, %d heads, "
+            "%.2f GiB packed, table=%s, kernel=%s",
+            self.num_shards, self.rows_per_shard,
+            "sharded" if self.sharded else "unsharded", self.bits, self.num_heads,
+            self.num_shards * self.rows_per_shard * self.words * 2 / 2**30,
+            self.table_mode, self.kernel,
         )
 
     def _lookup_packed(self, layer: torch.nn.Module, ids_flat: torch.Tensor) -> torch.Tensor:
@@ -2400,19 +3626,70 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
             return out
         return ngram_dequant_rows_torch(packed, self.bits, heads, bias)
 
+    def _ngram_lookup_uses_out_variant(self, layer: torch.nn.Module) -> bool:
+        """Whether this lookup has to write into a caller-allocated buffer.
+
+        Only the opt-in disk table needs it. There the lookup runs eagerly as a
+        CUDA-graph splitting op, so the output buffer must be allocated in the
+        piece before the split. The resident table keeps the mainline returning
+        op, so nothing about the default path changes.
+        """
+        return getattr(layer, "_exl3_ngram_disk", None) is not None
+
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         name = getattr(layer, "_exl3_opaque_name", None)
         if name is not None and _EXL3_OPS_READY:
-            return torch.ops.vllm.exl3_ngram_lookup(input_, name)
+            if not self._ngram_lookup_uses_out_variant(layer):
+                return torch.ops.vllm.exl3_ngram_lookup(input_, name)
+            # Out-variant on purpose, and reachable only with
+            # ``VLLM_EXL3_NGRAM_TABLE=disk``. When this op is a splitting op (disk
+            # mode), the piecewise CUDA graph after it was captured reading its
+            # input at one address; a fresh tensor returned from an eager op lands
+            # anywhere. The buffer is allocated here, inside the piece before the
+            # split, so its address is the graph's own and stable across replays,
+            # the same way vLLM's attention and PLE ops take their output as an
+            # argument.
+            out = torch.empty(
+                *input_.shape, NGRAM_ROW_DIM, dtype=layer._exl3_ngram_dtype, device=input_.device
+            )
+            torch.ops.vllm.exl3_ngram_lookup_out(input_, name, out)
+            return out
         return self._embedding_impl(layer, input_)
 
     def _embedding_impl(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        if getattr(layer, "_exl3_ngram_disk", None) is not None:
+            return self._embedding_impl_disk(layer, input_)
         if getattr(layer, "_exl3_ngram_rows", None) is None:
             raise RuntimeError("EXL3 n-gram table was not finalized after weight load")
         ids = input_.reshape(-1).to(torch.int64)
         packed = self._lookup_packed(layer, ids)
         heads = self._heads_for(layer, ids)
         out = self._decode(layer, packed, heads)
+        return out.to(layer._exl3_ngram_dtype).view(*input_.shape, NGRAM_ROW_DIM)
+
+    def _embedding_impl_disk(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        """Host-gathered lookup: unique row ids to the CPU, rows from the mapped
+        checkpoint, one upload, decode on the device, expand back.
+
+        The device-to-host copy is a synchronization point, so this op must run
+        eagerly: PIECEWISE CUDA graphs with ``vllm::exl3_ngram_lookup_out`` in
+        ``splitting_ops``. Under a FULL graph the copy cannot be captured.
+        """
+        ids = input_.reshape(-1).to(torch.int64)
+        uids, inverse = torch.unique(ids, return_inverse=True)
+        uids_cpu = uids.to("cpu", torch.int64)
+        packed_cpu = layer._exl3_ngram_disk.gather(uids_cpu)
+        heads_cpu = torch.searchsorted(
+            layer._exl3_ngram_head_offsets_cpu, uids_cpu, right=True
+        ) - 1
+        heads_cpu = heads_cpu.clamp_(0, self.num_heads - 1).to(torch.int32)
+        # Blocking uploads on purpose: a non_blocking copy out of a pinned temporary
+        # can outlive the temporary and read freed memory, and the device-to-host copy
+        # above already synchronized this stream, so nothing is gained by overlapping.
+        packed = packed_cpu.to(input_.device)
+        heads = heads_cpu.to(input_.device)
+        rows = self._decode(layer, packed, heads)
+        out = rows.index_select(0, inverse.to(rows.device))
         return out.to(layer._exl3_ngram_dtype).view(*input_.shape, NGRAM_ROW_DIM)
 
     def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None):
@@ -2468,6 +3745,15 @@ def _exl3_ngram_lookup_fake(ids: torch.Tensor, layer_name: str) -> torch.Tensor:
     return ids.new_empty(*ids.shape, NGRAM_ROW_DIM, dtype=layer._exl3_ngram_dtype)
 
 
+def _exl3_ngram_lookup_out_op(ids: torch.Tensor, layer_name: str, out: torch.Tensor) -> None:
+    layer = _EXL3_OPAQUE_LAYERS[layer_name]
+    out.copy_(layer.quant_method._embedding_impl(layer, ids))
+
+
+def _exl3_ngram_lookup_out_fake(ids: torch.Tensor, layer_name: str, out: torch.Tensor) -> None:
+    return None
+
+
 def _exl3_register_custom_ops() -> bool:
     global _EXL3_OPS_READY
     if _EXL3_OPS_READY:
@@ -2493,6 +3779,13 @@ def _exl3_register_custom_ops() -> bool:
                 op_func=_exl3_ngram_lookup_op,
                 mutates_args=[],
                 fake_impl=_exl3_ngram_lookup_fake,
+            )
+        if not hasattr(torch.ops.vllm, "exl3_ngram_lookup_out"):
+            direct_register_custom_op(
+                op_name="exl3_ngram_lookup_out",
+                op_func=_exl3_ngram_lookup_out_op,
+                mutates_args=["out"],
+                fake_impl=_exl3_ngram_lookup_out_fake,
             )
     except Exception as exc:  # pragma: no cover - registration is best effort
         logger.warning("EXL3 custom op registration failed; eager fallback: %r", exc)
@@ -2962,6 +4255,12 @@ class Exl3LinearMethod(LinearMethodBase):
                     f"loaded {tuple(sharded.shape)}"
                 )
             dest.copy_(sharded)
+            if dest.device.type == "cuda" and torch is not None:
+                try:
+                    torch.cuda.current_stream().synchronize()
+                except Exception:
+                    pass
+            _madv_dontneed_cpu_tensor(sharded)
 
         return weight_loader
 
