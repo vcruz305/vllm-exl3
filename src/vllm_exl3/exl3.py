@@ -2665,8 +2665,14 @@ class Exl3Config(QuantizationConfig):
                 bits = self.bits
                 hb = getattr(self, "head_bits", 0)
                 if hb and ("/attn." in prefix or ".attn." in prefix
+                           or "_attn." in prefix
                            or "compressor." in prefix
-                           or "shared_experts." in prefix):
+                           or "shared_expert" in prefix
+                           # Vision towers ship whole-tower K=head_bits
+                           # (attn, mlp, and merger alike; verified: every
+                           # visual trellis is 96-wide in the k6 pack).
+                           or "visual." in prefix
+                           ) and "indexer" not in prefix:
                     bits = hb
                 return Exl3LinearMethod(self, bits=bits)
             if getattr(self, "non_routed_dtype_policy", "") == "bf16_as_stored":
@@ -2692,7 +2698,12 @@ class Exl3Config(QuantizationConfig):
             if self._matches_non_routed_exl3(prefix):
                 layer._exl3_prefix = prefix
                 return Exl3LinearMethod(self, bits=self._bits_for_non_routed(prefix))
-            return None
+            # Packs quantized end-to-end ship the head tensors
+            # (lm_head.trellis/suh/svh/mul1) without a non_routed_exl3
+            # spec — claim those too, at head_bits.
+            _hb = getattr(self, "head_bits", 0) or self.bits
+            layer._exl3_prefix = prefix
+            return Exl3LinearMethod(self, bits=_hb)
         if isinstance(layer, VocabParallelEmbedding):
             spec = self._ngram_embedding_spec(prefix)
             if spec is not None:
@@ -2751,6 +2762,10 @@ def _exl3_routed_experts_loader(layer: torch.nn.Module):
             mapping = layer.get_expert_mapping(include_fused=True)
         except TypeError:
             mapping = layer.get_expert_mapping()
+        except AttributeError:
+            # Fork builds: FusedMoE carries the mapping as an attribute
+            # (self.expert_mapping) instead of a get_expert_mapping method.
+            mapping = layer.expert_mapping
         layer_name = str(getattr(layer, "layer_name", ""))
         for expert_name, loaded_weight in weights:
             qual_name = f"{layer_name}.{expert_name}" if layer_name else expert_name
@@ -4430,10 +4445,25 @@ class Exl3LinearMethod(LinearMethodBase):
                 )
                 span = sum(output_partition_sizes[i] for i in ids)
                 if loaded_out != span:
-                    raise RuntimeError(
-                        f"EXL3 linear load: {suffix} tensor covers {loaded_out} outputs "
-                        f"but shards {ids} total {span}"
-                    )
+                    # TP-sharded merged layer: the checkpoint tensor covers
+                    # the FULL output (every rank's span) while this rank's
+                    # params hold only its shard — narrow to this rank's
+                    # contiguous slice before splitting at shard boundaries.
+                    if loaded_out == span * tp_size:
+                        dim = 1 if suffix == "trellis" else 0
+                        per = loaded_out // tp_size
+                        lo = per * tp_rank
+                        loaded_weight = (
+                            loaded_weight[:, lo // 16 : (lo + per) // 16, :]
+                            if suffix == "trellis"
+                            else loaded_weight[lo : lo + per]
+                        )
+                        loaded_out = per
+                    else:
+                        raise RuntimeError(
+                            f"EXL3 linear load: {suffix} tensor covers {loaded_out} outputs "
+                            f"but shards {ids} total {span}"
+                        )
                 start = 0
                 for i in ids:
                     size = output_partition_sizes[i]
@@ -4482,6 +4512,8 @@ class Exl3LinearMethod(LinearMethodBase):
                 elif suffix in ("mul1", "mcg"):
                     # Markers: (n_shards, 1) param; both local slices'
                     # markers carry the same codebook value — write row 0.
+                    if loaded_weight.numel() == 0:
+                        return
                     param.data[0] = loaded_weight.reshape(1)
                     return
                 else:  # trellis
@@ -4568,8 +4600,25 @@ class Exl3LinearMethod(LinearMethodBase):
             )
             # round(): expected_out may be padded (tile-aligned pad);
             # the loaded tensor covers the unpadded geometry — integer
-            # division would skew the shard count (129280//32384=3).
-            shard_tp_size = max(1, round(total_out / expected_out))
+            # division would skew the shard count (129280//32384=3),
+            # and the pad skews round() too (640 svh vs padded 256:
+            # 640/256 = 2.5). The invariant: the loaded tensor covers
+            # shard_tp_size ranks' worth of REAL rows, each piece must
+            # fit the (possibly padded) dest, and shard_tp_size must
+            # divide tp_size. Pick the COARSEST divisor whose per-rank
+            # piece still fits — finer narrowing would under-fill the
+            # dest's real rows; coarser pieces exceed the dest. For the
+            # padded case (640 svh, padded 256 dest, tp 4) only d = 4
+            # fits (640/4 = 160 <= 256); for exact cases the piece
+            # equals expected_out at the true divisor.
+            _cands = [
+                d for d in range(1, tp_size + 1)
+                if tp_size % d == 0 and total_out % d == 0
+                and total_out // d <= expected_out
+            ]
+            shard_tp_size = next(
+                iter(_cands), max(1, round(total_out / expected_out))
+            )
             shard_tp_rank = tp_rank // max(1, tp_size // shard_tp_size)
 
             # Rank-local slice tensors (batched/bmm layers): when the
@@ -4673,6 +4722,42 @@ class Exl3LinearMethod(LinearMethodBase):
                 raise ValueError(f"unknown EXL3 suffix={suffix}")
 
             if tuple(dest.shape) != tuple(sharded.shape):
+                # Padded geometry: the narrowed tensor covers the shard's
+                # TRUE input rows; the padded param row holds them at the
+                # head with the pad region zeroed (padded suh rows are
+                # zero — the pad contributes nothing).
+                if (
+                    suffix in ("suh", "svh")
+                    and sharded.dim() == 1
+                    and dest.shape[0] > sharded.shape[0]
+                ):
+                    dest[: sharded.shape[0]].copy_(sharded)
+                    return
+                if (
+                    suffix == "trellis"
+                    and sharded.dim() == 3
+                    and dest.shape[0] > sharded.shape[0]
+                    and dest.shape[1:] == sharded.shape[1:]
+                ):
+                    # Padded row-parallel input: the narrowed trellis holds
+                    # the shard's TRUE in-tiles; the padded param's leading
+                    # in-tile dim carries them at the head (pad tiles are
+                    # zero — padded input rows only see zero-extended data).
+                    dest[: sharded.shape[0]].copy_(sharded)
+                    return
+                if (
+                    suffix == "trellis"
+                    and sharded.dim() == 3
+                    and dest.shape[0] == sharded.shape[0]
+                    and dest.shape[1] > sharded.shape[1]
+                    and dest.shape[2] == sharded.shape[2]
+                ):
+                    # Padded column-parallel output: the narrowed trellis
+                    # holds the shard's TRUE out-tiles; the padded param's
+                    # out-tile dim carries them at the head (pad tiles are
+                    # zero — padded output rows contribute nothing).
+                    dest[:, : sharded.shape[1]].copy_(sharded)
+                    return
                 # Rank-local checkpoint tensors (batched/bmm layers whose
                 # slice structure already accounts for TP): the TP narrowing
                 # above is wrong for them. Retry with the un-narrowed
@@ -4721,8 +4806,9 @@ class Exl3LinearMethod(LinearMethodBase):
                     f"exactly one codebook marker must be present"
                 )
             if not mcg_is_set and not mul1_is_set:
+                prefix = getattr(layer, 'prefix', '?')
                 raise RuntimeError(
-                    f"EXL3 linear shard {i}: neither mcg nor mul1 marker is set; "
+                    f"EXL3 linear {prefix} shard {i}: neither mcg nor mul1 marker is set; "
                     f"exactly one codebook marker must be present"
                 )
             # Verify marker value
