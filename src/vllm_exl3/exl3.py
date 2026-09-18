@@ -3353,10 +3353,44 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 return True if return_success else None
 
             # Legacy: one independent Parameter allocation per expert.
+            # Block-aligned fill (fork scheme): the reconstruct kernel's
+            # 128-block Hadamard mixes channels within each block, so a
+            # rank must hold the FULL block-aligned tile window spanning
+            # its shard boundary — not the ragged narrow (which drops the
+            # boundary block's tail tiles and decodes wrong owned
+            # channels). Pre-fill zeros, then copy the real window from
+            # the un-narrowed checkpoint tensor; the act-mask (stashed by
+            # the suh/svh path) restricts apply to the owned channels.
             dest_device = owner_mod.w13_suh.device
             if _exl3_mem_waterfall_enabled():
                 _exl3_mem_snapshot("AFTER_DEST_ALLOC", owner_mod)
-            if (
+            if tp_size > 1:
+                if shard_id == "w2":
+                    full = int(loaded.shape[0]) * 16
+                else:
+                    full = int(loaded.shape[1]) * 16
+                if full % tp_size:
+                    raise ValueError(
+                        f"EXL3 MoE intermediate {full} not divisible by "
+                        f"tp={tp_size}"
+                    )
+                real = full // tp_size
+                owned_lo = tp_rank * real
+                owned_hi = owned_lo + real
+                lo = owned_lo // 128 * 128
+                hi = -(-owned_hi // 128) * 128
+                kt_lo, kt_hi = lo // 16, hi // 16
+                if shard_id == "w2":
+                    window = loaded.detach().contiguous()[kt_lo:kt_hi]
+                else:  # w13 col path: tile range lives on dim 1
+                    window = loaded.detach().contiguous()[:, kt_lo:kt_hi, :]
+                payload = torch.zeros(
+                    (kt_hi - kt_lo, *window.shape[1:]),
+                    dtype=window.dtype,
+                    device=dest_device,
+                )
+                payload.copy_(window.to(device=dest_device))
+            elif (
                 sharded.dtype == torch.int16
                 and sharded.device == dest_device
                 and sharded.is_contiguous()
@@ -3366,10 +3400,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 payload = sharded.to(
                     device=dest_device, dtype=torch.int16, non_blocking=False
                 ).contiguous()
-            if _exl3_mem_waterfall_enabled():
-                _exl3_mem_snapshot("AFTER_READ", owner_mod)
-                _exl3_mem_snapshot("AFTER_LAYOUT_CONVERSION", owner_mod)
-                _exl3_mem_snapshot("AFTER_COPY_TO_FINAL", owner_mod)
             new_p = Parameter(payload, requires_grad=False)
             new_p.weight_loader = self._load_exl3
             new_p._exl3_owner = owner_mod
