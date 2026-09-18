@@ -4594,8 +4594,6 @@ class Exl3LinearMethod(LinearMethodBase):
                 bf16_shards,
                 layer,
                 is_qkv_parallel,
-                is_bmm=is_bmm,
-                bmm_slices=bmm_slices,
             )
         weight_param.weight_loader = self._make_weight_loader(
             "weight",
