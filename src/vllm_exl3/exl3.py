@@ -3384,12 +3384,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     window = loaded.detach().contiguous()[kt_lo:kt_hi]
                 else:  # w13 col path: tile range lives on dim 1
                     window = loaded.detach().contiguous()[:, kt_lo:kt_hi, :]
-                payload = torch.zeros(
-                    (kt_hi - kt_lo, *window.shape[1:]),
-                    dtype=window.dtype,
-                    device=dest_device,
-                )
-                payload.copy_(window.to(device=dest_device))
+                # The window covers every dest tile with real data — the
+                # zeros pre-fill idea is moot; the window IS the payload.
+                payload = window.to(device=dest_device).contiguous()
             elif (
                 sharded.dtype == torch.int16
                 and sharded.device == dest_device
