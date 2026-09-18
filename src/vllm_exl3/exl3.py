@@ -1176,7 +1176,13 @@ def _narrow_tp(tensor: torch.Tensor, dim: int, tp_rank: int, tp_size: int) -> to
 
 
 def _resolve_tp_geometry(*owners: Any) -> tuple[int, int]:
-    """Resolve per-layer TP metadata before consulting process-wide TP state."""
+    """Resolve per-layer TP metadata before consulting process-wide TP state.
+
+    Rank and size resolve INDEPENDENTLY: a module may expose one without the
+    other (VocabParallelEmbedding stores tp_size but not tp_rank). Coupling
+    them made the resolver return rank 0 with the module's size — every rank
+    then loaded shard 0 (the lm_head constant-token bug).
+    """
     for owner in owners:
         if owner is None:
             continue
@@ -1187,7 +1193,19 @@ def _resolve_tp_geometry(*owners: Any) -> tuple[int, int]:
         if size is None:
             size = getattr(owner, "_exl3_tp_size", None)
         if rank is not None or size is not None:
-            return int(rank) if rank is not None else 0, int(size) if size is not None else 1
+            resolved_rank = int(rank) if rank is not None else None
+            resolved_size = int(size) if size is not None else None
+            if resolved_rank is None or resolved_size is None:
+                from vllm.distributed import (
+                    get_tensor_model_parallel_rank,
+                    get_tensor_model_parallel_world_size,
+                )
+
+                if resolved_rank is None:
+                    resolved_rank = get_tensor_model_parallel_rank()
+                if resolved_size is None:
+                    resolved_size = get_tensor_model_parallel_world_size()
+            return resolved_rank, resolved_size
 
     from vllm.distributed import (
         get_tensor_model_parallel_rank,
@@ -1475,6 +1493,9 @@ def apply_exl3_python_loop(
             gate = gate.clamp(max=limit)
             up = up.clamp(min=-limit, max=limit)
         act = F.silu(gate) * up
+        act_mask = pack.get("act_mask")
+        if act_mask is not None:
+            act.mul_(act_mask)
         down = pack["down"].forward(act.contiguous().half(), {}, out_dtype=torch.float32)
         scale = weights[token_idx, k_pos].unsqueeze(-1).to(dtype=torch.float32)
         out.index_add_(0, token_idx, down * scale)
@@ -2530,6 +2551,75 @@ class Exl3Config(QuantizationConfig):
             return list(layer_cfg.get("bf16_shards", []))
         return []
 
+    def _resolve_indexer_bits_from_checkpoint(
+        self, model_dir: str | None = None
+    ) -> int | None:
+        """Actual indexer trellis width from the checkpoint header.
+
+        Trellis tile words = 16 * bits, so one safetensors header read
+        resolves the family ambiguity: DeepSeek V4 packs the indexer at
+        head_bits (80-wide = 5bpw) while Qwen3.8 packs it at the global
+        bits (64-wide = 4bpw). Reads headers only — no tensor data.
+        Returns the resolved bits, or None when unresolvable.
+        """
+        try:
+            import json
+            import struct
+
+            if model_dir is None:
+                from vllm.config import get_current_vllm_config
+
+                model_dir = get_current_vllm_config().model_config.model
+            index_path = os.path.join(model_dir, "model.safetensors.index.json")
+            single_path = os.path.join(model_dir, "model.safetensors")
+            if os.path.isfile(index_path):
+                with open(index_path) as f:
+                    weight_map = json.load(f).get("weight_map", {})
+                shards: dict[str, list[str]] = {}
+                for key, shard in weight_map.items():
+                    if "indexer" in key and key.endswith(".trellis"):
+                        shards.setdefault(shard, []).append(key)
+            elif os.path.isfile(single_path):
+                shards = {single_path: []}
+            else:
+                return None
+            for shard, keys in shards.items():
+                path = shard if os.path.isabs(shard) else os.path.join(
+                    model_dir, shard
+                )
+                with open(path, "rb") as f:
+                    (header_len,) = struct.unpack("<Q", f.read(8))
+                    header = json.loads(f.read(header_len))
+                if not keys:
+                    keys = [
+                        k
+                        for k in header
+                        if k != "__metadata__"
+                        and "indexer" in k
+                        and k.endswith(".trellis")
+                    ]
+                for key in keys:
+                    shape = header.get(key, {}).get("shape") or []
+                    if len(shape) == 3 and shape[-1] % 16 == 0:
+                        return shape[-1] // 16
+        except Exception:
+            pass
+        return None
+
+    def _indexer_head_bits_verified(self) -> bool:
+        """True when the pack's indexer family really is packed at head_bits.
+
+        The checkpoint's actual packed width decides; when it cannot be
+        read, keep the legacy name-family behavior (apply head_bits).
+        """
+        resolved = getattr(self, "_indexer_bits_resolved", False)
+        if resolved is False:
+            resolved = self._resolve_indexer_bits_from_checkpoint()
+            self._indexer_bits_resolved = resolved
+        if resolved is None:
+            return True
+        return resolved == self.head_bits
+
     def get_supported_act_dtypes(self) -> list[torch.dtype]:
         return [torch.bfloat16, torch.float16, torch.float32]
 
@@ -2574,6 +2664,13 @@ class Exl3Config(QuantizationConfig):
         )
         # __init__ swallows unknown kwargs; stash the delegation dict explicitly.
         inst.non_routed_quantization = config.get("non_routed_quantization")
+        # Packs that omit the ngram_embedding spec but ledger the table under
+        # tensor_storage: derive the spec from the ledger entry so the PLE
+        # table (Qwen3.8-Flash-Next) claims through Exl3EmbeddingMethod.
+        if not inst.ngram_embedding:
+            inst.ngram_embedding = _derive_ngram_embedding_spec(
+                config.get("tensor_storage") or {}
+            ) or {}
         # "bf16_as_stored": dense linears are BF16 tensors; never delegate them
         # (the delegate still serves source-format MTP experts).
         inst.non_routed_dtype_policy = str(config.get("non_routed_dtype_policy", ""))
@@ -2664,15 +2761,24 @@ class Exl3Config(QuantizationConfig):
                 # checkpoint: wq_a/wkv trellis k_words=80 = 5bpw).
                 bits = self.bits
                 hb = getattr(self, "head_bits", 0)
-                if hb and ("/attn." in prefix or ".attn." in prefix
-                           or "_attn." in prefix
-                           or "compressor." in prefix
-                           or "shared_expert" in prefix
-                           # Vision towers ship whole-tower K=head_bits
-                           # (attn, mlp, and merger alike; verified: every
-                           # visual trellis is 96-wide in the k6 pack).
-                           or "visual." in prefix
-                           ) and "indexer" not in prefix:
+                if hb and "indexer." in prefix:
+                    # The indexer's packing is ambiguous across packs:
+                    # DeepSeek V4 packs it at head_bits (80-wide = 5bpw),
+                    # Qwen3.8 at the global bits (64-wide = 4bpw). Decide
+                    # from the checkpoint's actual trellis width — note
+                    # "_attn." would otherwise swallow self_attn.indexer.*
+                    # into the attention family before this clause.
+                    if self._indexer_head_bits_verified():
+                        bits = hb
+                elif hb and ("/attn." in prefix or ".attn." in prefix
+                             or "_attn." in prefix
+                             or "compressor." in prefix
+                             or "shared_expert" in prefix
+                             # Vision towers ship whole-tower K=head_bits
+                             # (attn, mlp, and merger alike; verified: every
+                             # visual trellis is 96-wide in the k6 pack).
+                             or "visual." in prefix
+                             ):
                     bits = hb
                 return Exl3LinearMethod(self, bits=bits)
             if getattr(self, "non_routed_dtype_policy", "") == "bf16_as_stored":
@@ -2857,9 +2963,23 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         self.bits = int(bits) if bits is not None else quant_config.bits
         self._logged = False
 
+    def maybe_roundup_sizes(
+        self,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        act_dtype: torch.dtype,
+        moe_parallel_config,
+    ) -> tuple[int, int]:
+        # The reconstruct kernels require 128-aligned N; TP shards of the
+        # MoE intermediate (e.g. 640/4 = 160) break that alignment. Round
+        # the per-rank intermediate up to the alignment so the packed
+        # trellis tiles stay kernel-legal; the tail rows are zero-padded
+        # and never read (the router only produces ids into real rows).
+        aligned = -(-intermediate_size_per_partition // 128) * 128
+        return hidden_size, aligned
+
     def get_fused_moe_quant_config(self, layer: "RoutedExperts") -> FusedMoEQuantConfig | None:
         return None
-
     def create_weights(
         self,
         layer: "RoutedExperts",
@@ -3265,12 +3385,79 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
         if not sharded.is_contiguous():
             sharded = sharded.contiguous()
+        # MoE TP sharding vs 128-block Hadamards: the reconstruct kernel mixes
+        # each 128-channel block, so a shard boundary inside a block cannot be
+        # served by zero-padded partial data. Fill the aligned buffer with the
+        # block-aligned TRUE data (contiguous slice of the loaded tensor) and
+        # mask activations to the owned channels at apply time. Stash the full
+        # per-expert intermediate size on first sight.
+        if tp_size > 1 and shard_id == "w2" and suffix == "suh":
+            full = int(loaded.shape[0])
+            if full % tp_size:
+                raise ValueError(
+                    f"EXL3 MoE intermediate {full} not divisible by tp={tp_size}"
+                )
+            owner._exl3_intermediate_full = full
+        if tp_size > 1 and suffix in ("trellis", "suh", "svh"):
+            full = getattr(owner, "_exl3_intermediate_full", None)
+            if full is None:
+                dim = 0 if shard_id == "w2" else (1 if suffix == "trellis" else 0)
+                full = int(loaded.shape[dim]) * (16 if suffix == "trellis" else 1)
+            real = full // tp_size
+            owned_lo = tp_rank * real
+            owned_hi = owned_lo + real
+            lo = owned_lo // 128 * 128
+            hi = -(-owned_hi // 128) * 128
+            if owner is not None:
+                owner._exl3_act_owned = (owned_lo - lo, owned_hi - lo)
+            if suffix == "trellis":
+                kt_lo, kt_hi = lo // 16, hi // 16
+                if shard_id == "w2":
+                    src = loaded.detach().contiguous()[kt_lo:kt_hi]
+                else:  # w13 col path: sharded dim is 1 (n-tiles)
+                    src = loaded.detach().contiguous()[:, kt_lo:kt_hi, :]
+            elif (shard_id == "w2" and suffix == "suh") or (
+                shard_id in ("w1", "w3") and suffix == "svh"
+            ):
+                # Channel-sharded scales: block-aligned TRUE slice.
+                src = loaded.detach().contiguous()[lo:hi]
+            else:  # w13 suh / w2 svh span hidden; not channel-sharded
+                src = sharded
+            if tuple(dest.shape) != tuple(src.shape):
+                raise RuntimeError(
+                    f"EXL3 aligned buffer mismatch {weight_name} shard={shard_id} "
+                    f"expert={expert_id}: dest {tuple(dest.shape)} != "
+                    f"src {tuple(src.shape)}"
+                )
+            dest.copy_(src)
+            return True if return_success else None
+
         if tuple(dest.shape) != tuple(sharded.shape):
-            raise RuntimeError(
-                f"EXL3 load shape mismatch {weight_name} shard={shard_id} "
-                f"expert={expert_id}: dest {tuple(dest.shape)} != "
-                f"loaded {tuple(sharded.shape)}"
-            )
+            # Aligned-alloc padding: create_weights allocates the 128-aligned
+            # intermediate (maybe_roundup_sizes); the checkpoint ships the real
+            # per-rank size. Zero-pad the single short dim — the suh/svh tail
+            # rows are 0, so padded activations decode to exactly 0 and the
+            # padded trellis tiles are never semantically read.
+            diffs = [
+                d
+                for d in range(dest.dim())
+                if dest.shape[d] != sharded.shape[d]
+            ]
+            if (
+                dest.dim() == sharded.dim()
+                and len(diffs) == 1
+                and dest.shape[diffs[0]] > sharded.shape[diffs[0]]
+            ):
+                d = diffs[0]
+                pad = dest.shape[d] - sharded.shape[d]
+                spec = (0, 0) * (sharded.dim() - 1 - d) + (0, pad) + (0, 0) * d
+                sharded = torch.nn.functional.pad(sharded, spec)
+            else:
+                raise RuntimeError(
+                    f"EXL3 load shape mismatch {weight_name} shard={shard_id} "
+                    f"expert={expert_id}: dest {tuple(dest.shape)} != "
+                    f"loaded {tuple(sharded.shape)}"
+                )
         dest.copy_(sharded)
         if dest.device.type == "cuda" and torch is not None:
             try:
@@ -3396,6 +3583,17 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         layer._exl3_inners = inners
         mixed_k = len(set(k_values)) > 1
         layer._exl3_mixed_k = mixed_k
+        # Block-aligned buffer scheme: activations are masked to the owned
+        # channel window before the down projection (see _load_exl3).
+        owned = getattr(layer, "_exl3_act_owned", None)
+        if owned is not None:
+            layer._exl3_act_mask = torch.zeros(
+                layer._exl3_intermediate_local, dtype=torch.bool,
+                device=layer.w2_suh.device,
+            )
+            layer._exl3_act_mask[owned[0]:owned[1]] = True
+            for inner in inners:
+                inner["act_mask"] = layer._exl3_act_mask
         # Codebook flags (mcg, mul1) per projection for the fused kernel launch;
         # every expert in a layer must agree.
         if inners:
@@ -3538,6 +3736,59 @@ NGRAM_MUL1 = 0x83DCD12D
 def ngram_words_per_row(bits: int) -> int:
     """Packed int16 words per row: one fp16 scale word plus the K-bit ring bitstream."""
     return 1 + NGRAM_ROW_DIM * int(bits) // 16
+
+
+def _derive_ngram_embedding_spec(
+    tensor_storage: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Derive the ngram_embedding spec from a tensor_storage ledger.
+
+    Some packs (Qwen3.8-Flash-Next) ledger the packed n-gram table under
+    tensor_storage but omit the top-level ngram_embedding spec. Reconstruct
+    the spec from the ledgered trellis shape: rows = trellis rows,
+    words = trellis cols, bits = the K whose packed width matches
+    ngram_words_per_row, num_heads = the head_bias leading dim, and
+    num_shards = 1 (the ledger holds a single packed table).
+    """
+    # Ledger layouts differ: either a flat {name: entry} map or a per-module
+    # {module: {"stored_tensors": {name: entry}}} nesting.
+    flat: dict[str, Any] = {}
+    for key, entry in tensor_storage.items():
+        stored = entry.get("stored_tensors") if isinstance(entry, dict) else None
+        if stored:
+            flat.update(stored)
+        else:
+            flat[key] = entry
+    prefix = None
+    trellis = None
+    for name, entry in flat.items():
+        if not name.endswith(".ngram_embedding.trellis"):
+            continue
+        if prefix is not None and not name.startswith(prefix):
+            # Multiple distinct tables: ambiguous without an explicit spec.
+            return None
+        prefix = name.rsplit(".trellis", 1)[0]
+        trellis = entry
+    if trellis is None:
+        return None
+    shape = trellis.get("shape") or []
+    if len(shape) != 2:
+        return None
+    rows, words = int(shape[0]), int(shape[1])
+    bits = next((k for k in range(1, 9) if ngram_words_per_row(k) == words), None)
+    if bits is None:
+        return None
+    head_bias = flat.get(f"{prefix}.head_bias")
+    head_shape = (head_bias or {}).get("shape") or []
+    if len(head_shape) != 2 or int(head_shape[1]) != NGRAM_ROW_DIM:
+        return None
+    return {
+        "bits": bits,
+        "num_shards": 1,
+        "rows_per_shard": rows,
+        "num_heads": int(head_shape[0]),
+        "modules": ["ngram_embedding"],
+    }
 
 
 def _fp16_from_bits(bits16: int, device) -> torch.Tensor:
@@ -3899,7 +4150,7 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
 
     def _decode(self, layer: torch.nn.Module, packed: torch.Tensor, heads: torch.Tensor) -> torch.Tensor:
         bias = layer._exl3_ngram_head_bias
-        if self.kernel == "ext" and self._ext is not None:
+        if self.kernel == "ext" and self._ext is not None and packed.is_cuda:
             out = torch.empty(
                 packed.shape[0], NGRAM_ROW_DIM, dtype=torch.float16, device=packed.device
             )
@@ -3935,6 +4186,11 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
             )
             torch.ops.vllm.exl3_ngram_lookup_out(input_, name, out)
             return out
+        # The custom op registers only the platform dispatch key (CUDA); the
+        # PLE offload worker runs this lookup on CPU (the packed table lives
+        # in host RAM), so route non-CUDA eager calls to the impl directly.
+        if name is not None and _EXL3_OPS_READY and input_.is_cuda:
+            return torch.ops.vllm.exl3_ngram_lookup(input_, name)
         return self._embedding_impl(layer, input_)
 
     def _embedding_impl(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
@@ -4122,28 +4378,14 @@ _EXL3_COOP_GEMM = os.environ.get("VLLM_EXL3_COOP_GEMM", "").strip() in ("1", "tr
 
 
 def _dense_forward(linear, x_fp16: torch.Tensor) -> torch.Tensor:
-    """Dense EXL3 forward with the wedge-prone row range kept off the cooperative GEMM.
-
-    exllamav3 dispatches by row count: up to 2 rows run the non-cooperative GEMV
-    (exl3_gemv_int8; the QTIP gemv needs K in 2..4 so it never applies to K=5),
-    3..144 rows run the cooperative trellis GEMM (cudaLaunchCooperativeKernel,
-    grid barriers over a shared lock buffer), and above 144 rows LinearEXL3
-    reconstructs the weight and runs hgemm. On the vLLM nightly V2 model runner
-    the cooperative GEMM wedged the engine on every 33..144-token prefill and,
-    through those prefills, every long MTP run. Routing rows >= 17 through the
-    reconstruct path removed the wedge: a 4-worker MTP k=2 stress that wedged
-    the baseline in 161 s ran clean for 45 minutes (1085 requests) with decode
-    speed unchanged. Rows 3..16 (single-request MTP steps and small batches)
-    keep exllamav3's dispatch; that range ran clean in the same 45 minutes and
-    the reconstruct path would cost about 10x per call there.
-
-    VLLM_EXL3_RECONSTRUCT_MIN_ROWS moves the threshold (17 by default);
-    VLLM_EXL3_COOP_GEMM=1 restores the old dispatch for A/B runs.
-    """
+    """Dense EXL3 forward with the wedge-prone row range kept off the coop GEMM."""
     rows = int(x_fp16.shape[0])
     if (not _EXL3_COOP_GEMM) and _EXL3_RECON_MIN_ROWS <= rows <= _EXL3_RECONSTRUCT_THRESHOLD:
-        return linear.forward(x_fp16, {"reconstruct": True}, out_dtype=torch.float32)
-    return linear.forward(x_fp16, {}, out_dtype=torch.float32)
+        out = linear.forward(x_fp16, {"reconstruct": True}, out_dtype=torch.float32)
+    else:
+        out = linear.forward(x_fp16, {}, out_dtype=torch.float32)
+    return out
+
 
 
 class Exl3LinearMethod(LinearMethodBase):
@@ -4220,10 +4462,8 @@ class Exl3LinearMethod(LinearMethodBase):
         is_bmm = bmm_slices > 1 or bool(getattr(layer, "is_bmm", False))
         layer._exl3_linear_is_bmm = is_bmm
         layer._exl3_bmm_slices = bmm_slices
-        import os
         # K words per shard
         k_words = self.bits * 16
-
         # EXL3 pads both matrix dims to multiples of 128 (zeros at the end;
         # padded output columns carry svh = 0, padded input rows only see
         # zero-extended inputs). Allocate the padded geometry, load the
@@ -4780,6 +5020,13 @@ class Exl3LinearMethod(LinearMethodBase):
                     pass
             _madv_dontneed_cpu_tensor(sharded)
 
+            # Equal-shape case: dest was selected for exactly this shard, so
+            # copy unconditionally (idempotent for double-writes). Without
+            # this, replicated tensors whose shapes already match — e.g. the
+            # lm_head's replicated suh — fell off the end of the closure and
+            # silently left the param at its torch.empty allocation.
+            dest.copy_(sharded)
+            return
         return weight_loader
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
