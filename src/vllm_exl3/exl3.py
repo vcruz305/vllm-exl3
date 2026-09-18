@@ -2970,13 +2970,14 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         act_dtype: torch.dtype,
         moe_parallel_config,
     ) -> tuple[int, int]:
-        # Identity: the trellis validation tracks the TRUE per-rank
-        # intermediate (ragged, sized from the checkpoint on load); the
-        # 128-block boundary is handled by padding the channel buffers
-        # (svh/suh) at allocation, NOT by rounding the geometry here.
-        # Rounding desynchronized _exl3_out_tiles from the checkpoint's
-        # real tile counts and failed the w2 trellis validation.
-        return hidden_size, intermediate_size_per_partition
+        # ALIGNED (fork scheme, run-110-validated): round the per-rank
+        # intermediate up to the 128-block boundary so the packed trellis
+        # tiles stay kernel-legal; the loader's block-aligned copy-TRUE
+        # branch fills the aligned buffers and the act-mask owns the real
+        # channel window. Identity here desynchronized the loader's
+        # block-aligned slices from the buffer geometry.
+        aligned = -(-intermediate_size_per_partition // 128) * 128
+        return hidden_size, aligned
 
     def get_fused_moe_quant_config(self, layer: "RoutedExperts") -> FusedMoEQuantConfig | None:
         return None
@@ -3251,26 +3252,30 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 raise ValueError(f"unknown EXL3 shard_id={shard_id}")
             if _exl3_mem_waterfall_enabled():
                 _exl3_mem_snapshot("AFTER_SOURCE_OPEN", owner_mod)
-            # Validate tile geometry against the layer's hidden/intermediate
-            # before paying for a device materialization.
-            in_tiles = int(getattr(owner_mod, "_exl3_in_tiles", 0))
-            out_tiles = int(getattr(owner_mod, "_exl3_out_tiles", 0))
-            if shard_id in ("w1", "w3"):
-                expect_prefix = (in_tiles, out_tiles)
-            else:
-                expect_prefix = (out_tiles, in_tiles)
-            if tuple(sharded.shape[:2]) != expect_prefix:
-                raise RuntimeError(
-                    f"EXL3 trellis tile mismatch {weight_name} shard={shard_id} "
-                    f"expert={expert_id}: got {tuple(sharded.shape)} "
-                    f"expected prefix {expect_prefix}+K_words"
-                )
-            if int(sharded.shape[-1]) % 16 != 0:
-                raise RuntimeError(
-                    f"EXL3 trellis K_words not multiple of 16: {tuple(sharded.shape)}"
-                )
-
+            # Arena/direct-fill staging and the tile validation belong to
+            # the arena/mixed-K feature path. The legacy fork path loads
+            # via the block-aligned copy-TRUE branch below, whose geometry
+            # (aligned buffers, act-mask) differs from the ragged contract
+            # these checks enforce — running them on the legacy path
+            # rejected valid shards or staged every expert on host.
             use_arena = _exl3_trellis_arena_enabled()
+            if use_arena:
+                in_tiles = int(getattr(owner_mod, "_exl3_in_tiles", 0))
+                out_tiles = int(getattr(owner_mod, "_exl3_out_tiles", 0))
+                if shard_id in ("w1", "w3"):
+                    expect_prefix = (in_tiles, out_tiles)
+                else:
+                    expect_prefix = (out_tiles, in_tiles)
+                if tuple(sharded.shape[:2]) != expect_prefix:
+                    raise RuntimeError(
+                        f"EXL3 trellis tile mismatch {weight_name} shard={shard_id} "
+                        f"expert={expert_id}: got {tuple(sharded.shape)} "
+                        f"expected prefix {expect_prefix}+K_words"
+                    )
+                if int(sharded.shape[-1]) % 16 != 0:
+                    raise RuntimeError(
+                        f"EXL3 trellis K_words not multiple of 16: {tuple(sharded.shape)}"
+                    )
             if getattr(owner_mod, "_exl3_require_direct_fill", False) and not use_arena:
                 raise RuntimeError("attested EXL3 direct-fill cannot disable final arenas")
             if use_arena:
