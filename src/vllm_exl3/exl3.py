@@ -2970,15 +2970,13 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         act_dtype: torch.dtype,
         moe_parallel_config,
     ) -> tuple[int, int]:
-        # Upstream's ragged geometry: the packed trellis is sized from the
-        # checkpoint tensor on load (exact per-expert shapes, heterogeneous
-        # K), and TP narrowing happens in shard_exl3_row/col. The 128-block
-        # Hadamard boundary is handled by the block-aligned buffer scheme
-        # (block-aligned TRUE data + act-mask), NOT by rounding the local
-        # intermediate up — rounding here desynchronizes the tile attrs
-        # (_exl3_out_tiles) from the checkpoint's real tile counts and
-        # fails the w2 trellis validation. Return identity.
-        return hidden_size, intermediate_size_per_partition
+        # The reconstruct kernels require 128-aligned N; TP shards of the
+        # MoE intermediate (e.g. 640/4 = 160) break that alignment. Round
+        # the per-rank intermediate up to the alignment so the packed
+        # trellis tiles stay kernel-legal; the tail rows are zero-padded
+        # and never read (the router only produces ids into real rows).
+        aligned = -(-intermediate_size_per_partition // 128) * 128
+        return hidden_size, aligned
 
     def get_fused_moe_quant_config(self, layer: "RoutedExperts") -> FusedMoEQuantConfig | None:
         return None
@@ -3027,13 +3025,19 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         extra = {k: v for k, v in extra_weight_attrs.items() if k != "weight_loader"}
 
         # Suh/svh/markers stay stacked (shape independent of packed K).
+        # Channel buffers (svh/suh along the intermediate dim) are padded to
+        # the 128-block boundary: the loader's block-aligned copy slices
+        # [lo:hi] with hi rounded up to 128, so the buffers must hold the
+        # aligned width (zero tail). The trellis stays ragged — sized from
+        # the checkpoint on load.
+        _chan_aligned = -(-intermediate_size_per_partition // 128) * 128
         w13_suh = Parameter(
             torch.empty(num_experts, 2, hidden_size, dtype=torch.float16),
             requires_grad=False,
         )
         w13_svh = Parameter(
-            torch.empty(
-                num_experts, 2, intermediate_size_per_partition, dtype=torch.float16
+            torch.zeros(
+                num_experts, 2, _chan_aligned, dtype=torch.float16
             ),
             requires_grad=False,
         )
@@ -3046,8 +3050,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
         w2_suh = Parameter(
-            torch.empty(
-                num_experts, intermediate_size_per_partition, dtype=torch.float16
+            torch.zeros(
+                num_experts, _chan_aligned, dtype=torch.float16
             ),
             requires_grad=False,
         )
