@@ -2551,6 +2551,120 @@ class Exl3Config(QuantizationConfig):
             return list(layer_cfg.get("bf16_shards", []))
         return []
 
+    def _resolve_prefix_bits_from_checkpoint(
+        self, prefix: str
+    ) -> int | None:
+        """Per-tensor K for one linear, from the checkpoint's trellis width.
+
+        Turboderp calibration packs allocate per-tensor bits (a single
+        Qwen3.8-27B pack spans K=4..8 across layers while config declares
+        bits=6/head_bits=6). The safetensors header of the prefix's own
+        trellis is the ground truth; family heuristics (global bits,
+        head_bits) are only fallbacks. Reads headers only — no tensor
+        data. Cached per prefix. Returns None when unresolvable.
+        """
+        cache = getattr(self, "_prefix_bits_cache", None)
+        if cache is None:
+            cache = self._prefix_bits_cache = {}
+        if prefix in cache:
+            return cache[prefix]
+        bits = self._resolve_prefix_bits_uncached(prefix)
+        cache[prefix] = bits
+        return bits
+
+    def _resolve_prefix_bits_uncached(
+        self, prefix: str
+    ) -> int | None:
+        try:
+            import json
+            import re
+            import struct
+
+            from vllm.config import get_current_vllm_config
+
+            model_dir = get_current_vllm_config().model_config.model
+            index_path = os.path.join(model_dir, "model.safetensors.index.json")
+            single_path = os.path.join(model_dir, "model.safetensors")
+            if os.path.isfile(index_path):
+                with open(index_path) as f:
+                    weight_map = json.load(f).get("weight_map", {})
+            elif os.path.isfile(single_path):
+                weight_map = {}
+            else:
+                return None
+
+            # Prefix forms: language_model.model.layers.0.mlp.down_proj
+            # (vLLM) vs model.language_model.layers.0.mlp.down_proj
+            # (checkpoint). Match on the layer index plus the module tail,
+            # falling back to a plain suffix match for non-layer prefixes.
+            # Merged vLLM linears map to their checkpoint tensor splits
+            # (gate_up_proj ships as gate_proj + up_proj, etc.).
+            merged_splits = {
+                "gate_up_proj": ("gate_proj", "up_proj"),
+                "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+                "in_proj_qkvz": ("in_proj_qkv", "in_proj_z"),
+                "kv_proj": ("k_proj", "v_proj"),
+            }
+            m = re.search(r"(?:^|\.)layers\.(\d+)\.(.+)$", prefix or "")
+            if m is not None:
+                layer_idx, tail = m.group(1), m.group(2)
+                parent, _, module = tail.rpartition(".")
+                splits = merged_splits.get(module)
+                if splits is not None:
+                    # Swap the merged basename for its checkpoint splits,
+                    # keeping the parent path (mlp., linear_attn., ...).
+                    patterns = tuple(
+                        f"layers.{layer_idx}.{parent}.{t}.trellis"
+                        for t in splits
+                    ) if parent else tuple(
+                        f"layers.{layer_idx}.{t}.trellis" for t in splits
+                    )
+                else:
+                    patterns = (f"layers.{layer_idx}.{tail}.trellis",)
+            else:
+                tail = (prefix or "").rsplit(".", 1)[-1]
+                patterns = (f"{tail}.trellis",)
+
+            def matches(key: str) -> bool:
+                # mtp.layers.N.* must not match layers.N.*
+                if key.startswith("mtp."):
+                    return False
+                return any(p in key for p in patterns)
+
+            keys = [k for k in weight_map if matches(k)]
+            shards: dict[str, list[str]] = {}
+            for key, shard in weight_map.items():
+                if matches(key):
+                    shards.setdefault(shard, []).append(key)
+            if not shards and os.path.isfile(single_path):
+                shards = {single_path: []}
+            resolved_ks: list[int] = []
+            for shard, shard_keys in shards.items():
+                path = shard if os.path.isabs(shard) else os.path.join(
+                    model_dir, shard
+                )
+                with open(path, "rb") as f:
+                    (header_len,) = struct.unpack("<Q", f.read(8))
+                    header = json.loads(f.read(header_len))
+                if not shard_keys:
+                    shard_keys = [
+                        k for k in header
+                        if k != "__metadata__" and matches(k)
+                    ]
+                for key in shard_keys:
+                    shape = header.get(key, {}).get("shape") or []
+                    if len(shape) == 3 and shape[-1] % 16 == 0:
+                        resolved_ks.append(shape[-1] // 16)
+            # A merged allocation needs every matched tensor at the same K;
+            # mixed-K merged groups (e.g. q=5/k=7/v=7) cannot share one
+            # trellis width — return None and let the caller decide.
+            if resolved_ks and len(set(resolved_ks)) == 1:
+                return resolved_ks[0]
+            return None
+        except Exception:
+            pass
+        return None
+
     def _resolve_indexer_bits_from_checkpoint(
         self, model_dir: str | None = None
     ) -> int | None:
@@ -2780,6 +2894,12 @@ class Exl3Config(QuantizationConfig):
                              or "visual." in prefix
                              ):
                     bits = hb
+                # Per-tensor calibration packs (per-layer K spanning the
+                # global/head_bits pair) carry the real K in each trellis
+                # width; the checkpoint wins over every family heuristic.
+                resolved = self._resolve_prefix_bits_from_checkpoint(prefix)
+                if resolved is not None:
+                    bits = resolved
                 return Exl3LinearMethod(self, bits=bits)
             if getattr(self, "non_routed_dtype_policy", "") == "bf16_as_stored":
                 return UnquantizedLinearMethod()
