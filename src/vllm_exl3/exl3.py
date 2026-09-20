@@ -2553,7 +2553,7 @@ class Exl3Config(QuantizationConfig):
 
     def _resolve_prefix_bits_from_checkpoint(
         self, prefix: str
-    ) -> int | None:
+    ) -> int | list[int] | None:
         """Per-tensor K for one linear, from the checkpoint's trellis width.
 
         Turboderp calibration packs allocate per-tensor bits (a single
@@ -2561,7 +2561,12 @@ class Exl3Config(QuantizationConfig):
         bits=6/head_bits=6). The safetensors header of the prefix's own
         trellis is the ground truth; family heuristics (global bits,
         head_bits) are only fallbacks. Reads headers only — no tensor
-        data. Cached per prefix. Returns None when unresolvable.
+        data. Cached per prefix. Returns:
+          - int: uniform K for the prefix (single tensor or uniform merged
+            group);
+          - list[int]: per-shard Ks for a mixed-K merged group, ordered by
+            the merged_splits mapping (checkpoint tensor order);
+          - None: unresolvable (no trellis found, header unreadable).
         """
         cache = getattr(self, "_prefix_bits_cache", None)
         if cache is None:
@@ -2574,7 +2579,7 @@ class Exl3Config(QuantizationConfig):
 
     def _resolve_prefix_bits_uncached(
         self, prefix: str
-    ) -> int | None:
+    ) -> int | list[int] | None:
         try:
             import json
             import re
@@ -2655,11 +2660,14 @@ class Exl3Config(QuantizationConfig):
                     shape = header.get(key, {}).get("shape") or []
                     if len(shape) == 3 and shape[-1] % 16 == 0:
                         resolved_ks.append(shape[-1] // 16)
-            # A merged allocation needs every matched tensor at the same K;
-            # mixed-K merged groups (e.g. q=5/k=7/v=7) cannot share one
-            # trellis width — return None and let the caller decide.
+            # Merged groups: the caller needs per-shard Ks. Uniform → int;
+            # mixed-K merged groups (e.g. q=5/k=7/v=7) → the ordered list,
+            # one entry per matched tensor (checkpoint order = shard order
+            # for the merged_splits mapping); no trellis at all → None.
             if resolved_ks and len(set(resolved_ks)) == 1:
                 return resolved_ks[0]
+            if resolved_ks:
+                return resolved_ks
             return None
         except Exception:
             pass
@@ -4621,8 +4629,25 @@ class Exl3LinearMethod(LinearMethodBase):
         is_bmm = bmm_slices > 1 or bool(getattr(layer, "is_bmm", False))
         layer._exl3_linear_is_bmm = is_bmm
         layer._exl3_bmm_slices = bmm_slices
-        # K words per shard
-        k_words = self.bits * 16
+        # K words per shard. Mixed-K merged groups (per-tensor calibration
+        # packs) resolve to a per-shard K list; the trellis below allocates
+        # each shard's own width and apply dispatches per shard K.
+        shard_ks: list[int] | None = None
+        resolved = self.quant_config._resolve_prefix_bits_from_checkpoint(
+            _prefix
+        )
+        if isinstance(resolved, list):
+            if len(resolved) != n_shards:
+                raise RuntimeError(
+                    f"EXL3 mixed-K resolution returned {len(resolved)} shard Ks "
+                    f"for {n_shards} shards at {_prefix}: {resolved}"
+                )
+            shard_ks = resolved
+        k_words = (
+            (max(shard_ks) if shard_ks else self.bits) * 16
+        )
+        if shard_ks:
+            layer._exl3_shard_ks = shard_ks
         # EXL3 pads both matrix dims to multiples of 128 (zeros at the end;
         # padded output columns carry svh = 0, padded input rows only see
         # zero-extended inputs). Allocate the padded geometry, load the
@@ -4675,11 +4700,27 @@ class Exl3LinearMethod(LinearMethodBase):
         out_tiles_list = [s // 16 for s in output_partition_sizes]
         total_out_tiles = sum(out_tiles_list)
 
-        # Allocate fused trellis covering all shards (dim1 will be narrow per-shard)
-        trellis_param = Parameter(
-            torch.empty(in_tiles, total_out_tiles, k_words, dtype=torch.int16),
-            requires_grad=False,
-        )
+        # Mixed-K merged groups: each shard gets its OWN trellis param
+        # sized at its checkpoint K (the packed bitstream is K-dependent
+        # per 16-value span — zero-padding a lower-K shard to a common
+        # width corrupts dequantization). Uniform groups keep the fused
+        # param (identical downstream behavior).
+        if shard_ks and len(set(shard_ks)) > 1:
+            trellis_params = [
+                Parameter(
+                    torch.empty(in_tiles, t, ks * 16, dtype=torch.int16),
+                    requires_grad=False,
+                )
+                for t, ks in zip(out_tiles_list, shard_ks)
+            ]
+            trellis_param = trellis_params[0]
+            layer._exl3_ragged_trellis = trellis_params
+        else:
+            # Allocate fused trellis covering all shards (dim1 narrow per-shard)
+            trellis_param = Parameter(
+                torch.empty(in_tiles, total_out_tiles, k_words, dtype=torch.int16),
+                requires_grad=False,
+            )
         # Per-shard suh (one per shard, each covers this rank's input partition)
         # Batched (bmm) layers: each slice has its OWN suh (verified:
         # per-slice suh tensors are distinct) — allocate one row per
@@ -4723,6 +4764,15 @@ class Exl3LinearMethod(LinearMethodBase):
         layer.register_parameter("mcg", mcg_param)
         layer.register_parameter("mul1", mul1_param)
         layer.register_parameter("weight", weight_param)
+        if shard_ks and len(set(shard_ks)) > 1:
+            # Ragged layout: shards 0..n-2 register under trellis_shard_{i};
+            # shard n-1 IS the fused "trellis" param (the model's
+            # stacked_params_mapping and WeightsMapper expect a "trellis"
+            # suffix to exist; routing shard n-1's writes through it keeps
+            # that contract).
+            for si, tp in enumerate(trellis_params[:-1]):
+                layer.register_parameter(f"trellis_shard_{si}", tp)
+        layer.register_parameter("trellis", trellis_param)
 
         # Custom weight loader
         extra = {k: v for k, v in extra_weight_attrs.items() if k != "weight_loader"}
@@ -4754,6 +4804,18 @@ class Exl3LinearMethod(LinearMethodBase):
                 layer,
                 is_qkv_parallel,
             )
+        if shard_ks and len(set(shard_ks)) > 1:
+            for si, tp in enumerate(trellis_params[:-1]):
+                tp.weight_loader = self._make_weight_loader(
+                    "trellis",
+                    n_shards,
+                    output_partition_sizes,
+                    is_row_parallel,
+                    bf16_shards,
+                    layer,
+                    is_qkv_parallel,
+                    ragged_shard_idx=si,
+                )
         weight_param.weight_loader = self._make_weight_loader(
             "weight",
             n_shards,
@@ -4787,6 +4849,7 @@ class Exl3LinearMethod(LinearMethodBase):
         is_qkv_parallel=False,
         is_bmm=False,
         bmm_slices=0,
+        ragged_shard_idx=None,
     ):
         """Create a weight_loader closure for EXL3 linear parameters."""
 
@@ -4796,6 +4859,23 @@ class Exl3LinearMethod(LinearMethodBase):
             loaded_shard_id: str | int | None = None,
         ) -> None:
             tp_rank, tp_size = _resolve_tp_geometry(layer, param)
+            if ragged_shard_idx is not None:
+                # Ragged mixed-K layout: this param IS shard
+                # ragged_shard_idx's trellis. Accept only that shard's
+                # write; shape must match the param exactly (the
+                # checkpoint tensor IS the shard tensor at tp1; TP
+                # narrowing of ragged shards is unsupported).
+                if loaded_shard_id != ragged_shard_idx:
+                    return
+                if tuple(loaded_weight.shape) != tuple(param.shape):
+                    raise RuntimeError(
+                        f"EXL3 ragged trellis load shape mismatch shard={ragged_shard_idx}: "
+                        f"param {tuple(param.shape)} != loaded {tuple(loaded_weight.shape)}; "
+                        f"prefix={getattr(layer, '_exl3_prefix', '?')}"
+                    )
+                param.data.copy_(loaded_weight)
+                return
+
 
             # One checkpoint tensor may span several consecutive shards; vLLM's
             # WeightsMapper says so with a tuple of shard ids (Qwen3.5/4
@@ -4920,6 +5000,17 @@ class Exl3LinearMethod(LinearMethodBase):
                     if tuple(dest.shape) == tuple(loaded_weight.shape):
                         dest.copy_(loaded_weight)
                         return
+            _ragged = getattr(layer, "_exl3_ragged_trellis", None)
+            if (
+                _ragged is not None
+                and suffix == "trellis"
+                and shard_idx < len(_ragged) - 1
+            ):
+                # Ragged mixed-K layout: shards 0..n-2 live in their own
+                # trellis_shard_{i} params (each at its own K); this fused
+                # param holds only shard n-1. Ignore other shards' writes —
+                # their tensors arrived via the trellis_shard_{i} params.
+                return
             if shard_idx >= n_shards:
                 raise ValueError(
                     f"shard_idx={shard_idx} out of range for n_shards={n_shards}; "
@@ -5257,7 +5348,11 @@ class Exl3LinearMethod(LinearMethodBase):
                 continue
             out_tiles_start = sum(s // 16 for s in output_sizes[:i])
             out_tiles_end = out_tiles_start + output_sizes[i] // 16
-            trellis_shard = layer.trellis[:, out_tiles_start:out_tiles_end, :].contiguous()
+            _ragged = getattr(layer, "_exl3_ragged_trellis", None)
+            if _ragged is not None:
+                trellis_shard = _ragged[i].contiguous()
+            else:
+                trellis_shard = layer.trellis[:, out_tiles_start:out_tiles_end, :].contiguous()
             suh_shard = layer.suh[i].contiguous()
             svh_shard = layer.svh[
                 sum(output_sizes[:i]) : sum(output_sizes[: i + 1])
@@ -5296,6 +5391,13 @@ class Exl3LinearMethod(LinearMethodBase):
             if hasattr(layer, param_name):
                 try:
                     delattr(layer, param_name)
+                except Exception:
+                    pass
+        _ragged = getattr(layer, "_exl3_ragged_trellis", None)
+        if _ragged is not None:
+            for si in range(len(_ragged) - 1):
+                try:
+                    delattr(layer, f"trellis_shard_{si}")
                 except Exception:
                     pass
 
