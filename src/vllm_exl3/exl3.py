@@ -1186,6 +1186,22 @@ def aligned_tp_split(size: int, tp_rank: int, tp_size: int, align: int) -> tuple
     return sum(counts[:tp_rank]) * align, counts[tp_rank] * align
 
 
+def moe_tp_rotation(layer: Any, tp_size: int) -> int:
+    """Per-layer chunk rotation for aligned MoE TP (VLLM_EXL3_MOE_TP_ROTATE=1, 0 = off).
+
+    An uneven aligned split (2304 over tp=4 -> 640/640/512/512) always gives the
+    larger chunks to the same ranks, a ~13 GiB weight imbalance on DSV4.1. With
+    rotation, rank r of layer L takes chunk (r + L) % tp_size. Every rank still
+    computes a partial sum over its own slice and the MoE all-reduce adds them,
+    so the output is unchanged; only which rank holds which slice moves.
+    """
+    if os.environ.get("VLLM_EXL3_MOE_TP_ROTATE", "0") != "1" or tp_size <= 1:
+        return 0
+    name = str(getattr(layer, "layer_name", None) or getattr(layer, "prefix", None) or "")
+    m = re.search(r"layers\.(\d+)", name)
+    return int(m.group(1)) % tp_size if m else 0
+
+
 def _narrow_tp(
     tensor: torch.Tensor,
     dim: int,
@@ -2863,6 +2879,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             tp_rank, tp_size = _resolve_tp_geometry(layer)
             full = intermediate_size_per_partition * tp_size
             if tp_size > 1 and full % align == 0:
+                layer._exl3_tp_rotation = moe_tp_rotation(layer, tp_size)
+                tp_rank = (tp_rank + layer._exl3_tp_rotation) % tp_size
                 offset, local = aligned_tp_split(full, tp_rank, tp_size, align)
                 logger.info(
                     "EXL3 aligned MoE TP: rank %d/%d intermediate %d -> %d (offset %d)",
@@ -3073,6 +3091,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
         owner_mod = owner if owner is not None else getattr(param, "_exl3_owner", None)
         tp_rank, tp_size = _resolve_tp_geometry(owner_mod, param)
+        if tp_size > 1 and getattr(owner_mod, "_exl3_tp_rotation", 0):
+            # Same per-layer chunk rotation as create_weights (memory balance).
+            tp_rank = (tp_rank + owner_mod._exl3_tp_rotation) % tp_size
         if getattr(owner_mod, "use_ep", False):
             # Expert parallel: experts are whole; feature slicing must not run
             # (shard_exl3_col/row would quarter already-whole expert tensors).

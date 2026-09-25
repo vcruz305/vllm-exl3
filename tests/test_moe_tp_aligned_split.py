@@ -73,3 +73,26 @@ def test_aligned_geometry_does_not_raise(monkeypatch) -> None:
     t = torch.arange(2304)
     assert _narrow_tp(t, 0, 2, 4, 1, aligned=True).numel() == 512
 
+
+def test_rotation_balances_chunk_sizes_across_layers(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from vllm_exl3.exl3 import moe_tp_rotation
+
+    monkeypatch.setenv("VLLM_EXL3_MOE_TP_ROTATE", "1")
+    totals = [0] * 4
+    for layer_idx in range(40):
+        layer = SimpleNamespace(layer_name=f"model.layers.{layer_idx}.ffn.experts")
+        rot = moe_tp_rotation(layer, 4)
+        for rank in range(4):
+            totals[rank] += aligned_tp_split(2304, (rank + rot) % 4, 4, 128)[1]
+    assert totals == [576 * 40] * 4
+
+
+def test_rotation_off_by_default(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from vllm_exl3.exl3 import moe_tp_rotation
+
+    monkeypatch.delenv("VLLM_EXL3_MOE_TP_ROTATE", raising=False)
+    assert moe_tp_rotation(SimpleNamespace(layer_name="model.layers.7.ffn.experts"), 4) == 0
