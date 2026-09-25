@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Per-layer chunk rotation for the aligned MoE TP split (`VLLM_EXL3_MOE_TP_ROTATE=1`, #40). Without
+  it the uneven split's larger chunks land on the same ranks in every layer — 70.1 vs 56.8 GiB of
+  weights per rank on DSV4.1-Flash, where the heavy ranks cap the KV cache for the whole TP group.
+  With rotation, rank `r` of layer `L` takes chunk `(r + L) % tp`. The MoE all-reduce sums rank
+  partials, so outputs are unchanged and only ownership moves. The contributor measures 63.4 GiB on
+  every rank and KV cache raised from 8 to 17 GiB per rank (2.45M to 5.22M tokens). Off by default.
+
 ## 0.5.0 (2026-09-25)
 
 Everything merged since 0.4.2, plus the vLLM 0.30.0 compatibility audit. The MoE kernel work in this
