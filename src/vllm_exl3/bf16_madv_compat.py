@@ -40,26 +40,22 @@ def install_mixed_bf16_madv_compat(module: Any) -> None:
         return
 
     @wraps(original)
-    def wrapped_make(
-        self,
-        suffix,
-        n_shards,
-        output_partition_sizes,
-        is_row_parallel,
-        bf16_shards,
-        layer=None,
-        is_qkv_parallel=False,
-    ):
-        loader = original(
-            self,
-            suffix,
-            n_shards,
-            output_partition_sizes,
-            is_row_parallel,
-            bf16_shards,
-            layer,
-            is_qkv_parallel,
+    def wrapped_make(self, *args, **kwargs):
+        # Signature-agnostic forwarding: this wrapper installs at plugin
+        # registration, before model build, so any new _make_weight_loader
+        # parameter (e.g. ragged_shard_idx) must pass through untouched.
+        loader = original(self, *args, **kwargs)
+        # All call sites pass positionally:
+        # (suffix, n_shards, output_partition_sizes, is_row_parallel,
+        #  bf16_shards, layer, is_qkv_parallel, [is_bmm, bmm_slices,
+        #  ragged_shard_idx]) — index them explicitly instead of
+        # type-sniffing (output_partition_sizes is also a list).
+        suffix = args[0] if len(args) > 0 else kwargs.get("suffix")
+        n_shards = args[1] if len(args) > 1 else kwargs.get("n_shards")
+        output_partition_sizes = (
+            args[2] if len(args) > 2 else kwargs.get("output_partition_sizes")
         )
+        bf16_shards = args[4] if len(args) > 4 else kwargs.get("bf16_shards")
         if suffix != "weight" or not bf16_shards:
             return loader
 
