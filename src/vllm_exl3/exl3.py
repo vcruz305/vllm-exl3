@@ -1820,6 +1820,51 @@ def _native_moe_max_rows(bits: int) -> int:
 # predate the flag (or CPU fixtures that build a bare namespace) fall back to MCG,
 # matching every other consumer in this module.
 _MCG_CODEBOOK_FLAGS = (True, False) * 3
+# [LAB PATCH 2026-10-06 P3] One-launch multi-row dispatch built on
+# vllm_exl3_c.p2b_fused_moe_padded (static-shape padded grid, per-expert K
+# tables, device-resident n_valid -> zero host syncs in the apply path).
+# Upstream exported the kernel but never called it. A first-call runtime
+# probe compares it against the per-row loop and latches the result, so a
+# kernel that silently ignores the row dim falls back to the loop.
+_PAD_Q_BUCKETS = (4, 8, 16, 32, 64)
+_PAD_SCRATCH: dict = {}
+_PAD_STATE: list = [None]  # None=unprobed, True=pad matches loop, False=loop only
+_PAD_PROBES_LEFT: list = [32]
+_PAD_ENV: list = [None]
+_LAB_FORCE_LOOP_NOW: list = [False]
+
+
+def _pad_policy() -> str:
+    if _PAD_ENV[0] is None:
+        # A/B 2026-10-06: with graphs+MTP canonical, per-row loop captured
+        # into CUDA graphs replays faster than eager padded islands; padded
+        # stays opt-in (VLLM_EXL3_LAB_PAD=auto) for eager-only deployments.
+        _PAD_ENV[0] = os.environ.get("VLLM_EXL3_LAB_PAD", "off").strip().lower()
+    return _PAD_ENV[0]
+
+
+def _pad_bucket(rows: int) -> int:
+    for q in _PAD_Q_BUCKETS:
+        if rows <= q:
+            return q
+    return 0
+
+
+def _pad_scratch(device, q: int, hidden: int, topk: int) -> dict:
+    key = (str(device), q, hidden, topk)
+    s = _PAD_SCRATCH.get(key)
+    if s is None:
+        s = {
+            "xh": torch.zeros((q, hidden), dtype=torch.float16, device=device),
+            "ids": torch.zeros((q, topk), dtype=torch.int32, device=device),
+            "w": torch.zeros((q, topk), dtype=torch.float16, device=device),
+            "out": torch.zeros((q, hidden), dtype=torch.float16, device=device),
+            "nvalid": torch.zeros((1,), dtype=torch.int32, device=device),
+        }
+        _PAD_SCRATCH[key] = s
+    return s
+
+
 def _apply_native_fused_moe(
     x2d: torch.Tensor,
     ids: torch.Tensor,
@@ -1920,6 +1965,93 @@ def _apply_native_fused_moe(
         k = int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", 4)))
         k_args = (k, k, k, True)
     extra_args = (intermediate, clamp_limit) if (extended_abi or mixed_mk) else ()
+    # [LAB PATCH 2026-10-06 P3] padded-grid single-launch for multi-row
+    # mixed-K decode; probe-gated against the per-row loop below.
+    n_rows = int(x2d.shape[0])
+    policy = _pad_policy()
+    if (
+        mixed_mk
+        and policy != "off"
+        and n_rows >= 2
+        and not _LAB_FORCE_LOOP_NOW[0]
+        and not torch.cuda.is_current_stream_capturing()
+        and int(getattr(module, "P2B_MOE_PADDED", 0) or 0) >= 1
+        and int(getattr(layer, "_exl3_mixed_k_max", 0)) in (2, 3, 4)
+    ):
+        q = _pad_bucket(n_rows)
+        pad_fn = getattr(module, "p2b_fused_moe_padded", None) if q else None
+        if pad_fn is not None:
+            try:
+                s = _pad_scratch(
+                    x2d.device, q, int(xh.shape[1]), int(safe_ids.shape[-1])
+                )
+                s["xh"][:n_rows].copy_(xh)
+                s["ids"][:n_rows].copy_(safe_ids)
+                s["w"][:n_rows].copy_(safe_weights)
+                s["nvalid"].fill_(n_rows)
+                pres = pad_fn(
+                    s["xh"],
+                    s["out"],
+                    ptrs["gate_trellis"],
+                    ptrs["gate_suh"],
+                    ptrs["gate_svh"],
+                    ptrs["up_trellis"],
+                    ptrs["up_suh"],
+                    ptrs["up_svh"],
+                    ptrs["down_trellis"],
+                    ptrs["down_suh"],
+                    ptrs["down_svh"],
+                    s["ids"],
+                    s["w"],
+                    s["nvalid"],
+                    layer._exl3_K_gate_arr,
+                    layer._exl3_K_up_arr,
+                    layer._exl3_K_down_arr,
+                    n_exp,
+                    int(safe_ids.shape[-1]),  # max_k == routing-grid columns (topk)
+                    True,
+                    *extra_args,
+                )
+                if isinstance(pres, torch.Tensor) and pres is not s["out"]:
+                    s["out"].copy_(pres.reshape(s["out"].shape))
+                if _PAD_STATE[0] is None and _PAD_PROBES_LEFT[0] > 0:
+                    _PAD_PROBES_LEFT[0] -= 1
+                    _LAB_FORCE_LOOP_NOW[0] = True
+                    try:
+                        ref = _apply_native_fused_moe(
+                            x2d, ids, weights, layer, inners, expert_map, limit
+                        )
+                    finally:
+                        _LAB_FORCE_LOOP_NOW[0] = False
+                    cand16 = s["out"][:n_rows]
+                    ref16 = ref.to(dtype=torch.float16)
+                    ok = bool(
+                        cand16.shape == ref16.shape
+                        and torch.allclose(
+                            cand16.float(), ref16.float(), rtol=2e-2, atol=3e-3
+                        )
+                    )
+                    diff = (
+                        float((cand16.float() - ref16.float()).abs().max())
+                        if cand16.shape == ref16.shape
+                        else float("inf")
+                    )
+                    _PAD_STATE[0] = ok
+                    logger.info(
+                        "[LAB] p2b_fused_moe_padded probe rows=%d ok=%s maxabs=%.3e",
+                        n_rows,
+                        ok,
+                        diff,
+                    )
+                if _PAD_STATE[0] is True:
+                    return s["out"][:n_rows].to(dtype=torch.float32)
+            except Exception as exc:  # fall back to the loop, log once
+                if _PAD_STATE[0] is None:
+                    _PAD_STATE[0] = False
+                    logger.warning(
+                        "[LAB] p2b_fused_moe_padded failed (%s); per-row loop only.",
+                        exc,
+                    )
     for row in range(int(x2d.shape[0])):
         result = fn(
             xh[row : row + 1],
