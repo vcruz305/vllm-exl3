@@ -11,6 +11,15 @@
   partials, so outputs are unchanged and only ownership moves. The contributor measures 63.4 GiB on
   every rank and KV cache raised from 8 to 17 GiB per rank (2.45M to 5.22M tokens). Off by default.
 
+### Fixed
+
+- The `ngram_dequant` call site now matches the loaded exllamav3 extension's arity. The binding takes a
+  required trailing `rotate` bool (verified on the 1.4.9 and 1.6.0 cores; the bare `m.def` exposes no
+  default for it), and the call site passed five arguments — every ext-kernel n-gram decode raised
+  `TypeError`. The arity is probed once at weight load (a 6-arg probe call; `TypeError` selects the
+  5-arg form, any other failure falls back to the torch decoder), so one wheel serves both core
+  generations. Verified end-to-end serving GLM-5.3-Flash EXL3 on exllamav3 1.6.0 (B200).
+
 ## 0.5.0 (2026-09-25)
 
 Everything merged since 0.4.2, plus the vLLM 0.30.0 compatibility audit. The MoE kernel work in this
