@@ -1371,6 +1371,16 @@ def native_moe_kernel_available() -> bool:
     return _load_native_exl3_ext() is not None
 
 
+def _native_moe_mixed_kernel_available() -> bool:
+    """Whether the compiled native multi-K (per-expert K table) MoE kernel is available."""
+    module = _load_native_exl3_ext()
+    return bool(
+        module is not None
+        and callable(getattr(module, "p2b_fused_moe_mk", None))
+        and int(getattr(module, "P2B_MOE_MIXED_K", 0) or 0) >= 1
+    )
+
+
 def _exllamav3_moe_available() -> bool:
     try:
         return callable(getattr(load_exllamav3_ext(), "exl3_moe", None))
@@ -1605,6 +1615,37 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
             "down_svh_ptrs": layer._exl3_ptrs["down_svh"],
         }
     )
+    if (
+        mixed_k
+        and (exllamav3_ext is None or not hasattr(exllamav3_ext, "exl3_moe_mixedk"))
+        and _native_moe_mixed_kernel_available()
+    ):
+        # [LAB PATCH 2026-10-06] Native p2b multi-K serves mixed-K layers
+        # without exllamav3's exl3_moe_mixedk binding and without the
+        # ExLlamaV3 fused temp buffers (keeps ~1.6 GiB in the KV pool).
+        # The pointer tables were built above; K sets are validated here at
+        # load time so dispatch never syncs the K tables to the host.
+        layer._exl3_fused_temps = None
+        layer._exl3_fused_concurrency = 0
+        layer._exl3_k = None
+        layer._exl3_mixedk_unified = True
+        layer._exl3_mixed_native_mk = True
+
+        def _k_words(which: str) -> list[int]:
+            return [
+                int(getattr(pack[which], "trellis").shape[-1]) // 16 for pack in inners
+            ]
+
+        gate_k, up_k, down_k = _k_words("gate"), _k_words("up"), _k_words("down")
+        # The native multi-K/padded kernels require int8 K tables, one entry
+        # per pointer-table slot (the int32 tables elsewhere are for the
+        # exllamav3 exl3_moe_mixedk binding, absent in this build).
+        layer._exl3_K_gate_arr = torch.tensor(gate_k, dtype=torch.int8, device=device)
+        layer._exl3_K_up_arr = torch.tensor(up_k, dtype=torch.int8, device=device)
+        layer._exl3_K_down_arr = torch.tensor(down_k, dtype=torch.int8, device=device)
+        kset = set(gate_k) | set(up_k) | set(down_k)
+        layer._exl3_mixed_k_max = max(kset) if kset <= {2, 3, 4} else 0
+        return
     idx = int(device.index) if device.index is not None else 0
     if exllamav3_ext is not None and hasattr(
         exllamav3_ext, "exl3_moe_max_concurrency"
@@ -1671,7 +1712,13 @@ def _native_moe_dimensions_supported(
     hidden_meta = int(getattr(layer, "_exl3_hidden_size", x2d.shape[1]))
     inter_meta = int(getattr(layer, "_exl3_intermediate_local", 2048))
     rows = int(x2d.shape[0])
-    bits = int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", -1)))
+    if getattr(layer, "_exl3_mixed_k", False):
+        # [LAB PATCH 2026-10-06] Mixed-K: gate on the load-time cached K max
+        # (0 = unavailable/disallowed K) instead of the scalar _exl3_k, so no
+        # per-launch DtoH sync of the K tables happens on the hot path.
+        bits = int(getattr(layer, "_exl3_mixed_k_max", 0))
+    else:
+        bits = int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", -1)))
     if not (
         rows >= 1
         and int(x2d.shape[1]) == hidden_meta == 4096
@@ -1722,8 +1769,6 @@ def _native_moe_max_rows(bits: int) -> int:
 # predate the flag (or CPU fixtures that build a bare namespace) fall back to MCG,
 # matching every other consumer in this module.
 _MCG_CODEBOOK_FLAGS = (True, False) * 3
-
-
 def _apply_native_fused_moe(
     x2d: torch.Tensor,
     ids: torch.Tensor,
@@ -1799,9 +1844,31 @@ def _apply_native_fused_moe(
     )
     xh = x2d.to(dtype=torch.float16).contiguous()
     native_out = torch.empty_like(xh)
-    k = int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", 4)))
-    fn = module.p2b_fused_moe
-    extra_args = (intermediate, clamp_limit) if extended_abi else ()
+    mixed_mk = bool(getattr(layer, "_exl3_mixed_native_mk", False)) and (
+        getattr(layer, "_exl3_K_gate_arr", None) is not None
+    )
+    if mixed_mk:
+        # [LAB PATCH 2026-10-06] Native multi-K dispatch for mixed-K packs:
+        # p2b_fused_moe_mk takes the three device-resident per-expert K tables
+        # built by build_exl3_fused_state in place of the scalar K triple.
+        # Upstream exported the kernel but never selected it.
+        fn = getattr(module, "p2b_fused_moe_mk", None)
+        if fn is None:
+            return None
+        k_args = (
+            layer._exl3_K_gate_arr,
+            layer._exl3_K_up_arr,
+            layer._exl3_K_down_arr,
+            n_exp,
+            True,
+        )
+    elif getattr(layer, "_exl3_mixed_k", False):
+        return None
+    else:
+        fn = module.p2b_fused_moe
+        k = int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", 4)))
+        k_args = (k, k, k, True)
+    extra_args = (intermediate, clamp_limit) if (extended_abi or mixed_mk) else ()
     for row in range(int(x2d.shape[0])):
         result = fn(
             xh[row : row + 1],
@@ -1817,18 +1884,12 @@ def _apply_native_fused_moe(
             ptrs["down_svh"],
             safe_ids[row],
             safe_weights[row],
-            k,
-            k,
-            k,
-            True,
+            *k_args,
             *extra_args,
         )
-        # pybind returns the same output tensor, while lightweight test doubles
-        # may return a fresh tensor.  Accommodate both without synchronizing.
         if isinstance(result, torch.Tensor) and result is not native_out:
             native_out[row : row + 1].copy_(result.reshape(1, -1))
     return native_out.to(dtype=torch.float32)
-
 
 _FAT_SCRATCH_CACHE: dict[tuple[str, int, int, int, int], dict[str, torch.Tensor]] = {}
 
@@ -2326,11 +2387,37 @@ def apply_exl3_experts(
         # Standard per-expert-loop mixed-K (not tensor-mixed-K store) — the
         # mixedk kernel path is handled via _exl3_mixedk_unified flag.
         if not getattr(layer, "_exl3_mixedk_unified", False):
-            from .tensor_mixed_k import apply_mixed_reference
-
+            # [LAB PATCH 2026-10-06] Stacked mixed-K packs (ds4rt K3.25) carry
+            # no _exl3_mixed_store; apply_mixed_reference would demand one. Its
+            # actual computation is the _exl3_inners loop, which is what the
+            # stacked load path builds — run it directly, eager-only.
             if fused is True:
-                raise RuntimeError("EXL3 mixed-K currently supports eager reference execution only")
-            return apply_mixed_reference(x, topk_ids, topk_weights, layer, limit=limit)
+                raise RuntimeError(
+                    "EXL3 stacked mixed-K supports eager, non-fused execution only"
+                )
+            from .tensor_mixed_k import require_eager_execution
+
+            require_eager_execution(
+                compiling=torch.compiler.is_compiling(),
+                capturing=x.is_cuda and torch.cuda.is_current_stream_capturing(),
+            )
+            inners = getattr(layer, "_exl3_inners", None)
+            if not inners:
+                raise RuntimeError("EXL3 experts were not built after weight load")
+            tokens, hidden = x.shape[-2], x.shape[-1]
+            x2d = x.reshape(tokens, hidden)
+            ids = topk_ids.reshape(tokens, -1).to(torch.long)
+            weights = topk_weights.reshape(tokens, -1)
+            out = apply_exl3_python_loop(
+                x2d,
+                ids,
+                weights,
+                inners,
+                pin_exl3_expert_map(layer, x2d.device),
+                limit,
+            )
+            layer._exl3_last_apply = "mixed_k_stacked_loop"
+            return out.to(dtype=x.dtype)
     if _EXL3_PREFILL_SYNC:
         _prefill_sync(int(x.numel() // x.shape[-1]))
     inners = getattr(layer, "_exl3_inners", None)
@@ -2367,7 +2454,13 @@ def apply_exl3_experts(
     have_ptrs = bool(getattr(layer, "_exl3_ptrs", None))
     if fused is True and not have_ptrs:
         raise RuntimeError("EXL3 fused apply requested but pointer tables are missing")
-    use_fused = (fused_moe_enabled() if fused is None else bool(fused)) and have_ptrs
+    use_fused = (
+        (fused_moe_enabled() if fused is None else bool(fused))
+        and have_ptrs
+        # [LAB PATCH 2026-10-06] native multi-K layers have pointer tables but
+        # no scalar K; the exllamav3 scalar fused path must not be selected.
+        and not getattr(layer, "_exl3_mixed_native_mk", False)
+    )
     if use_fused:
         try:
             import exllamav3_ext
@@ -3441,13 +3534,21 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # otherwise falls back to the LinearEXL3 loop.
         backend = get_moe_kernel_backend()
         if mixed_k:
-            # Check for the mixed-K fused kernel in exllamav3_ext.
+            # Check for a mixed-K fused kernel: exllamav3's exl3_moe_mixedk or,
+            # on the native ABI, vllm_exl3_c's p2b_fused_moe_mk.
+            # [LAB PATCH 2026-10-06] The original gate checked only
+            # exllamav3_ext, so an exllamav3 build without the mixed-K binding
+            # dropped every mixed layer to the eager loop even when the native
+            # multi-K kernel was compiled in.
             try:
                 _ext = load_exllamav3_ext()
                 has_mixedk = _ext is not None and hasattr(_ext, "exl3_moe_mixedk")
             except Exception:
                 has_mixedk = False
-            if has_mixedk and (fused_moe_enabled() or backend == "native"):
+            has_native_mixedk = _native_moe_mixed_kernel_available()
+            if (has_mixedk or has_native_mixedk) and (
+                fused_moe_enabled() or backend == "native"
+            ):
                 try:
                     build_exl3_fused_state(layer, inners)
                     fused_ok = True
@@ -3457,8 +3558,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     layer._exl3_mixedk_unified = False
             else:
                 fused_err = f"mixed_packed_K={sorted(set(k_values))}"
-                if not has_mixedk:
-                    fused_err += " (exl3_moe_mixedk not available)"
+                if not has_mixedk and not has_native_mixedk:
+                    fused_err += " (exl3_moe_mixedk / p2b_fused_moe_mk not available)"
                 layer._exl3_ptrs = None
                 layer._exl3_fused_temps = None
                 layer._exl3_fused_concurrency = 0
