@@ -3894,6 +3894,31 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
             ext = load_exllamav3_ext()
             if hasattr(ext, "ngram_dequant"):
                 self._ext = ext
+                # exllamav3's ngram_dequant binding takes a required trailing
+                # `rotate` bool (verified on the 1.4.9 and 1.6.0 exts; the bare
+                # m.def has no default, so a 5-arg call raises TypeError on
+                # every token). Probe the arity once at load and have _decode
+                # call the form the loaded ext accepts.
+                self._ext_ngram_rotate = None
+                try:
+                    _dev = layer._exl3_ngram_head_offsets.device
+                    _p = torch.zeros(1, 1 + NGRAM_ROW_DIM * max(int(self.bits), 1) // 16,
+                                     dtype=torch.int16, device=_dev)
+                    _o = torch.zeros(1, NGRAM_ROW_DIM, dtype=torch.float16, device=_dev)
+                    _h = torch.zeros(1, dtype=torch.int32, device=_dev)
+                    _b = torch.zeros(1, NGRAM_ROW_DIM, dtype=torch.float16, device=_dev)
+                    try:
+                        ext.ngram_dequant(_p, int(self.bits), _h, _b, _o, False)
+                        self._ext_ngram_rotate = True
+                    except TypeError:
+                        ext.ngram_dequant(_p, int(self.bits), _h, _b, _o)
+                        self._ext_ngram_rotate = False
+                except Exception:
+                    logger.warning(
+                        "exllamav3_ext ngram_dequant probe failed; the EXL3 "
+                        "n-gram table falls back to the torch decoder"
+                    )
+                    self._ext, self.kernel = None, "torch"
             else:
                 logger.warning(
                     "exllamav3_ext has no ngram_dequant; the EXL3 n-gram table falls back "
@@ -3922,7 +3947,10 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
             out = torch.empty(
                 packed.shape[0], NGRAM_ROW_DIM, dtype=torch.float16, device=packed.device
             )
-            self._ext.ngram_dequant(packed, self.bits, heads, bias, out)
+            if getattr(self, "_ext_ngram_rotate", False):
+                self._ext.ngram_dequant(packed, self.bits, heads, bias, out, False)
+            else:
+                self._ext.ngram_dequant(packed, self.bits, heads, bias, out)
             return out
         return ngram_dequant_rows_torch(packed, self.bits, heads, bias)
 
