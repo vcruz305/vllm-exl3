@@ -1523,6 +1523,11 @@ def map_topk_to_local(
     return torch.where(invalid, flat.new_full(flat.shape, n_local), mapped)
 
 
+# [LAB PATCH 2026-10-06 P4] Sync-free prefill grouping inside
+# apply_exl3_python_loop; VLLM_EXL3_LAB_SYNCLOOP=0 restores legacy behavior.
+_LAB_SYNCLOOP = os.environ.get("VLLM_EXL3_LAB_SYNCLOOP", "1").strip() != "0"
+
+
 def apply_exl3_python_loop(
     x2d: torch.Tensor,
     ids: torch.Tensor,
@@ -1539,6 +1544,52 @@ def apply_exl3_python_loop(
     if out is None:
         out = torch.zeros(tokens, hidden, dtype=torch.float32, device=x2d.device)
     local_ids = map_topk_to_local(ids, len(inners), expert_map).reshape_as(ids)
+    if _LAB_SYNCLOOP:
+        # map_topk_to_local maps invalid/non-local ids to the len(inners)
+        # sentinel, so bincount over local ids with one extra bin is exact
+        # and excludes them. Two host syncs per call (counts + expert bounds
+        # .tolist()) replace ~865 (local_ids == e).nonzero() D2H syncs per
+        # layer call: prefill profiling showed 124k aten::nonzero calls and
+        # 150 ms host wall per moe_forward_shared — the dominant prefill cost.
+        n_exp = len(inners)
+        flat = local_ids.reshape(-1)
+        if only_experts is not None:
+            active = [e for e in sorted(only_experts) if 0 <= e < n_exp]
+        else:
+            counts = torch.bincount(flat, minlength=n_exp + 1)[:n_exp].tolist()
+            active = [e for e, n in enumerate(counts) if n > 0]
+        if active:
+            sorted_ids, order = flat.sort(stable=True)
+            bounds = torch.searchsorted(
+                sorted_ids,
+                torch.arange(n_exp + 1, device=flat.device, dtype=sorted_ids.dtype),
+            ).tolist()
+            k_cols = local_ids.shape[-1]
+            for e in active:
+                start, end = bounds[e], bounds[e + 1]
+                if start >= end:
+                    continue
+                tok_flat = order[start:end]
+                token_idx = torch.div(tok_flat, k_cols, rounding_mode="floor")
+                k_pos = tok_flat % k_cols
+                h = x2d.index_select(0, token_idx)
+                pack = inners[e]
+                gate = pack["gate"].forward(
+                    h.contiguous().half(), {}, out_dtype=torch.float32
+                )
+                up = pack["up"].forward(
+                    h.contiguous().half(), {}, out_dtype=torch.float32
+                )
+                if limit is not None and limit > 0:
+                    gate = gate.clamp(max=limit)
+                    up = up.clamp(min=-limit, max=limit)
+                act = F.silu(gate) * up
+                down = pack["down"].forward(
+                    act.contiguous().half(), {}, out_dtype=torch.float32
+                )
+                scale = weights[token_idx, k_pos].unsqueeze(-1).to(dtype=torch.float32)
+                out.index_add_(0, token_idx, down * scale)
+        return out
     for raw in torch.unique(local_ids).tolist():
         e = int(raw)
         if e >= len(inners):
