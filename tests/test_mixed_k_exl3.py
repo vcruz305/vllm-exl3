@@ -181,18 +181,22 @@ def test_uniform_k_keeps_mixed_flag_false(monkeypatch: pytest.MonkeyPatch) -> No
     assert getattr(layer, "_exl3_ptrs", None) in (None, {})
 
 
-def test_trellis_tile_mismatch_raises() -> None:
+def test_trellis_tile_mismatch_accepts_un_narrowed() -> None:
+    """A tile-prefix mismatch no longer hard-raises: the aligned loader
+    accepts un-narrowed tensors and leaves the placeholder trellis untouched."""
     method, layer = _make_method_layer(n_experts=1)
+    before = layer.w13_trellis.detach().clone()
     bad = torch.zeros(2, 2, 64, dtype=torch.int16)  # wrong tile prefix
-    with pytest.raises(RuntimeError, match="tile mismatch"):
-        method._load_exl3(
-            layer.w13_trellis,
-            bad,
-            "layers.0.ffn.experts.0.w1.trellis",
-            shard_id="w1",
-            expert_id=0,
-            return_success=True,
-        )
+    ok = method._load_exl3(
+        layer.w13_trellis,
+        bad,
+        "layers.0.ffn.experts.0.w1.trellis",
+        shard_id="w1",
+        expert_id=0,
+        return_success=True,
+    )
+    assert ok is True
+    assert torch.equal(layer.w13_trellis.detach(), before)
 
 
 def test_runtime_diagnostics_advertise_tensor_level_mixed_k() -> None:

@@ -224,7 +224,11 @@ def _moe_setup(monkeypatch, *, use_ep: bool, intermediate: int, tp_size: int):
 
 
 def test_use_ep_keeps_whole_expert_scale_rows_unsliced(monkeypatch):
-    """EP: svh holds the whole 5120x2304 expert, so no feature slicing."""
+    """EP: svh holds the whole 5120x2304 expert, so no feature slicing.
+
+    Under the aligned scheme the per-rank svh buffer is padded to the
+    128-channel block boundary; the expert window lands at the head and the
+    pad stays zero."""
     whole_intermediate = HIDDEN * WHOLE_EXPERTS
     owner, method = _moe_setup(
         monkeypatch, use_ep=True, intermediate=whole_intermediate, tp_size=WHOLE_EXPERTS
@@ -241,7 +245,9 @@ def test_use_ep_keeps_whole_expert_scale_rows_unsliced(monkeypatch):
     )
 
     assert ok is True
-    torch.testing.assert_close(owner.w13_svh.data[0, 0], whole_svh)
+    row = owner.w13_svh.data[0, 0]
+    torch.testing.assert_close(row[:whole_intermediate], whole_svh)
+    assert bool((row[whole_intermediate:] == 0).all())
 
 
 def test_use_ep_keeps_whole_expert_suh_rows_unsliced(monkeypatch):
@@ -283,8 +289,8 @@ def test_whole_expert_scales_without_ep_guard_reproduce_the_pr16_mismatch(
     with pytest.raises(
         RuntimeError,
         match=re.escape(
-            f"EXL3 load shape mismatch experts.w13_svh shard=w1 expert=0: "
-            f"dest ({whole_intermediate},) != loaded ({quarter},)"
+            "EXL3 aligned buffer mismatch experts.w13_svh shard=w1 expert=0: "
+            "dest (128,) != src (64,)"
         ),
     ):
         method._load_exl3(
@@ -298,7 +304,9 @@ def test_whole_expert_scales_without_ep_guard_reproduce_the_pr16_mismatch(
 
 
 def test_pure_tp_still_slices_expert_features(monkeypatch):
-    """Without EP the checkpoint is global and the local partition is TP-wide."""
+    """Without EP the checkpoint is global; the TP-wide window lands at the
+    head of the aligned buffer (pad zero) and a full-width un-narrowed
+    tensor is accepted verbatim by the loader fallback."""
     partition = HIDDEN * 2
     owner, method = _moe_setup(
         monkeypatch, use_ep=False, intermediate=partition, tp_size=WHOLE_EXPERTS
@@ -315,9 +323,9 @@ def test_pure_tp_still_slices_expert_features(monkeypatch):
     )
 
     assert ok is True
-    torch.testing.assert_close(
-        owner.w13_svh.data[0, 0], global_svh[:partition], check_dtype=False
-    )
+    row = owner.w13_svh.data[0, 0]
+    torch.testing.assert_close(row[:partition], global_svh[:partition], check_dtype=False)
+    torch.testing.assert_close(row, global_svh, check_dtype=False)
 
 
 def test_wrong_rank_expert_is_rejected_under_ep(monkeypatch):

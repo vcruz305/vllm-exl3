@@ -158,8 +158,10 @@ def test_qkv_loader_replicated_kv_heads_uses_shard_specific_tp() -> None:
     torch.testing.assert_close(svh[512:640], loaded_svh)
 
 
-def test_suh_shape_mismatch_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Scale tensors still hard-fail on shape mismatch (exact dest geometry)."""
+def test_suh_shape_mismatch_accepts_un_narrowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Scale loads accept un-narrowed tensors under the aligned loader: the
+    leading window is written and the 128-block pad stays zero (the pre-align
+    exact-dest raise was superseded by the padded-geometry fallback)."""
     monkeypatch.setenv("VLLM_EXL3_TRELLIS_ARENA", "0")
     owner = _MoEOwner()
     method = _new_moe_method(owner.moe_config, exl3.Exl3Config(bits=2, codebook="mcg", scope="test"), bits=2)
@@ -172,15 +174,18 @@ def test_suh_shape_mismatch_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     owner.moe_tp_size = 1
     owner.tp_rank = 0
-    with pytest.raises(RuntimeError, match="shape mismatch"):
-        method._load_exl3(
-            owner.w13_suh,
-            torch.arange(8, dtype=torch.float16),
-            "experts.w13_suh",
-            shard_id="w1",
-            expert_id=0,
-            return_success=True,
-        )
+    ok = method._load_exl3(
+        owner.w13_suh,
+        torch.arange(8, dtype=torch.float16),
+        "experts.w13_suh",
+        shard_id="w1",
+        expert_id=0,
+        return_success=True,
+    )
+    assert ok is True
+    row = owner.w13_suh.data[0, 0]
+    assert torch.equal(row[:8], torch.arange(8, dtype=row.dtype))
+    assert bool((row[8:] == 0).all())
 
 
 def test_trellis_exact_shape_replaces_placeholder(monkeypatch: pytest.MonkeyPatch) -> None:
