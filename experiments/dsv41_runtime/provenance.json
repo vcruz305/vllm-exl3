@@ -1,0 +1,667 @@
+{
+  "schema_version": 1,
+  "files": {
+    "runtime/vllm_disk.py": {
+      "sha256": "db1c016c404070e9f4f0acf2b3f297414c0f271aff5873546d86dca99a8bebba",
+      "source": "runtime-redesign/runs/graph-image-native-numeric-r2/rank0-source/vllm_disk.py",
+      "source_sha256": "db1c016c404070e9f4f0acf2b3f297414c0f271aff5873546d86dca99a8bebba",
+      "installed_path": "/opt/sage-offload/vllm_disk.py"
+    },
+    "runtime/expert_cache.py": {
+      "sha256": "7f03bf121ed6c6c0f30ac0633be600f691beb75153f9b6c034ca207acc08ae2b",
+      "source": "offload-runtime/runs/cache84-admission-r1/expert_cache.py",
+      "source_sha256": "7f03bf121ed6c6c0f30ac0633be600f691beb75153f9b6c034ca207acc08ae2b",
+      "installed_path": "/opt/sage-offload/expert_cache.py"
+    },
+    "runtime/deepseek_v41_compat.py": {
+      "sha256": "04d172acd6f35dd186f5d19d39e2609165c304fd58638f0c89f1b3863d7cddf2",
+      "source": "runtime-redesign/runs/dspark-source-inventory-r1/source/sources/vllm-exl3/src/vllm_exl3/deepseek_v41.py",
+      "source_sha256": "04d172acd6f35dd186f5d19d39e2609165c304fd58638f0c89f1b3863d7cddf2",
+      "installed_path": "/opt/sage-offload/deepseek_v41_compat.py"
+    },
+    "runtime/native_stream.py": {
+      "sha256": "e9b125febd8b38054dd21400cddfa9fea3127092900249947e4e6acc69377bdd",
+      "source": "offload-runtime/runs/offload-cache84-confirm1/source/native_stream.py",
+      "source_sha256": "e9b125febd8b38054dd21400cddfa9fea3127092900249947e4e6acc69377bdd",
+      "installed_path": "/opt/sage-offload/native_stream.py"
+    },
+    "runtime/runtime_telemetry.py": {
+      "sha256": "d15a3183167843b29befb2665579ea4d085e5f63f45f10f2d49acfae352783b7",
+      "source": "runtime-redesign/runs/graph-image-native-numeric-r2/rank0-source/runtime_telemetry.py",
+      "source_sha256": "d15a3183167843b29befb2665579ea4d085e5f63f45f10f2d49acfae352783b7",
+      "installed_path": "/opt/sage-offload/runtime_telemetry.py"
+    },
+    "runtime/bounded_engram.py": {
+      "sha256": "f4b93ad6855d183517697fb4b974478cb4957ad12563fbad4148f739db4d5857",
+      "source": "offload-runtime/runs/offload-cache84-confirm1/source/bounded_engram.py",
+      "source_sha256": "f4b93ad6855d183517697fb4b974478cb4957ad12563fbad4148f739db4d5857",
+      "installed_path": "/opt/sage-offload/bounded_engram.py"
+    },
+    "runtime/expert_store.py": {
+      "sha256": "05a8d337f3eda5a4d451216ba69294c14f0d58211c91c0ec802f5646f45d156b",
+      "source": "offload-runtime/runs/cache84-admission-r1/expert_store.py",
+      "source_sha256": "05a8d337f3eda5a4d451216ba69294c14f0d58211c91c0ec802f5646f45d156b",
+      "installed_path": "/opt/sage-offload/expert_store.py"
+    },
+    "runtime/sage_plugin.py": {
+      "sha256": "2747292f0d451f624b032b419dfc41d6f0e5a6e33cc731488a710d4f77b9cd38",
+      "source": "runtime-redesign/runs/graph-image-numeric-r1/rank0-source/sage_plugin.py",
+      "source_sha256": "2747292f0d451f624b032b419dfc41d6f0e5a6e33cc731488a710d4f77b9cd38",
+      "installed_path": "/opt/sage-offload/sage_plugin.py"
+    },
+    "runtime/gpu_decode_plan.py": {
+      "sha256": "e2965dfe23f3a1aa757a4a7f7c3c67aead6d7816f751ea88cca570da0c2ffb7b",
+      "source": "runtime-redesign/runs/graph-cache-dynamic-check-r1/source/gpu_decode_plan.py",
+      "source_sha256": "e2965dfe23f3a1aa757a4a7f7c3c67aead6d7816f751ea88cca570da0c2ffb7b",
+      "installed_path": "/opt/sage-offload/gpu_decode_plan.py"
+    },
+    "runtime/shared_mapped_cache.py": {
+      "sha256": "d155b5c9f3d45d976aaedf8934c301abaa9715e0a425b7e85a51244f29a93d51",
+      "source": "runtime-redesign/runs/native-service-check-r1/source/shared_mapped_cache.py",
+      "source_sha256": "d155b5c9f3d45d976aaedf8934c301abaa9715e0a425b7e85a51244f29a93d51",
+      "installed_path": "/opt/sage-offload/shared_mapped_cache.py"
+    },
+    "runtime/kv_layout_audit.py": {
+      "sha256": "472596003042869f96d2c6701ed4f1cd82c6008bdc8f29b473f087d38367e502",
+      "source": "runtime-redesign/runs/graph-image-numeric-r1/rank0-source/kv_layout_audit.py",
+      "source_sha256": "472596003042869f96d2c6701ed4f1cd82c6008bdc8f29b473f087d38367e502",
+      "installed_path": "/opt/sage-offload/kv_layout_audit.py"
+    },
+    "runtime/decoder_tail_metadata.py": {
+      "sha256": "7477d631d324ccc483057f628d9b7a6cce57ff396dd54fc485dd5f7d982d02e2",
+      "source": "runtime-redesign/runs/decoder-tail-image-r1/source/decoder_tail_metadata.py",
+      "source_sha256": "7477d631d324ccc483057f628d9b7a6cce57ff396dd54fc485dd5f7d982d02e2",
+      "installed_path": "/opt/sage-offload/decoder_tail_metadata.py"
+    },
+    "runtime/decoder_tail.py": {
+      "sha256": "5e4f36db05f81e1058a4e2658975dcc60327121f93ad6958768546834b391ce7",
+      "source": "runtime-redesign/runs/graph-image-numeric-r1/rank0-source/decoder_tail.py",
+      "source_sha256": "5e4f36db05f81e1058a4e2658975dcc60327121f93ad6958768546834b391ce7",
+      "installed_path": "/opt/sage-offload/decoder_tail.py"
+    },
+    "runtime/grouped_cache.py": {
+      "sha256": "6858035825a5a75ce2dae9ea10c5a03ffbb0f602a2d1178066fedd448c7f6146",
+      "source": "runtime-redesign/runs/grouped-check-heterogeneous-r1/source/grouped_cache.py",
+      "source_sha256": "6858035825a5a75ce2dae9ea10c5a03ffbb0f602a2d1178066fedd448c7f6146",
+      "installed_path": "/opt/sage-offload/grouped_cache.py"
+    },
+    "runtime/heterogeneous_cache.py": {
+      "sha256": "ee633610cc2e20fe9c0138c5c9b5e02d7e244df0cf9d92ebf235f9f65548d718",
+      "source": "runtime-redesign/runs/grouped-check-heterogeneous-r1/source/heterogeneous_cache.py",
+      "source_sha256": "ee633610cc2e20fe9c0138c5c9b5e02d7e244df0cf9d92ebf235f9f65548d718",
+      "installed_path": "/opt/sage-offload/heterogeneous_cache.py"
+    },
+    "runtime/engram_prefetch.py": {
+      "sha256": "3bf7040e9bdbfbc5719bc95bb09c325c73c3e3f427d1e747b2710a141e04e0da",
+      "source": "runtime-redesign/runs/graph-image-numeric-r1/rank0-source/engram_prefetch.py",
+      "source_sha256": "3bf7040e9bdbfbc5719bc95bb09c325c73c3e3f427d1e747b2710a141e04e0da",
+      "installed_path": "/opt/sage-offload/engram_prefetch.py"
+    },
+    "runtime/cached_engram_table.py": {
+      "sha256": "4ab833b9b0eab2279cdbe0a8154f6e62fdfba70681665d9809c8602a19be78f4",
+      "source": "runtime-redesign/runs/engram-check-cache-r2/source/cached_engram_table.py",
+      "source_sha256": "4ab833b9b0eab2279cdbe0a8154f6e62fdfba70681665d9809c8602a19be78f4",
+      "installed_path": "/opt/sage-offload/cached_engram_table.py"
+    },
+    "runtime/engram_rows.py": {
+      "sha256": "3ff7efd8b2e720fd606011a4bb0c610eac661610ac9e57d18e49cb285cc8647e",
+      "source": "runtime-redesign/runs/engram-check-cache-r1/source/engram_rows.py",
+      "source_sha256": "3ff7efd8b2e720fd606011a4bb0c610eac661610ac9e57d18e49cb285cc8647e",
+      "installed_path": "/opt/sage-offload/engram_rows.py"
+    },
+    "runtime/grouped_plan.py": {
+      "sha256": "c5ae49be3c394b5cee63bb27b2be0d13b9e1ca759b84bc6d9fdca31a8fefcd97",
+      "source": "runtime-redesign/runs/grouped-check-heterogeneous-r1/source/grouped_plan.py",
+      "source_sha256": "c5ae49be3c394b5cee63bb27b2be0d13b9e1ca759b84bc6d9fdca31a8fefcd97",
+      "installed_path": "/opt/sage-offload/grouped_plan.py"
+    },
+    "runtime/prefetch_cache.py": {
+      "sha256": "7eb29eaff3928b0e6627255ee99acf6df8aafaa27604d765ed07c0c2f8e46175",
+      "source": "runtime-redesign/runs/grouped-check-heterogeneous-r1/source/prefetch_cache.py",
+      "source_sha256": "7eb29eaff3928b0e6627255ee99acf6df8aafaa27604d765ed07c0c2f8e46175",
+      "installed_path": "/opt/sage-offload/prefetch_cache.py"
+    },
+    "runtime/async_store.py": {
+      "sha256": "be242ba5ae23c2f35978a5d464856c4afa8a85efb3247e0bc5040b3731491275",
+      "source": "runtime-redesign/runs/graph-cache-dynamic-check-r1/source/async_store.py",
+      "source_sha256": "be242ba5ae23c2f35978a5d464856c4afa8a85efb3247e0bc5040b3731491275",
+      "installed_path": "/opt/sage-offload/async_store.py"
+    },
+    "runtime/graph_runtime.py": {
+      "sha256": "7ecb858c7724d1678b0236cd803ce7fb051496c2ea77983385edb51a1251ac28",
+      "source": "runtime-redesign/runs/native-graph-milestone-r1/source/graph-native-r1/graph_runtime.py",
+      "source_sha256": "7ecb858c7724d1678b0236cd803ce7fb051496c2ea77983385edb51a1251ac28",
+      "installed_path": "/opt/sage-offload/graph_runtime.py"
+    },
+    "runtime/graph_rows.py": {
+      "sha256": "13f40e87e927693de08fd522464bc8c268485842a40c41f5fdccf40b9829f822",
+      "source": "runtime-redesign/runs/graph-image-numeric-r1/rank0-source/graph_rows.py",
+      "source_sha256": "13f40e87e927693de08fd522464bc8c268485842a40c41f5fdccf40b9829f822",
+      "installed_path": "/opt/sage-offload/graph_rows.py"
+    },
+    "runtime/native_shared_cache.py": {
+      "sha256": "ec14002ca2b5e6a42311e576c272b11ec11f7d6eb846c587e39170f28cef9c4c",
+      "source": "runtime-redesign/runs/graph-image-native-numeric-r2/rank0-source/native_shared_cache.py",
+      "source_sha256": "ec14002ca2b5e6a42311e576c272b11ec11f7d6eb846c587e39170f28cef9c4c",
+      "installed_path": "/opt/sage-offload/native_shared_cache.py"
+    },
+    "runtime/null_kv_page.py": {
+      "sha256": "63fabb5468b47885a2210c0bfe6578722a22314b27d3af4570f58724c6c70d9d",
+      "source": "runtime-redesign/runs/attention-input-check-r2/source/null_kv_page.py",
+      "source_sha256": "63fabb5468b47885a2210c0bfe6578722a22314b27d3af4570f58724c6c70d9d",
+      "installed_path": "/opt/sage-offload/null_kv_page.py"
+    },
+    "runtime/native_rows.py": {
+      "sha256": "dbd79ae307f783563a5ab577d23749bd3583c4fda8e6a12dd55630ee5128ad82",
+      "source": "runtime-redesign/runs/engram-check-graph-r1/source/native_rows.py",
+      "source_sha256": "dbd79ae307f783563a5ab577d23749bd3583c4fda8e6a12dd55630ee5128ad82",
+      "installed_path": "/opt/sage-offload/native_rows.py"
+    },
+    "runtime/graph_lifetime.py": {
+      "sha256": "76b5972c5186cecb7b2a7c7cc8d19e46a483bb4e7effdd1a3f61065526ce31a0",
+      "source": "runtime-redesign/runs/graph-image-numeric-r1/rank0-source/graph_lifetime.py",
+      "source_sha256": "76b5972c5186cecb7b2a7c7cc8d19e46a483bb4e7effdd1a3f61065526ce31a0",
+      "installed_path": "/opt/sage-offload/graph_lifetime.py"
+    },
+    "bootstrap/sitecustomize.py": {
+      "sha256": "819ab4c52bea073e08dedc13201f50d885a7081cc1110917f1b9d7212064ef82",
+      "source": "runtime-redesign/runs/graph-image-numeric-r1/rank0-source/sitecustomize.py",
+      "source_sha256": "819ab4c52bea073e08dedc13201f50d885a7081cc1110917f1b9d7212064ef82",
+      "installed_path": "/usr/lib/python3.12/sitecustomize.py"
+    },
+    "vllm_overlay/cudagraph_utils.py": {
+      "sha256": "cebe1d56d98d1689ee155af540aacc33f22751fe138ec37e65c257b2af9e1df2",
+      "source": "runtime-redesign/runs/graph-image-numeric-r1/rank0-source/v2_cudagraph_utils.py",
+      "source_sha256": "cebe1d56d98d1689ee155af540aacc33f22751fe138ec37e65c257b2af9e1df2",
+      "installed_path": "/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/cudagraph_utils.py"
+    },
+    "vllm_overlay/model_runner.py": {
+      "sha256": "d16ad104d5351ccf1d46e5417300ed39d158a39f2dec9b1542022e3e57a8524c",
+      "source": "runtime-redesign/runs/graph-image-numeric-r1/rank0-source/v2_model_runner.py",
+      "source_sha256": "d16ad104d5351ccf1d46e5417300ed39d158a39f2dec9b1542022e3e57a8524c",
+      "installed_path": "/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py"
+    },
+    "history/grouped-image-r1/grouped_cache.py": {
+      "sha256": "aca1f696b4204c57c14eb27f37121ea55ad8d00388e6ae22dc9f71f526bf98ed",
+      "source": "runtime-redesign/runs/grouped-image-r1/source/grouped_cache.py",
+      "source_sha256": "aca1f696b4204c57c14eb27f37121ea55ad8d00388e6ae22dc9f71f526bf98ed"
+    },
+    "history/grouped-image-r1/grouped_plan.py": {
+      "sha256": "a6345a005057d79279aee95094da0c11a2a144aa68aabcc14ea4b3916140b13b",
+      "source": "runtime-redesign/runs/grouped-image-r1/source/grouped_plan.py",
+      "source_sha256": "a6345a005057d79279aee95094da0c11a2a144aa68aabcc14ea4b3916140b13b"
+    },
+    "history/grouped-image-r1/vllm_disk.py": {
+      "sha256": "58771b86cd090067ae8512690c685fce5cf45f4f6becac54fa1b222d6148a155",
+      "source": "runtime-redesign/runs/grouped-image-r1/source/vllm_disk.py",
+      "source_sha256": "58771b86cd090067ae8512690c685fce5cf45f4f6becac54fa1b222d6148a155"
+    },
+    "history/prefetch-image-r1/async_store.py": {
+      "sha256": "be242ba5ae23c2f35978a5d464856c4afa8a85efb3247e0bc5040b3731491275",
+      "source": "runtime-redesign/runs/prefetch-image-r1/source/async_store.py",
+      "source_sha256": "be242ba5ae23c2f35978a5d464856c4afa8a85efb3247e0bc5040b3731491275"
+    },
+    "history/prefetch-image-r1/grouped_cache.py": {
+      "sha256": "c0ebddaacfcc4c41e31a0a870d3d61288baaf430aa6b87cf2070b25f3f02b073",
+      "source": "runtime-redesign/runs/prefetch-image-r1/source/grouped_cache.py",
+      "source_sha256": "c0ebddaacfcc4c41e31a0a870d3d61288baaf430aa6b87cf2070b25f3f02b073"
+    },
+    "history/prefetch-image-r1/grouped_plan.py": {
+      "sha256": "c5ae49be3c394b5cee63bb27b2be0d13b9e1ca759b84bc6d9fdca31a8fefcd97",
+      "source": "runtime-redesign/runs/prefetch-image-r1/source/grouped_plan.py",
+      "source_sha256": "c5ae49be3c394b5cee63bb27b2be0d13b9e1ca759b84bc6d9fdca31a8fefcd97"
+    },
+    "history/prefetch-image-r1/prefetch_cache.py": {
+      "sha256": "7eb29eaff3928b0e6627255ee99acf6df8aafaa27604d765ed07c0c2f8e46175",
+      "source": "runtime-redesign/runs/prefetch-image-r1/source/prefetch_cache.py",
+      "source_sha256": "7eb29eaff3928b0e6627255ee99acf6df8aafaa27604d765ed07c0c2f8e46175"
+    },
+    "history/prefetch-image-r1/vllm_disk.py": {
+      "sha256": "c79cc24579db1fa10ad8faa5bcbf5e7fa1988b3b11cfd75b91aa7883fbfbd854",
+      "source": "runtime-redesign/runs/prefetch-image-r1/source/vllm_disk.py",
+      "source_sha256": "c79cc24579db1fa10ad8faa5bcbf5e7fa1988b3b11cfd75b91aa7883fbfbd854"
+    },
+    "history/engram-image-r1/cached_engram_table.py": {
+      "sha256": "4ab833b9b0eab2279cdbe0a8154f6e62fdfba70681665d9809c8602a19be78f4",
+      "source": "runtime-redesign/runs/engram-image-r1/source/cached_engram_table.py",
+      "source_sha256": "4ab833b9b0eab2279cdbe0a8154f6e62fdfba70681665d9809c8602a19be78f4"
+    },
+    "history/engram-image-r1/engram_prefetch.py": {
+      "sha256": "a385d3d939b9d0f049bdaf5366cd254c645117d918d7b3b9efe2b05b1f3a053a",
+      "source": "runtime-redesign/runs/engram-image-r1/source/engram_prefetch.py",
+      "source_sha256": "a385d3d939b9d0f049bdaf5366cd254c645117d918d7b3b9efe2b05b1f3a053a"
+    },
+    "history/engram-image-r1/engram_rows.py": {
+      "sha256": "3ff7efd8b2e720fd606011a4bb0c610eac661610ac9e57d18e49cb285cc8647e",
+      "source": "runtime-redesign/runs/engram-image-r1/source/engram_rows.py",
+      "source_sha256": "3ff7efd8b2e720fd606011a4bb0c610eac661610ac9e57d18e49cb285cc8647e"
+    },
+    "history/engram-image-r1/runtime_telemetry.py": {
+      "sha256": "2b964f6f3d1e2a03bb213733d5365113835bdf66ea67c336830779766f352b49",
+      "source": "runtime-redesign/runs/engram-image-r1/source/runtime_telemetry.py",
+      "source_sha256": "2b964f6f3d1e2a03bb213733d5365113835bdf66ea67c336830779766f352b49"
+    },
+    "history/engram-image-r1/sage_plugin.py": {
+      "sha256": "760dfea091e0d67165121fabab760051517e1fe758d47d98e1acf194ac774fcc",
+      "source": "runtime-redesign/runs/engram-image-r1/source/sage_plugin.py",
+      "source_sha256": "760dfea091e0d67165121fabab760051517e1fe758d47d98e1acf194ac774fcc"
+    },
+    "history/heterogeneous-image-r1/grouped_cache.py": {
+      "sha256": "6858035825a5a75ce2dae9ea10c5a03ffbb0f602a2d1178066fedd448c7f6146",
+      "source": "runtime-redesign/runs/heterogeneous-image-r1/source/grouped_cache.py",
+      "source_sha256": "6858035825a5a75ce2dae9ea10c5a03ffbb0f602a2d1178066fedd448c7f6146"
+    },
+    "history/heterogeneous-image-r1/heterogeneous_cache.py": {
+      "sha256": "ee633610cc2e20fe9c0138c5c9b5e02d7e244df0cf9d92ebf235f9f65548d718",
+      "source": "runtime-redesign/runs/heterogeneous-image-r1/source/heterogeneous_cache.py",
+      "source_sha256": "ee633610cc2e20fe9c0138c5c9b5e02d7e244df0cf9d92ebf235f9f65548d718"
+    },
+    "history/heterogeneous-image-r1/vllm_disk.py": {
+      "sha256": "8bb5bb55adca0b83ad9c5f0784e79b7cb1d8f78dfca6fa5d12bbde555b1c0058",
+      "source": "runtime-redesign/runs/heterogeneous-image-r1/source/vllm_disk.py",
+      "source_sha256": "8bb5bb55adca0b83ad9c5f0784e79b7cb1d8f78dfca6fa5d12bbde555b1c0058"
+    },
+    "history/decoder-tail-image-r4/decoder_tail.py": {
+      "sha256": "cb3887cd9332fd296ba835565e36e69293a46b3210f9bd949f1259bc594af062",
+      "source": "runtime-redesign/runs/decoder-tail-image-r4/source/decoder_tail.py",
+      "source_sha256": "cb3887cd9332fd296ba835565e36e69293a46b3210f9bd949f1259bc594af062"
+    },
+    "history/decoder-tail-image-r4/decoder_tail_metadata.py": {
+      "sha256": "7477d631d324ccc483057f628d9b7a6cce57ff396dd54fc485dd5f7d982d02e2",
+      "source": "runtime-redesign/runs/decoder-tail-image-r4/source/decoder_tail_metadata.py",
+      "source_sha256": "7477d631d324ccc483057f628d9b7a6cce57ff396dd54fc485dd5f7d982d02e2"
+    },
+    "history/decoder-tail-image-r4/kv_layout_audit.py": {
+      "sha256": "e4e912d528db6344a8284382c7eeef8b0f451e07d2788f7c7d3ad560e5f647c7",
+      "source": "runtime-redesign/runs/decoder-tail-image-r4/source/kv_layout_audit.py",
+      "source_sha256": "e4e912d528db6344a8284382c7eeef8b0f451e07d2788f7c7d3ad560e5f647c7"
+    },
+    "history/decoder-tail-image-r4/model.py": {
+      "sha256": "d3482a269e4366c1db509a1f58e626e40bd0a12b0a3129f143eea22921220531",
+      "source": "runtime-redesign/runs/decoder-tail-image-r4/source/model.py",
+      "source_sha256": "d3482a269e4366c1db509a1f58e626e40bd0a12b0a3129f143eea22921220531"
+    },
+    "history/decoder-tail-image-r4/runtime_telemetry.py": {
+      "sha256": "aeafc13fb9e8fab8c6b459a9f9baf5cb4430b962a97372c24ce936ba1c66fcb7",
+      "source": "runtime-redesign/runs/decoder-tail-image-r4/source/runtime_telemetry.py",
+      "source_sha256": "aeafc13fb9e8fab8c6b459a9f9baf5cb4430b962a97372c24ce936ba1c66fcb7"
+    },
+    "history/decoder-tail-image-r4/sage_plugin.py": {
+      "sha256": "6ad7cdfa990e6bb99d49de8c71209af6ed3eee82c530c7bdf5a4a8634ed36e22",
+      "source": "runtime-redesign/runs/decoder-tail-image-r4/source/sage_plugin.py",
+      "source_sha256": "6ad7cdfa990e6bb99d49de8c71209af6ed3eee82c530c7bdf5a4a8634ed36e22"
+    },
+    "runtime/build_packages.py": {
+      "sha256": "d4389b1fb17f717cc2f475198d16931de4e136a5292294cd99191b8bb348a43b",
+      "source": "offload-runtime/runs/offload-cache84-confirm3/source/build_packages.py",
+      "source_sha256": "d4389b1fb17f717cc2f475198d16931de4e136a5292294cd99191b8bb348a43b"
+    },
+    "runtime/verify_package.py": {
+      "sha256": "1bc02846fb854b388229347cf101847fa55c62285ce0efe6367dace78910f7c9",
+      "source": "offload-runtime/runs/offload-cache84-confirm3/source/verify_package.py",
+      "source_sha256": "1bc02846fb854b388229347cf101847fa55c62285ce0efe6367dace78910f7c9"
+    },
+    "runtime/catalog_layout.py": {
+      "sha256": "898344e00d742b92182f47aca0d2bbf83c7b7ff3e68dba2ddcad5ee8e162e037",
+      "source": "offload-runtime/runs/offload-cache84-confirm3/source/catalog_layout.py",
+      "source_sha256": "898344e00d742b92182f47aca0d2bbf83c7b7ff3e68dba2ddcad5ee8e162e037"
+    },
+    "native/mixed_k/heterogeneous_moe.h": {
+      "sha256": "41c6d9b4e12dabe98c6bfccf0861f46537ad02765e7b8b867e2a2d7eb89e025e",
+      "source": "runtime-redesign/runs/grouped-check-heterogeneous-r2/source/kernel-source/heterogeneous_moe.h",
+      "source_sha256": "41c6d9b4e12dabe98c6bfccf0861f46537ad02765e7b8b867e2a2d7eb89e025e"
+    },
+    "native/mixed_k/heterogeneous_moe.cu": {
+      "sha256": "2f826acd428ea0e27b3505118ba452b80c104c8c4eb6e19ec7c34e103fec0235",
+      "source": "runtime-redesign/runs/grouped-check-heterogeneous-r2/source/kernel-source/heterogeneous_moe.cu",
+      "source_sha256": "2f826acd428ea0e27b3505118ba452b80c104c8c4eb6e19ec7c34e103fec0235"
+    },
+    "native/mixed_k/native/quant/exl3_moe_kernel.cuh": {
+      "sha256": "aca3b85739bcacab3bb593b61832456d32dde13b4c1fbffc78f4288e5e21c2de",
+      "source": "runtime-redesign/runs/grouped-check-heterogeneous-r2/source/kernel-source/native/quant/exl3_moe_kernel.cuh",
+      "source_sha256": "aca3b85739bcacab3bb593b61832456d32dde13b4c1fbffc78f4288e5e21c2de"
+    },
+    "native/mixed_k/native/ptx.cuh": {
+      "sha256": "8ceacb1b321af5877a9a3d651e038fb1f44b543c3011e2f814f448830efe27ee",
+      "source": "runtime-redesign/runs/grouped-check-heterogeneous-r2/source/kernel-source/native/ptx.cuh",
+      "source_sha256": "8ceacb1b321af5877a9a3d651e038fb1f44b543c3011e2f814f448830efe27ee"
+    },
+    "native/mixed_k/native/quant/exl3_devctx.cuh": {
+      "sha256": "effb1827e9b6c61ba95287ccfa5d6a0b6ccef103c0d588d992359be9291834c0",
+      "source": "runtime-redesign/runs/grouped-check-heterogeneous-r2/source/kernel-source/native/quant/exl3_devctx.cuh",
+      "source_sha256": "effb1827e9b6c61ba95287ccfa5d6a0b6ccef103c0d588d992359be9291834c0"
+    },
+    "native/mixed_k/native/quant/exl3_gemm_inner.cuh": {
+      "sha256": "bf8df786418c94aee20327c32ec1b28cdf89507cbf07d32cb4d662a9719e0a9c",
+      "source": "runtime-redesign/runs/grouped-check-heterogeneous-r2/source/kernel-source/native/quant/exl3_gemm_inner.cuh",
+      "source_sha256": "bf8df786418c94aee20327c32ec1b28cdf89507cbf07d32cb4d662a9719e0a9c"
+    },
+    "native/mixed_k/native/quant/exl3_dq.cuh": {
+      "sha256": "7e3009b0f70635e8a98edf8b929832ca0fe16b6a5ad20f13b77ebfa72723feac",
+      "source": "runtime-redesign/runs/grouped-check-heterogeneous-r2/source/kernel-source/native/quant/exl3_dq.cuh",
+      "source_sha256": "7e3009b0f70635e8a98edf8b929832ca0fe16b6a5ad20f13b77ebfa72723feac"
+    },
+    "native/mixed_k/native/quant/codebook.cuh": {
+      "sha256": "0e3c63b323f8d3cc15c6a8f2e2b3816efafd71e149a99997b30b2f806375138a",
+      "source": "runtime-redesign/runs/grouped-check-heterogeneous-r2/source/kernel-source/native/quant/codebook.cuh",
+      "source_sha256": "0e3c63b323f8d3cc15c6a8f2e2b3816efafd71e149a99997b30b2f806375138a"
+    },
+    "native/mixed_k/native/quant/hadamard_inner.cuh": {
+      "sha256": "63ca981a4a706924b4ab87047a903bc51ed86d6abe713b8d8034d8812d3467f3",
+      "source": "runtime-redesign/runs/grouped-check-heterogeneous-r2/source/kernel-source/native/quant/hadamard_inner.cuh",
+      "source_sha256": "63ca981a4a706924b4ab87047a903bc51ed86d6abe713b8d8034d8812d3467f3"
+    },
+    "native/mixed_k/native/compat.cuh": {
+      "sha256": "dd6038fa6eb8b28df56b184e358e5633421af76eeb40bad4abc522ce6ba54f57",
+      "source": "runtime-redesign/runs/grouped-check-heterogeneous-r2/source/kernel-source/native/compat.cuh",
+      "source_sha256": "dd6038fa6eb8b28df56b184e358e5633421af76eeb40bad4abc522ce6ba54f57"
+    },
+    "native/mixed_k/native/quant/exl3_kernel_map.cuh": {
+      "sha256": "6db5f3ab7ed173236080d641309076608c32c97c923555fbdeb699e08515729e",
+      "source": "runtime-redesign/runs/grouped-check-heterogeneous-r2/source/kernel-source/native/quant/exl3_kernel_map.cuh",
+      "source_sha256": "6db5f3ab7ed173236080d641309076608c32c97c923555fbdeb699e08515729e"
+    },
+    "native/mixed_k/native/util.cuh": {
+      "sha256": "1907cea115260db7c3b0de540e375e7733b7ffc9019bec190c1d92abea1d964e",
+      "source": "runtime-redesign/runs/grouped-check-heterogeneous-r2/source/kernel-source/native/util.cuh",
+      "source_sha256": "1907cea115260db7c3b0de540e375e7733b7ffc9019bec190c1d92abea1d964e"
+    },
+    "native/mixed_k/native/util.h": {
+      "sha256": "ba89ac6793bf31cfe123d13baa2e34531a18a24bc3b2ff4add8cf4856b75a1c8",
+      "source": "runtime-redesign/runs/grouped-check-heterogeneous-r2/source/kernel-source/native/util.h",
+      "source_sha256": "ba89ac6793bf31cfe123d13baa2e34531a18a24bc3b2ff4add8cf4856b75a1c8"
+    },
+    "native/mixed_k/native/quant/exl3_moe_common.cuh": {
+      "sha256": "33a701c0f999a17ffd1361a7cbae95b6c61ef081d4ba6d3ea4b7001f10c1a79e",
+      "source": "runtime-redesign/runs/grouped-check-heterogeneous-r2/source/kernel-source/native/quant/exl3_moe_common.cuh",
+      "source_sha256": "33a701c0f999a17ffd1361a7cbae95b6c61ef081d4ba6d3ea4b7001f10c1a79e"
+    },
+    "native/mixed_k/heterogeneous_bindings.cpp": {
+      "sha256": "def8d08d8e9a2c721e91efef0505f429adb07f8a8050dea559d943321a11aae8",
+      "source": "runtime-redesign/runs/grouped-check-heterogeneous-r2/source/kernel-source/heterogeneous_bindings.cpp",
+      "source_sha256": "def8d08d8e9a2c721e91efef0505f429adb07f8a8050dea559d943321a11aae8"
+    },
+    "native/mixed_k/LICENSE-exllamav3": {
+      "sha256": "27a32b6263fcd96c79d3beeecf221c4366780bdf15ad51986f48650bd7369bff",
+      "source": "runtime-redesign/runs/grouped-check-heterogeneous-r2/source/kernel-source/LICENSE-exllamav3",
+      "source_sha256": "27a32b6263fcd96c79d3beeecf221c4366780bdf15ad51986f48650bd7369bff"
+    },
+    "native/dynamic/heterogeneous_moe.h": {
+      "sha256": "41c6d9b4e12dabe98c6bfccf0861f46537ad02765e7b8b867e2a2d7eb89e025e",
+      "source": "runtime-redesign/runs/dynamic-groups-check-r3/source/kernel-source/heterogeneous_moe.h",
+      "source_sha256": "41c6d9b4e12dabe98c6bfccf0861f46537ad02765e7b8b867e2a2d7eb89e025e"
+    },
+    "native/dynamic/heterogeneous_moe.cu": {
+      "sha256": "b9e9067a83a9d449fc7de8e95f51b324a98d7d635597e861cba1ec57bc8811d9",
+      "source": "runtime-redesign/runs/dynamic-groups-check-r3/source/kernel-source/heterogeneous_moe.cu",
+      "source_sha256": "b9e9067a83a9d449fc7de8e95f51b324a98d7d635597e861cba1ec57bc8811d9"
+    },
+    "native/dynamic/native/quant/exl3_moe_kernel.cuh": {
+      "sha256": "30cc4c41a7631ab69af62daa352baf7d5410df24ba89d4f86651bba4dbc1904e",
+      "source": "runtime-redesign/runs/dynamic-groups-check-r3/source/kernel-source/native/quant/exl3_moe_kernel.cuh",
+      "source_sha256": "30cc4c41a7631ab69af62daa352baf7d5410df24ba89d4f86651bba4dbc1904e"
+    },
+    "native/dynamic/native/ptx.cuh": {
+      "sha256": "8ceacb1b321af5877a9a3d651e038fb1f44b543c3011e2f814f448830efe27ee",
+      "source": "runtime-redesign/runs/dynamic-groups-check-r3/source/kernel-source/native/ptx.cuh",
+      "source_sha256": "8ceacb1b321af5877a9a3d651e038fb1f44b543c3011e2f814f448830efe27ee"
+    },
+    "native/dynamic/native/quant/exl3_devctx.cuh": {
+      "sha256": "effb1827e9b6c61ba95287ccfa5d6a0b6ccef103c0d588d992359be9291834c0",
+      "source": "runtime-redesign/runs/dynamic-groups-check-r3/source/kernel-source/native/quant/exl3_devctx.cuh",
+      "source_sha256": "effb1827e9b6c61ba95287ccfa5d6a0b6ccef103c0d588d992359be9291834c0"
+    },
+    "native/dynamic/native/quant/exl3_gemm_inner.cuh": {
+      "sha256": "e508f8fb7726a4c5e2f6d7fce7295d1e03833d7ca28af2dce9f6a72ce9f3582e",
+      "source": "runtime-redesign/runs/dynamic-groups-check-r3/source/kernel-source/native/quant/exl3_gemm_inner.cuh",
+      "source_sha256": "e508f8fb7726a4c5e2f6d7fce7295d1e03833d7ca28af2dce9f6a72ce9f3582e"
+    },
+    "native/dynamic/native/quant/exl3_dq.cuh": {
+      "sha256": "7e3009b0f70635e8a98edf8b929832ca0fe16b6a5ad20f13b77ebfa72723feac",
+      "source": "runtime-redesign/runs/dynamic-groups-check-r3/source/kernel-source/native/quant/exl3_dq.cuh",
+      "source_sha256": "7e3009b0f70635e8a98edf8b929832ca0fe16b6a5ad20f13b77ebfa72723feac"
+    },
+    "native/dynamic/native/quant/codebook.cuh": {
+      "sha256": "0e3c63b323f8d3cc15c6a8f2e2b3816efafd71e149a99997b30b2f806375138a",
+      "source": "runtime-redesign/runs/dynamic-groups-check-r3/source/kernel-source/native/quant/codebook.cuh",
+      "source_sha256": "0e3c63b323f8d3cc15c6a8f2e2b3816efafd71e149a99997b30b2f806375138a"
+    },
+    "native/dynamic/native/quant/hadamard_inner.cuh": {
+      "sha256": "63ca981a4a706924b4ab87047a903bc51ed86d6abe713b8d8034d8812d3467f3",
+      "source": "runtime-redesign/runs/dynamic-groups-check-r3/source/kernel-source/native/quant/hadamard_inner.cuh",
+      "source_sha256": "63ca981a4a706924b4ab87047a903bc51ed86d6abe713b8d8034d8812d3467f3"
+    },
+    "native/dynamic/native/compat.cuh": {
+      "sha256": "dd6038fa6eb8b28df56b184e358e5633421af76eeb40bad4abc522ce6ba54f57",
+      "source": "runtime-redesign/runs/dynamic-groups-check-r3/source/kernel-source/native/compat.cuh",
+      "source_sha256": "dd6038fa6eb8b28df56b184e358e5633421af76eeb40bad4abc522ce6ba54f57"
+    },
+    "native/dynamic/native/quant/exl3_kernel_map.cuh": {
+      "sha256": "6db5f3ab7ed173236080d641309076608c32c97c923555fbdeb699e08515729e",
+      "source": "runtime-redesign/runs/dynamic-groups-check-r3/source/kernel-source/native/quant/exl3_kernel_map.cuh",
+      "source_sha256": "6db5f3ab7ed173236080d641309076608c32c97c923555fbdeb699e08515729e"
+    },
+    "native/dynamic/native/util.cuh": {
+      "sha256": "1907cea115260db7c3b0de540e375e7733b7ffc9019bec190c1d92abea1d964e",
+      "source": "runtime-redesign/runs/dynamic-groups-check-r3/source/kernel-source/native/util.cuh",
+      "source_sha256": "1907cea115260db7c3b0de540e375e7733b7ffc9019bec190c1d92abea1d964e"
+    },
+    "native/dynamic/native/util.h": {
+      "sha256": "ba89ac6793bf31cfe123d13baa2e34531a18a24bc3b2ff4add8cf4856b75a1c8",
+      "source": "runtime-redesign/runs/dynamic-groups-check-r3/source/kernel-source/native/util.h",
+      "source_sha256": "ba89ac6793bf31cfe123d13baa2e34531a18a24bc3b2ff4add8cf4856b75a1c8"
+    },
+    "native/dynamic/native/quant/exl3_moe_common.cuh": {
+      "sha256": "33a701c0f999a17ffd1361a7cbae95b6c61ef081d4ba6d3ea4b7001f10c1a79e",
+      "source": "runtime-redesign/runs/dynamic-groups-check-r3/source/kernel-source/native/quant/exl3_moe_common.cuh",
+      "source_sha256": "33a701c0f999a17ffd1361a7cbae95b6c61ef081d4ba6d3ea4b7001f10c1a79e"
+    },
+    "native/dynamic/heterogeneous_bindings.cpp": {
+      "sha256": "def8d08d8e9a2c721e91efef0505f429adb07f8a8050dea559d943321a11aae8",
+      "source": "runtime-redesign/runs/dynamic-groups-check-r3/source/kernel-source/heterogeneous_bindings.cpp",
+      "source_sha256": "def8d08d8e9a2c721e91efef0505f429adb07f8a8050dea559d943321a11aae8"
+    },
+    "native/dynamic/LICENSE-exllamav3": {
+      "sha256": "27a32b6263fcd96c79d3beeecf221c4366780bdf15ad51986f48650bd7369bff",
+      "source": "runtime-redesign/runs/dynamic-groups-check-r3/source/kernel-source/LICENSE-exllamav3",
+      "source_sha256": "27a32b6263fcd96c79d3beeecf221c4366780bdf15ad51986f48650bd7369bff"
+    },
+    "native/service/shared_miss.cu": {
+      "sha256": "855afbe8bcc2e61a73c78ebb2469573aab3751b6983e5b5b248875b61cf9a616",
+      "source": "runtime-redesign/runs/native-graph-milestone-r1/source/native-service-candidate/shared_miss.cu",
+      "source_sha256": "855afbe8bcc2e61a73c78ebb2469573aab3751b6983e5b5b248875b61cf9a616"
+    },
+    "native/service/native_service.cpp": {
+      "sha256": "f0caff1d469e605e97eda22b0d616a1f5978fefe6cce09126e462a71360b24b2",
+      "source": "runtime-redesign/runs/native-graph-milestone-r1/source/native-service-candidate/native_service.cpp",
+      "source_sha256": "f0caff1d469e605e97eda22b0d616a1f5978fefe6cce09126e462a71360b24b2"
+    },
+    "native/service/native_service.h": {
+      "sha256": "115afae84cbc0fa9f3a9f9b9e6cc9e3f773453ec20fa15bdaad504cfc8330c0a",
+      "source": "runtime-redesign/runs/native-graph-milestone-r1/source/native-service-candidate/native_service.h",
+      "source_sha256": "115afae84cbc0fa9f3a9f9b9e6cc9e3f773453ec20fa15bdaad504cfc8330c0a"
+    },
+    "native/service/native_region_check.cpp": {
+      "sha256": "72a0689ab2412d058bd54850c0b1a9feda13af31df2320ea64292067e4688849",
+      "source": "runtime-redesign/runs/native-graph-milestone-r1/source/native-service-candidate/native_region_check.cpp",
+      "source_sha256": "72a0689ab2412d058bd54850c0b1a9feda13af31df2320ea64292067e4688849"
+    },
+    "native/engram/row_service.cpp": {
+      "sha256": "fc2b0cf1ee399cc6e595ddddb8e9ae3b21e846356108b422b40eff67c904f27d",
+      "source": "runtime-redesign/runs/engram-check-graph-r3/source/row_service.cpp",
+      "source_sha256": "fc2b0cf1ee399cc6e595ddddb8e9ae3b21e846356108b422b40eff67c904f27d"
+    },
+    "tests/test_grouped_plan.py": {
+      "sha256": "4ce4572586b45ce099b5d56a0269d16712d909ccfb9161293026589c18efa7bd",
+      "source": "runtime-redesign/runs/redesign-milestone-r1/source/test_grouped_plan.py",
+      "source_sha256": "4ce4572586b45ce099b5d56a0269d16712d909ccfb9161293026589c18efa7bd"
+    },
+    "tests/test_async_store.py": {
+      "sha256": "51aa634bbfcaa19c7e87fdbc5154cbf618c6b0112d557c212fd2347b5807bd37",
+      "source": "runtime-redesign/runs/redesign-milestone-r3/source/test_async_store.py",
+      "source_sha256": "d7579eed2b250205cb9da80a393179c3f5d48da3d726665de8402af81ca467ed",
+      "adaptation": "Removed the private lab sibling import path; run_cpu_tests.py supplies the bundled runtime path."
+    },
+    "tests/test_engram_rows.py": {
+      "sha256": "f3d70771ae33e6a06e3a49e204c6190030c1daf889ed805a78dd6c7d381f3067",
+      "source": "runtime-redesign/runs/redesign-milestone-r3/source/test_engram_rows.py",
+      "source_sha256": "f3d70771ae33e6a06e3a49e204c6190030c1daf889ed805a78dd6c7d381f3067"
+    }
+  },
+  "verified_artifacts": {
+    "runtime-redesign/graph-image-native-r1": {
+      "manifest_sha256": "24985f506a95a0c40feb3a133db8eebad746e76f6e84dfc11dcfcaeef94930ca",
+      "manifest_file_sha256": "bee1518c7ba6c4b3e437d55f53252ece699d19c6340256c8eebf12288698e2cd",
+      "files_verified": 64
+    },
+    "runtime-redesign/graph-image-native-numeric-r2": {
+      "manifest_sha256": "010de7d12245e39f727b385bdf803df76209b72e7417548caf54510ba2614266",
+      "manifest_file_sha256": "32c6c35f4ca46fb1ea568cce66806b80faa5a5a991fe5e05eaab7c607ff6f2bb",
+      "files_verified": 70
+    },
+    "runtime-redesign/dspark-source-inventory-r1": {
+      "manifest_sha256": "54d8e7fbf9a37a96ebf81cec83956dee69b1c37df164f38825ef235b2913a87c",
+      "manifest_file_sha256": "17e6a8d49bcdebf32a9ad88dc21ce0cabcdef1aa1fdc0732d720f6a1cd655d10",
+      "files_verified": 8
+    },
+    "runtime-redesign/graph-image-numeric-r1": {
+      "manifest_sha256": "48a73025fee0d9c2089242cb80cf8e2fd6fc1cc411c1276d800b5e30e92c7bd2",
+      "manifest_file_sha256": "f11e3b52ddf638761989fad646e230c67ccbcd8298cd383a57cb002ed880a43e",
+      "files_verified": 64
+    },
+    "runtime-redesign/graph-cache-dynamic-check-r1": {
+      "manifest_sha256": "e52852cc4237c6240197af0a810151ac2244cea300d5331d415e64b2302e1ffc",
+      "manifest_file_sha256": "a4fdf9bb2fae7265d767ad5d01b8bac374bc84a266a12b4a2c3af69962357ae6",
+      "files_verified": 15
+    },
+    "runtime-redesign/native-service-check-r1": {
+      "manifest_sha256": "05a91385486cd73bdb9160ac6187c18a2d7ad871f6206297dff5e63484555c9c",
+      "manifest_file_sha256": "bd9fd1f4429737b6c2520ee2cab021d6eca17c2825324aa625e6bf0eeef15d7c",
+      "files_verified": 18
+    },
+    "runtime-redesign/decoder-tail-image-r1": {
+      "manifest_sha256": "61edd21beef79051e90182615d28be4e3938d8d9ada5f60c37bcbcb400df9a1b",
+      "manifest_file_sha256": "a0b85321f2ea84faa7fb3c94589eaf8b4b7239f0a576e694330c465d378df936",
+      "files_verified": 14
+    },
+    "runtime-redesign/grouped-check-heterogeneous-r1": {
+      "manifest_sha256": "a5cef309f31bb237aeb3c9adbd94d4de612e69479c19567db7535a5b2b7a5333",
+      "manifest_file_sha256": "3373b88dc3e891e186b0c80400c864efc93099a450ec8f9bd23ec4b18764210f",
+      "files_verified": 130
+    },
+    "runtime-redesign/engram-check-cache-r2": {
+      "manifest_sha256": "6662652984e6197be20391ac70602c5c284f7d6eddb3e7c444446b37f2999d3d",
+      "manifest_file_sha256": "8ba7a61d2a3a5fb60039a8f86feb57c2fa4aefd8a15351db3beb5fdf32b6edd5",
+      "files_verified": 13
+    },
+    "runtime-redesign/engram-check-cache-r1": {
+      "manifest_sha256": "485d00717deeab02e01ed386b214500dfbe768a431b291483a8ce77119c387ca",
+      "manifest_file_sha256": "039398b9a220790fd153e088e919cc5efb7db1c73b28323420c86ecd6dd40322",
+      "files_verified": 11
+    },
+    "runtime-redesign/native-graph-milestone-r1": {
+      "manifest_sha256": "e4db2ed2aaf3c80722453618dcf4199f04e0031e586a9e0d0dea6621735064ef",
+      "manifest_file_sha256": "5f7d0717bb9cb86fd9cbf17b59e87479c9f045da10eddba306f26ff56749dd97",
+      "files_verified": 41
+    },
+    "runtime-redesign/attention-input-check-r2": {
+      "manifest_sha256": "a0e570e3656baaf96a06750e4347d394931258edcdf8a03e345ef46cd8b845b3",
+      "manifest_file_sha256": "ac354218ddf873751c1f7ecb7639001f1eb34660a4ae84b5d20125fbd2b7826d",
+      "files_verified": 12
+    },
+    "runtime-redesign/engram-check-graph-r1": {
+      "manifest_sha256": "dd9a1ddf556348d71a4cff796ba3049377886770e60299a34f62970b921d8287",
+      "manifest_file_sha256": "9943a4bd80f85a4c9fb7d9a1e8ef007a4858f286020d2ac6041616feb0fc04a1",
+      "files_verified": 14
+    },
+    "runtime-redesign/grouped-image-r1": {
+      "manifest_sha256": "ec2bfb7364114aa646b61f6776585b41425c7f70ce837f6708632031cd68badb",
+      "manifest_file_sha256": "86333925645fe9ed9caa0775404763cf424ca4210f429ca1d5dd8a9fb12c9838",
+      "files_verified": 11
+    },
+    "runtime-redesign/prefetch-image-r1": {
+      "manifest_sha256": "b5e075e5cc9891c4d1e84a84cf78443af730f4dbb41f2d53ae1f853abc043f97",
+      "manifest_file_sha256": "67217dd0f1614953a2323652431d4b24d65d64a82251eab78fbfe111dd34d674",
+      "files_verified": 13
+    },
+    "runtime-redesign/engram-image-r1": {
+      "manifest_sha256": "51ce4162d07cf3a17a72ec4111ab67dfabfdc98d0a30e05eb85808d87343f96f",
+      "manifest_file_sha256": "f6fa12078dea5ae2acdc51005257d896f765fe88fd5d1047ebb35ec9ca09fb45",
+      "files_verified": 13
+    },
+    "runtime-redesign/heterogeneous-image-r1": {
+      "manifest_sha256": "a49089bcbba31ee82f5dc13af1086e3f3167e7df6abf612a57d68782c3254e83",
+      "manifest_file_sha256": "c47e771fbd01a3d547563b05678bd41fc10e7729c5d569577b5642c046b76b52",
+      "files_verified": 13
+    },
+    "runtime-redesign/decoder-tail-image-r4": {
+      "manifest_sha256": "5269ea0e8de42abfeff0415d0a7eaeff20fb46c3592313507435dd70369ffd9d",
+      "manifest_file_sha256": "7999fe1e930851b3af0e956db7ce07d80e5a70f7314fe0e33791ac4e2e2557ef",
+      "files_verified": 24
+    },
+    "runtime-redesign/grouped-check-heterogeneous-r2": {
+      "manifest_sha256": "9b5a17ef5f8398fb9753744911082562266e96a315c0068827cbf3418c465492",
+      "manifest_file_sha256": "5717263959e53beae0b6be1cbe7f718ad6d2e0b653ca7c60db304e6e693e5330",
+      "files_verified": 130
+    },
+    "runtime-redesign/dynamic-groups-check-r3": {
+      "manifest_sha256": "fe07341c8397d26fc25a0db5411c191ded5c756c49a3d6f8fe042fad1877751e",
+      "manifest_file_sha256": "e1e7a8568ca13725e3cf5f8c2380a36601043a51789a5803fb812b3a4384a359",
+      "files_verified": 125
+    },
+    "runtime-redesign/engram-check-graph-r3": {
+      "manifest_sha256": "1be103b00ab52f3f23504c62baa0b06f42263b2e9ee96419d5745833e67a568b",
+      "manifest_file_sha256": "d6388225ad85e73d32ea79781614c3ee33a3f8581d973345e85feea2d959b797",
+      "files_verified": 14
+    },
+    "runtime-redesign/redesign-milestone-r1": {
+      "manifest_sha256": "787c45d24a7cfc7077c1f6677f3ef706e40dba1956c03e7ab66820e607bfff17",
+      "manifest_file_sha256": "61ebaec66dbc5c2a1cbfcd663b267296114a3ad4ffd66757f4b89d0b45907e79",
+      "files_verified": 17
+    },
+    "runtime-redesign/redesign-milestone-r3": {
+      "manifest_sha256": "c495d3b5f4ae5f9f95deee1db852b555e3869653ee6dd49f6fa4e80f04e2a315",
+      "manifest_file_sha256": "4d429b36d4e459d63a2765cc2f2778414e5ada2eeedcc6b8680fb43f5925ff03",
+      "files_verified": 41
+    },
+    "runtime-redesign/mechanism-comparison-r3": {
+      "manifest_sha256": "78b4b9160330b38e9cfc26e20e5dd7bda9ac1b780b690c2811a449eaa3b6fb72",
+      "manifest_file_sha256": "26d3ff15c1472b6762af060b0744ef219acce3f2980c248404ac67a6b392d633",
+      "files_verified": 3
+    },
+    "runtime-redesign/prefill-comparison-r1": {
+      "manifest_sha256": "edcce6af069a88ed5fc3a6333259a1b374148ff9d4168732748508cd05c1f7ab",
+      "manifest_file_sha256": "297d12a84e5497f8250c520af00ea9cc3ddc57bdc4074f23a28142572fe94fe6",
+      "files_verified": 3
+    },
+    "runtime-redesign/decode-baseline-r1": {
+      "manifest_sha256": "5dd7b09e0bd5aea14510c0c4b88a283cb0d1e843d4e33ca7eec70aacad4b957d",
+      "manifest_file_sha256": "d2b04f21cd3df9e0fad57094e5463788b653dacc566145f9e1b0f461ba6b52fd",
+      "files_verified": 51
+    },
+    "runtime-redesign/decode-baseline-system-r1": {
+      "manifest_sha256": "0729264c8385d8abd3ed79c648eb02a05a061d509bf8f7706aa4869f348c1c69",
+      "manifest_file_sha256": "fab046375e8aa971d0d54dcd1305ec114341bb4781e8f8f793bd1ef646c7a10d",
+      "files_verified": 51
+    },
+    "runtime-redesign/decode-graph-native-r1": {
+      "manifest_sha256": "b5c07ed73865c1bea99a07e55e57cf356ec6a410a85a70c52a0844465fcf15c2",
+      "manifest_file_sha256": "f7c558414cfdbf9a15c784afd2c2aae24cf57ce0f7352e52f68860f68c39535b",
+      "files_verified": 54
+    },
+    "runtime-redesign/native-service-check-r2": {
+      "manifest_sha256": "1da980634de1a070474d48fcde240148621143f13e7382340c451ffc68fc7f55",
+      "manifest_file_sha256": "d0f65b5fd285b533d8d12283cfe321f584c6585fd83088d323c333c13d5cedb5",
+      "files_verified": 18
+    }
+  },
+  "historical_image": {
+    "rank0": "sha256:fda0fd530a93a347d2ed6fe5e54195f1379975f770c7a30d1939456925018b20",
+    "note": "Local image ID, not a pullable registry digest."
+  },
+  "base_preimages": {
+    "/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/cudagraph_utils.py": "211de2232fb71aeb761dedbd7fadb7e0832db9331eac6951a1eafb6d77f1be9c",
+    "/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py": "33e49f3bd99e642971cea41bbcc73677cb74b863dbf16998d9ebfc94607a64e6",
+    "/usr/lib/python3.12/sitecustomize.py": "e2dd179fb447bc70db4cf46b211b554be7abcddcb865095f839e407c7783cc68"
+  }
+}
