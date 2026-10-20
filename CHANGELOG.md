@@ -93,6 +93,12 @@
 - Fat-path scratch cache grew one full set per (cap, k_words, up_words) key
   inside a single long prefill: 4.6 GiB, against the 240 MiB the run needs.
   Now one set per device, dropped on insert.
+- The `ngram_dequant` call site now matches the loaded exllamav3 extension's arity. The binding takes a
+  required trailing `rotate` bool (verified on the 1.4.9 and 1.6.0 cores; the bare `m.def` exposes no
+  default for it), and the call site passed five arguments — every ext-kernel n-gram decode raised
+  `TypeError`. The arity is probed once at weight load (a 6-arg probe call; `TypeError` selects the
+  5-arg form, any other failure falls back to the torch decoder), so one wheel serves both core
+  generations. Verified end-to-end serving GLM-5.3-Flash EXL3 on exllamav3 1.6.0 (B200).
 
 ## 0.5.0 (2026-09-25)
 
