@@ -45,29 +45,31 @@ def install_physical_fused_k_compat(exl3_module: Any) -> None:
         return
 
     def wrapped(layer: Any, inners: list[dict[str, Any]]) -> None:
-        mixed_k = bool(getattr(layer, "_exl3_mixed_k", False))
-        if not mixed_k:
-            physical = _physical_k_values(inners)
-            if len(physical) != 1:
-                raise RuntimeError(
-                    "EXL3 fused MoE requires one physical K across gate/up/down and "
-                    f"all local experts; loaded K values={sorted(physical)}"
-                )
-            physical_k = next(iter(physical))
-            if not 1 <= physical_k <= 8:
-                raise RuntimeError(
-                    f"EXL3 fused MoE physical K={physical_k} is outside K1-K8"
-                )
+        physical = _physical_k_values(inners)
+        # [LAB PATCH 2026-10-06] The uniformity requirement exists because the
+        # scalar fused launches interpret every trellis with one width. The
+        # native multi-K kernel (p2b_fused_moe_mk) reads per-expert K tables
+        # from the device, so a physically mixed layer is legitimate whenever
+        # that kernel is compiled in.
+        mixed_native = len(physical) != 1 and bool(
+            getattr(
+                exl3_module, "_native_moe_mixed_kernel_available", lambda: False
+            )()
+        )
+        if len(physical) != 1 and not mixed_native:
+            raise RuntimeError(
+                "EXL3 fused MoE requires one physical K across gate/up/down and "
+                f"all local experts; loaded K values={sorted(physical)}"
+            )
+        physical_k = next(iter(physical)) if len(physical) == 1 else max(physical)
+        if not 1 <= physical_k <= 8:
+            raise RuntimeError(
+                f"EXL3 fused MoE physical K={physical_k} is outside K1-K8"
+            )
 
         original(layer, inners)
-
-        if mixed_k:
-            # Mixed-K layers carry per-expert K arrays and per-K-group dispatch
-            # tables installed by the original builder; the scalar fused K is
-            # intentionally invalid there. Enforcing one physical K here would
-            # reject every heterogeneous pack (e.g. NemotronH up-K4/down-K5).
+        if mixed_native and getattr(layer, "_exl3_mixed_native_mk", False):
             return
-
         configured = int(getattr(layer, "_exl3_bits", physical_k))
         layer._exl3_k = physical_k
         layer._exl3_physical_fused_k = physical_k
