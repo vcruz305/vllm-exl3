@@ -5,6 +5,7 @@ use the fused fast path; heterogeneous packed K falls back to python_loop).
 exl3 packs quantized to a fractional average (3.05 bpw) assign K per tensor.
 This reads every safetensors header (no tensor data) and reports:
   - per MoE layer: the set of K values across experts for gate/up/down (uniform or not)
+  - per MTP MoE layer: the set of K values across MTP experts (`mtp_expert_k_per_layer`)
   - per dense linear (attention, dense MLP, shared expert, lm_head): K and suffixes
   - row-wise n-gram embedding tables (exllamav3 ngram format): shard count, rows, K, aux tensors
   - every tensor suffix seen per module family, so extra tensors the plugin ignores show up
@@ -47,6 +48,7 @@ def main():
     out = args.out or os.path.join(args.pack, "pack_scan.json")
 
     layer_re = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+    mtp_layer_re = re.compile(r"(?:^|\.)mtp\.layers\.(\d+)\.")
     expert_re = re.compile(r"\.experts\.(\d+)\.(\w+)\.(\w+)$")
     ngram_re = re.compile(r"^(.*)\.shard_(\d+)\.trellis$")
     tensors = list(headers(args.pack))
@@ -103,6 +105,7 @@ def main():
 
     families = collections.defaultdict(set)      # module family -> suffixes seen
     expert_k = collections.defaultdict(lambda: collections.defaultdict(set))  # layer -> proj -> {K}
+    mtp_expert_k = collections.defaultdict(lambda: collections.defaultdict(set))  # mtp_layer -> proj -> {K}
     dense_k = {}                                   # module prefix -> K
     misc = collections.Counter()
     total = 0
@@ -118,7 +121,14 @@ def main():
         else:
             k = None
         m = expert_re.search(name)
+        mtp_lm = mtp_layer_re.search(name)
         lm = layer_re.search(name)
+        if m and mtp_lm:
+            mtp_layer, proj, suffix = int(mtp_lm.group(1)), m.group(2), m.group(3)
+            families[f"mtp.layers.N.experts.E.{proj}"].add(suffix)
+            if k is not None:
+                mtp_expert_k[mtp_layer][proj].add(k)
+            continue
         if m and lm:
             layer, proj, suffix = int(lm.group(1)), m.group(2), m.group(3)
             families[f"layers.N.experts.E.{proj}"].add(suffix)
@@ -145,6 +155,13 @@ def main():
                 nonuniform.append((layer, proj, ks))
         per_layer[layer] = row
 
+    mtp_per_layer = {}
+    for layer in sorted(mtp_expert_k):
+        row = {}
+        for proj in sorted(mtp_expert_k[layer]):
+            row[proj] = sorted(mtp_expert_k[layer][proj])
+        mtp_per_layer[layer] = row
+
     dense_by_fam = collections.defaultdict(collections.Counter)
     for base, k in dense_k.items():
         dense_by_fam[re.sub(r"\.\d+\.", ".N.", base)][k] += 1
@@ -154,6 +171,7 @@ def main():
         "tensors": total,
         "moe_layers": len(per_layer),
         "expert_k_per_layer": {str(l): r for l, r in per_layer.items()},
+        "mtp_expert_k_per_layer": {str(l): r for l, r in mtp_per_layer.items()},
         "expert_k_nonuniform": [{"layer": l, "proj": p, "ks": ks} for l, p, ks in nonuniform],
         "dense_k_by_family": {f: dict(c) for f, c in sorted(dense_by_fam.items())},
         "dense_k_by_prefix": dense_k,
@@ -164,12 +182,14 @@ def main():
     }
     json.dump(summary, open(out, "w"), indent=1)
 
-    print(f"tensors={total} moe_layers={len(per_layer)} nonuniform_expert_layers={len(nonuniform)}")
+    print(f"tensors={total} moe_layers={len(per_layer)} mtp_moe_layers={len(mtp_per_layer)} nonuniform_expert_layers={len(nonuniform)}")
     kd = collections.Counter()
     for l, r in per_layer.items():
         for p, ks in r.items():
             kd[tuple(ks)] += 1
     print("expert K distribution (per layer/proj):", dict(kd))
+    if mtp_per_layer:
+        print("MTP expert K per layer:", mtp_per_layer)
     if nonuniform:
         print(
             "NONUNIFORM expert K within a layer "

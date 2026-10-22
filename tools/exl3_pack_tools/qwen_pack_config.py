@@ -86,32 +86,54 @@ def main():
     base = collections.Counter(layer_k.values()).most_common(1)[0][0]
     layer_bits = {str(l): k for l, k in sorted(layer_k.items()) if k != base}
 
+    n_main = int(holder.get("num_hidden_layers") or cfg.get("num_hidden_layers") or 0)
+    mtp_expert_k = scan.get("mtp_expert_k_per_layer") or {}
+    for ml_str, row in sorted(mtp_expert_k.items(), key=lambda kv: int(kv[0])):
+        vals = []
+        for proj in row:
+            vals.extend(row[proj])
+        if not vals:
+            continue
+        rep = int(collections.Counter(vals).most_common(1)[0][0])
+        ml = int(ml_str)
+        layer_bits[f"mtp.layers.{ml}"] = rep
+        if n_main:
+            layer_bits[str(n_main + ml)] = rep
+
     # vLLM fuses some checkpoint projections into one module (packed_modules_mapping in
-    # qwen4_exp), and its module prefixes differ from checkpoint names, so emit the map under
-    # every plausible name: raw checkpoint prefix, the fused module it lands in, and both the
-    # checkpoint root and the vLLM-side root. Extra keys are harmless; a missing one leaves a
-    # layer unquantized and the load fails on a missing .weight.
+    # qwen4_exp / qwen3_5), and its module prefixes differ from checkpoint names, so emit
+    # the map under every plausible name: raw checkpoint prefix, the fused module it lands in,
+    # and both the checkpoint root and the vLLM-side root. Extra keys are harmless; a missing
+    # one leaves a layer unquantized and the load fails on a missing .weight.
+    # For visual blocks, checkpoints may carry BOTH unquantized BF16 attn.qkv.{weight,bias}
+    # and split EXL3 attn.{q,k,v}_proj.*; keep visual attn.qkv unquantized BF16 by skipping
+    # split visual q/k/v_proj prefixes here.
     fused = {
-        "q_proj": "qkv_proj", "k_proj": "qkv_proj", "v_proj": "qkv_proj",
+        "q_proj": "qkv_proj", "k_proj": "k_proj", "v_proj": "v_proj",
         "gate_proj": "gate_up_proj", "up_proj": "gate_up_proj",
         "in_proj_qkv": "in_proj_qkvz", "in_proj_z": "in_proj_qkvz",
         "in_proj_b": "in_proj_ba", "in_proj_a": "in_proj_ba",
         "key_proj": "kv_proj", "value_proj": "kv_proj",
     }
+    fused["k_proj"] = "qkv_proj"
+    fused["v_proj"] = "qkv_proj"
     roots = [("model.language_model.", "language_model.model."),
              ("model.language_model.", "model."),
              ("model.visual.", "visual."), ("model.visual.", "vision_model.")]
-    # vLLM numbers the MTP draft's layers after the main stack (checkpoint mtp.layers.0 is
-    # module mtp.layers.<num_hidden_layers>), so emit those names too.
-    n_main = int(holder.get("num_hidden_layers") or cfg.get("num_hidden_layers") or 0)
+    # vLLM numbers the MTP draft's layers after the main stack in some models (mtp.layers.<n_main>)
+    # and under mtp.layers.0 / mtp.fc (remapped to model.fc) in Qwen3_5MoeMTP, so emit all forms.
     mtp_re = re.compile(r"^mtp\.layers\.(\d+)\.")
     dense_layers = {}
     suffixes = set()
     for prefix, k in scan["dense_k_by_prefix"].items():
-        variants = {prefix}
         head, _, leaf = prefix.rpartition(".")
+        if "visual." in prefix and leaf in ("q_proj", "k_proj", "v_proj", "qkv"):
+            continue
+        variants = {prefix}
         if leaf in fused:
             variants.add(f"{head}.{fused[leaf]}")
+        if prefix == "mtp.fc":
+            variants.add("model.fc")
         for v in list(variants):
             for src, dst in roots:
                 if v.startswith(src):
@@ -126,14 +148,23 @@ def main():
             tail = v.split(".")
             suffixes.add(".".join(tail[-2:]) if len(tail) >= 2 else v)
 
-    codebook = str(q.get("codebook", "mcg"))
+    suffixes_by_fam = scan.get("suffixes_by_family") or {}
+    has_mul1 = any("mul1" in s for s in suffixes_by_fam.values())
+    default_codebook = "mul1" if has_mul1 else "mcg"
+    codebook = str(q.get("codebook") or default_codebook)
+    head_bits = int(
+        q.get("head_bits")
+        or scan["dense_k_by_prefix"].get("lm_head")
+        or scan["dense_k_by_prefix"].get("model.language_model.lm_head")
+        or 16
+    )
     k_counts = collections.Counter(int(k) for k in scan["dense_k_by_prefix"].values())
     dense_default = k_counts.most_common(1)[0][0]
     new_q = {
         "quant_method": "exl3",
         "bits": int(base),
         "codebook": codebook,
-        "head_bits": int(q.get("head_bits", 16)),
+        "head_bits": head_bits,
         "scope": "native_all_linears",
         "layer_bits": layer_bits,
         "non_routed_exl3": {

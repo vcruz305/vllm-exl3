@@ -114,7 +114,9 @@ MUL1_MARKER_SIGNED_INT32 = -2082680531
 EXL3_SUFFIXES = ("trellis", "suh", "svh", "mcg", "mul1")
 SWIGLU_LIMIT_DEFAULT = 10.0
 TEMP_ROWS_FUSED = 2048
-_COOP = os.environ.get("VLLM_EXL3_COOP", "0") == "1"
+_COOP = os.environ.get("VLLM_EXL3_COOP", "1") == "1"
+_COOP_SLOTS_MAX = 256
+_COOP_ROWS_MAX = 32
 try:
     FAT_EXPERT_THRESHOLD = max(0, int(os.environ.get("VLLM_EXL3_FAT_THRESHOLD", "256")))
 except (TypeError, ValueError):
@@ -126,6 +128,33 @@ MOE_ACT_SILU = 0
 MOE_ACT_RELU2_NOGATE = 2
 # Shared fused scratch: decode is sequential across layers.
 _FUSED_TEMP_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+_COOP_TEMP_CACHE: dict[tuple, Any] = {}
+
+
+def _get_coop_temps(dev, hidden: int, inter_dim: int, tokens: int):
+    coop_key = (str(dev), hidden, inter_dim)
+    coop_temps = _COOP_TEMP_CACHE.get(coop_key)
+    if coop_temps is None:
+        had_g = torch.empty((_COOP_SLOTS_MAX, hidden), dtype=torch.float16, device=dev)
+        had_u = torch.empty_like(had_g)
+        gu_g = torch.empty((_COOP_SLOTS_MAX, 1, inter_dim), dtype=torch.float16, device=dev)
+        gu_u = torch.empty_like(gu_g)
+        act_out = torch.empty_like(gu_g)
+        d_out = torch.empty((_COOP_SLOTS_MAX, 1, hidden), dtype=torch.float32, device=dev)
+        coop_temps = (had_g, had_u, gu_g, gu_u, act_out, d_out)
+        _COOP_TEMP_CACHE[coop_key] = coop_temps
+    else:
+        had_g, had_u, gu_g, gu_u, act_out, d_out = coop_temps
+    ctr_key = (str(dev), hidden, inter_dim, tokens)
+    ctr = _COOP_TEMP_CACHE.get(ctr_key)
+    if ctr is None:
+        ctr = torch.zeros(
+            _COOP_SLOTS_MAX * (inter_dim // 128) + tokens * (hidden // 128) + 2 * _COOP_SLOTS_MAX + 3,
+            dtype=torch.int32,
+            device=dev,
+        )
+        _COOP_TEMP_CACHE[ctr_key] = ctr
+    return had_g, had_u, gu_g, gu_u, act_out, d_out, ctr
 
 # The schedule is deliberately expressed as inclusive ranges.  Keeping the
 # policy here (rather than in a serving script) lets vLLM callers use the same
@@ -638,6 +667,16 @@ def _try_prescan_trellis_shapes(
     model_dir = os.environ.get("VLLM_ENGRAM_MODEL_DIR") or os.environ.get(
         "VLLM_EXL3_MODEL_DIR"
     )
+    if not model_dir and _VLLM_AVAILABLE:
+        try:
+            from vllm.config import get_current_vllm_config
+            _vcfg = get_current_vllm_config()
+            if _vcfg is not None and getattr(_vcfg, "model_config", None) is not None:
+                _cand_dir = getattr(_vcfg.model_config, "model", None)
+                if _cand_dir and os.path.isdir(str(_cand_dir)):
+                    model_dir = str(_cand_dir)
+        except Exception:
+            pass
     if not model_dir:
         return None
     try:
@@ -671,44 +710,49 @@ def _try_prescan_trellis_shapes(
     )
     # EP linear placement: local e <-> global offset+e
     # NemotronH packs store experts under ...mixer.experts (up/down only,
-    # gateless relu2); the historical layout is ...ffn.experts (gate/up/down).
+    # gateless relu2); Qwen3.5/Ornith uses ...mlp.experts; historical layout is ...ffn.experts.
     base_name = layer_name
-    for cand in ("ffn.experts", "mixer.experts"):
+    for cand in ("ffn.experts", "mixer.experts", "mlp.experts"):
         if cand in base_name:
             prefix = f"layers.{layer_id}.{cand}."
             break
     else:
         prefix = f"layers.{layer_id}.ffn.experts."
-    # DSpark builds its draft layers as ``model.layers.<num_hidden_layers + i>``
-    # while the checkpoint names them ``mtp.<i>``; without this the prescan
-    # misses every draft expert and the load falls back to host staging.
-    prefixes = [prefix]
+    prefixes = []
+    if "mtp.layers." in base_name:
+        prefixes.append(f"mtp.{prefix}")
+    prefixes.append(prefix)
     _nhl = _main_stack_num_layers(model_dir)
     if _nhl is not None and layer_id >= _nhl:
         prefixes.append(f"mtp.{layer_id - _nhl}.ffn.experts.")
+        prefixes.append(f"mtp.layers.{layer_id - _nhl}.mlp.experts.")
     gateless = moe_layer_is_gateless(layer)
-    # Checkpoint-side names: the historical layout stores gate/up/down as
-    # w1/w3/w2; NemotronH stores up_proj/down_proj (no gate). vLLM maps both
-    # onto shard ids w1/w3/w2 at load time; the prescan reads the raw index.
-    ckpt_names = {"up": "up_proj", "down": "down_proj"} if gateless else {
-        "gate": "w1", "up": "w3", "down": "w2",
-    }
+    ckpt_names = (
+        {"up": ("up_proj",), "down": ("down_proj",)}
+        if gateless
+        else {
+            "gate": ("w1", "gate_proj"),
+            "up": ("w3", "up_proj"),
+            "down": ("w2", "down_proj"),
+        }
+    )
     shapes: dict[str, dict[int, tuple[int, ...]]] = {
         "gate": {},
         "up": {},
         "down": {},
     }
-    # Gather keys per local expert. Standalone-saved packs keep the raw
-    # `backbone.` prefix on disk (the loader shim rewrites names only in the
-    # streaming iterator), so accept both raw prefix forms.
+    raw_prefixes = ("", "backbone.") if "mtp.layers." in base_name else ("", "backbone.", "model.language_model.", "model.")
     for local_e in range(int(num_experts)):
         global_e = offset + local_e
-        for proj, ckpt_name in ckpt_names.items():
+        for proj, ckpt_cands in ckpt_names.items():
             shard = None
             for _p in prefixes:
-                for raw_prefix in ("", "backbone."):
-                    key = f"{raw_prefix}{_p}{global_e}.{ckpt_name}.trellis"
-                    shard = weight_map.get(key)
+                for raw_prefix in raw_prefixes:
+                    for ckpt_name in ckpt_cands:
+                        key = f"{raw_prefix}{_p}{global_e}.{ckpt_name}.trellis"
+                        shard = weight_map.get(key)
+                        if shard is not None:
+                            break
                     if shard is not None:
                         break
                 if shard is not None:
@@ -1824,29 +1868,29 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
     layer._exl3_fused_temps = temps
     layer._exl3_fused_concurrency = concurrency
     if mixed_k:
-        # Per-expert K arrays for exl3_moe_mixedk; scalar _exl3_k is invalid.
+        # Per-expert K arrays for exl3_moe_mixedk use half-bit units K2 = 2 * K (shape[-1] // 8).
         layer._exl3_k = None
         layer._exl3_mixedk_unified = True
         k_gate = (
             torch.tensor(
-                [int(pack["up"].trellis.shape[-1]) // 16 for pack in inners],
+                [int(pack["up"].trellis.shape[-1]) // 8 for pack in inners],
                 dtype=torch.int32,
                 device=device,
             )
             if gateless
             else torch.tensor(
-                [int(pack["gate"].trellis.shape[-1]) // 16 for pack in inners],
+                [int(pack["gate"].trellis.shape[-1]) // 8 for pack in inners],
                 dtype=torch.int32,
                 device=device,
             )
         )
         k_up = torch.tensor(
-            [int(pack["up"].trellis.shape[-1]) // 16 for pack in inners],
+            [int(pack["up"].trellis.shape[-1]) // 8 for pack in inners],
             dtype=torch.int32,
             device=device,
         )
         k_down = torch.tensor(
-            [int(pack["down"].trellis.shape[-1]) // 16 for pack in inners],
+            [int(pack["down"].trellis.shape[-1]) // 8 for pack in inners],
             dtype=torch.int32,
             device=device,
         )
@@ -1883,18 +1927,25 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
             layer._exl3_kdesc.numel(), dtype=torch.int32, device=device
         )
         # Per-K-group dispatch (the GB10-qualified path): experts bucketed by
-        # their (K_gate, K_up, K_down) tuple; each bucket runs one uniform-K
+        # their integer (K_gate, K_up, K_down) tuple; each bucket runs one uniform-K
         # exl3_moe launch. The unified mixedk kernel is known to fault on
         # sm_121 (GB10) at layer 23; grouped dispatch avoids it entirely.
         groups: dict[tuple[int, int, int], list[int]] = {}
         for e, pack in enumerate(inners):
-            kg = int(k_gate[e].item())
-            ku = int(k_up[e].item())
-            kd = int(k_down[e].item())
+            kg = int(pack["up"].trellis.shape[-1] if gateless else pack["gate"].trellis.shape[-1]) // 16
+            ku = int(pack["up"].trellis.shape[-1]) // 16
+            kd = int(pack["down"].trellis.shape[-1]) // 16
             groups.setdefault((kg, ku, kd), []).append(e)
         layer._exl3_k_groups = [
             (k_tuple, ids) for k_tuple, ids in sorted(groups.items())
         ]
+        if len(layer._exl3_k_groups) == 1:
+            _kt = layer._exl3_k_groups[0][0]
+            layer._exl3_k_tuple = _kt
+            layer._exl3_coop_compat = bool((not gateless) and _kt[0] == _kt[1])
+        else:
+            layer._exl3_k_tuple = None
+            layer._exl3_coop_compat = False
         # CUDA-graph-safe dispatch state, built once here (never per step):
         #   * one device id tensor per K group, so the forward issues no H2D copy
         #   * the group ordinal of every expert, so membership is a gather+compare
@@ -1946,9 +1997,36 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
             layer._exl3_packed_id = _pid
             layer._exl3_group_ranges = _ranges
     else:
-        layer._exl3_k = int(layer._exl3_bits)
+        _k_uni = int(layer._exl3_bits)
+        layer._exl3_k = _k_uni
+        layer._exl3_k_tuple = (_k_uni, _k_uni, _k_uni)
+        layer._exl3_coop_compat = not gateless
         layer._exl3_mixedk_unified = False
         layer._exl3_k_groups = None
+
+    if (
+        getattr(layer, "_exl3_coop_compat", False)
+        and device.type == "cuda"
+        and hidden % 128 == 0
+        and intermediate % 128 == 0
+    ):
+        coop_key = (str(device), hidden, intermediate)
+        if coop_key not in _COOP_TEMP_CACHE:
+            had_g = torch.empty((_COOP_SLOTS_MAX, hidden), dtype=torch.float16, device=device)
+            had_u = torch.empty_like(had_g)
+            gu_g = torch.empty((_COOP_SLOTS_MAX, 1, intermediate), dtype=torch.float16, device=device)
+            gu_u = torch.empty_like(gu_g)
+            act_out = torch.empty_like(gu_g)
+            d_out = torch.empty((_COOP_SLOTS_MAX, 1, hidden), dtype=torch.float32, device=device)
+            _COOP_TEMP_CACHE[coop_key] = (had_g, had_u, gu_g, gu_u, act_out, d_out)
+        for _r in range(1, _COOP_ROWS_MAX + 1):
+            ctr_key = (str(device), hidden, intermediate, _r)
+            if ctr_key not in _COOP_TEMP_CACHE:
+                _COOP_TEMP_CACHE[ctr_key] = torch.zeros(
+                    _COOP_SLOTS_MAX * (intermediate // 128) + _r * (hidden // 128) + 2 * _COOP_SLOTS_MAX + 3,
+                    dtype=torch.int32,
+                    device=device,
+                )
 
 
 def _native_moe_dimensions_supported(
@@ -2448,60 +2526,23 @@ def apply_exl3_fused_moe(
 
     local = map_topk_to_local(ids, n_exp, expert_map)
     topk = int(ids.shape[-1])
-    flat_token = torch.arange(tokens, device=x2d.device, dtype=torch.long).repeat_interleave(topk)
-    flat_weight = weights.reshape(-1).to(dtype=torch.float16)
-    # scatter_add stays on GPU. torch.bincount can host-stage and break CUDA graphs.
-    expert_count = torch.zeros(n_exp + 1, dtype=torch.long, device=local.device)
-    expert_count.scatter_add_(
-        0, local.long(), torch.ones(local.shape, dtype=torch.long, device=local.device)
-    )
-    out = torch.zeros(tokens, hidden, dtype=torch.float32, device=x2d.device)
     xh = x2d.contiguous().half()
 
-    counts = expert_count[:n_exp]
-
-    if tokens > TEMP_ROWS_FUSED and bool((counts > TEMP_ROWS_FUSED).any().item()):
-        logger.info_once("EXL3 fat-chunk slicing ACTIVE (tokens=%d)" % tokens)
-        # Deep-context prefill chunks can route more than TEMP_ROWS_FUSED rows
-        # to a single expert. The fused kernel covers at most TEMP_ROWS_FUSED
-        # rows per expert, and the old fallback reconstructed whole experts
-        # per chunk, stalling prefill by orders of magnitude past ~160k
-        # context (the ">163k hang"). Within a slice of <= TEMP_ROWS_FUSED
-        # tokens no expert can exceed TEMP_ROWS_FUSED rows (each token adds at
-        # most one row per expert), so re-run the fused path per slice.
-        # Prefill-only: decode batches are at most the largest capture size,
-        # far below TEMP_ROWS_FUSED, and never reach this host sync.
-        for s in range(0, tokens, TEMP_ROWS_FUSED):
-            e = min(s + TEMP_ROWS_FUSED, tokens)
-            out[s:e] = apply_exl3_fused_moe(
-                x2d[s:e], ids[s:e], weights[s:e], layer, inners, expert_map, limit
-            )
-        return out
-
-    fat = counts > FAT_EXPERT_THRESHOLD
-    # counts[e] cannot exceed the row count, so with no more rows than the
-    # threshold no expert can be fat. Testing that Python-side first keeps the
-    # device sync below off the decode path, where graph capture forbids it.
-    fat_possible = tokens > FAT_EXPERT_THRESHOLD
-    fat_route = torch.zeros_like(local, dtype=torch.bool)
-    if fat_possible and bool(fat.any().item()):
-        safe_local = local.clamp(min=0, max=max(n_exp - 1, 0))
-        fat_route = (local < n_exp) & fat.index_select(0, safe_local)
-
     # exl3_moe_coop fast path (exllamav3 >= 1.5.0): decode-shaped batches only —
-    # the slot scratch is capped at 256, i.e. tokens <= 42 at topk 6, which covers
-    # single-stream speculation and light-concurrency traffic. Larger batches and
-    # fat routes fall through to the stock path below.
-    # Mixed-K layers skip coop and use the mixedk kernel instead.
-    # Gateless (relu2) layers also skip coop: the cooperative kernels implement
-    # the gated silu/gelu pair only.
+    # slot scratch is capped at 256 (tokens <= 32 at topk 8). Uniform-expert layers
+    # (including asymmetric Kg == Ku != Kd) run here before any argsort/scatter_add_.
+    coop_compat = getattr(
+        layer,
+        "_exl3_coop_compat",
+        (not is_mixedk) and (not getattr(layer, "_exl3_gateless", False)),
+    )
     if (
         _COOP
-        and not is_mixedk
-        and not getattr(layer, "_exl3_gateless", False)
-        and tokens * topk <= 256
+        and coop_compat
+        and tokens * topk <= _COOP_SLOTS_MAX
+        and tokens <= FAT_EXPERT_THRESHOLD
+        and tokens <= TEMP_ROWS_FUSED
         and hasattr(exllamav3_ext, "exl3_moe_coop")
-        and not (fat_possible and bool(fat.any().item()))
     ):
         flags = getattr(layer, "_exl3_codebook_flags", _MCG_CODEBOOK_FLAGS)
         mcg, mul1 = bool(flags[0]), bool(flags[1])
@@ -2511,23 +2552,17 @@ def apply_exl3_fused_moe(
             and hidden % 128 == 0
             and inter_dim % 128 == 0
         ):
-            k = int(getattr(layer, "_exl3_k", 4))
-            slots = tokens * topk
-            smax = 4 * slots  # split-k partial rows, per tests/test_moe_coop.py
+            k_tuple = getattr(layer, "_exl3_k_tuple", None)
+            if k_tuple is None:
+                k_val = int(getattr(layer, "_exl3_k", 4) or 4)
+                kg = ku = kd = k_val
+            else:
+                kg, ku, kd = int(k_tuple[0]), int(k_tuple[1]), int(k_tuple[2])
             dev = x2d.device
+            out = torch.empty(tokens, hidden, dtype=torch.float32, device=dev)
             sel_c = local.reshape(tokens, topk).to(torch.int64).contiguous()
-            rw_c = flat_weight.reshape(tokens, topk).contiguous()
-            had_g = torch.empty((slots, hidden), dtype=torch.float16, device=dev)
-            had_u = torch.empty_like(had_g)
-            gu_g = torch.empty((smax, 1, inter_dim), dtype=torch.float16, device=dev)
-            gu_u = torch.empty_like(gu_g)
-            act_out = torch.empty_like(gu_g)
-            d_out = torch.empty((smax, 1, hidden), dtype=torch.float32, device=dev)
-            ctr = torch.zeros(
-                smax * (inter_dim // 128) + tokens * (hidden // 128) + 2 * smax + 3,
-                dtype=torch.int32,
-                device=dev,
-            )
+            rw_c = weights.reshape(tokens, topk).to(dtype=torch.float16).contiguous()
+            had_g, had_u, gu_g, gu_u, act_out, d_out, ctr = _get_coop_temps(dev, hidden, inter_dim, tokens)
             # Kernel contract: min_expert=-1 disables range filtering and
             # indexes pointer tables by raw sel. Plugin sentinels are
             # n_exp (non-local / EP). Pass [0, n_exp) so those routes
@@ -2538,13 +2573,42 @@ def apply_exl3_fused_moe(
                 ptrs["up_trellis"], ptrs["up_suh"], ptrs["up_svh"],
                 ptrs["down_trellis"], ptrs["down_suh"], ptrs["down_svh"],
                 None, None, None,
-                k, k, k, mcg, mul1, MOE_ACT_SILU,
+                kg, ku, kd, mcg, mul1, MOE_ACT_SILU,
                 float(limit) if (limit is not None and limit > 0) else 0.0,
                 True,
                 had_g, had_u, gu_g, gu_u, act_out, d_out, ctr, out,
                 None, None,
             )
             return out
+
+    flat_token = torch.arange(tokens, device=x2d.device, dtype=torch.long).repeat_interleave(topk)
+    flat_weight = weights.reshape(-1).to(dtype=torch.float16)
+    # scatter_add stays on GPU. torch.bincount can host-stage and break CUDA graphs.
+    expert_count = torch.zeros(n_exp + 1, dtype=torch.long, device=local.device)
+    expert_count.scatter_add_(
+        0, local.long(), torch.ones(local.shape, dtype=torch.long, device=local.device)
+    )
+    out = torch.zeros(tokens, hidden, dtype=torch.float32, device=x2d.device)
+
+    counts = expert_count[:n_exp]
+
+    _capturing = bool(torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
+    if (not _capturing) and tokens > TEMP_ROWS_FUSED and bool((counts > TEMP_ROWS_FUSED).any().item()):
+        logger.info_once("EXL3 fat-chunk slicing ACTIVE (tokens=%d)" % tokens)
+        for s in range(0, tokens, TEMP_ROWS_FUSED):
+            e = min(s + TEMP_ROWS_FUSED, tokens)
+            out[s:e] = apply_exl3_fused_moe(
+                x2d[s:e], ids[s:e], weights[s:e], layer, inners, expert_map, limit
+            )
+        return out
+
+    fat_possible = (not _capturing) and (tokens > FAT_EXPERT_THRESHOLD)
+    fat_route = torch.zeros_like(local, dtype=torch.bool)
+    if fat_possible:
+        fat = counts > FAT_EXPERT_THRESHOLD
+        if bool(fat.any().item()):
+            safe_local = local.clamp(min=0, max=max(n_exp - 1, 0))
+            fat_route = (local < n_exp) & fat.index_select(0, safe_local)
 
     # The standard kernel handles non-fat routes. Fat routes are represented by
     # the invalid sentinel with zero weight here and are dispatched exactly once
@@ -2582,7 +2646,8 @@ def apply_exl3_fused_moe(
     if moe_act is None:
         moe_act = resolve_moe_act(layer)
 
-    if is_mixedk and hasattr(exllamav3_ext, "exl3_moe_mixedk"):
+    k_tuple_single = getattr(layer, "_exl3_k_tuple", None)
+    if is_mixedk and k_tuple_single is None and hasattr(exllamav3_ext, "exl3_moe_mixedk"):
         k_groups = getattr(layer, "_exl3_k_groups", None)
         mode = os.environ.get("VLLM_EXL3_MIXEDK_MODE", "").strip().lower()
         grouped_default = _exl3_mixedk_grouped_default()
@@ -2756,7 +2821,11 @@ def apply_exl3_fused_moe(
         else:
             fn_mk(*args_mk)
     else:
-        k = int(getattr(layer, "_exl3_k", 4))
+        if k_tuple_single is not None:
+            kg, ku, kd = int(k_tuple_single[0]), int(k_tuple_single[1]), int(k_tuple_single[2])
+        else:
+            k = int(getattr(layer, "_exl3_k", 4) or 4)
+            kg = ku = kd = k
         args = (
             xh,
             out,
@@ -2768,9 +2837,9 @@ def apply_exl3_fused_moe(
             temps[2],
             temps[3],
             moe_act,
-            k,
-            k,
-            k,
+            kg,
+            ku,
+            kd,
             ptrs["gate_trellis"],
             ptrs["gate_suh"],
             ptrs["gate_svh"],
@@ -3019,8 +3088,9 @@ class Exl3Config(QuantizationConfig):
         # layers are shaped for their own K and would fail the load shape
         # check under the base K.
         raw_layer_bits = kwargs.pop("layer_bits", None) or {}
-        self.layer_bits: dict[int, int] = {
-            int(k): int(v) for k, v in dict(raw_layer_bits).items()
+        self.layer_bits: dict[int | str, int] = {
+            (int(k) if isinstance(k, int) or str(k).lstrip("-").isdigit() else str(k)): int(v)
+            for k, v in dict(raw_layer_bits).items()
         }
         for layer_idx, layer_k in self.layer_bits.items():
             if layer_k not in (2, 3, 4, 5, 6):
@@ -3115,15 +3185,25 @@ class Exl3Config(QuantizationConfig):
         return "exl3"
 
     _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+    _MTP_LAYER_RE = re.compile(r"(?:^|\.)(mtp\.layers\.\d+)(?:\.|$)")
 
     def bits_for_prefix(self, prefix: str) -> int:
         """Per-layer K: `layer_bits` entry for this layer, else the base K."""
         if not self.layer_bits:
             return self.bits
-        m = self._LAYER_RE.search(prefix or "")
+        p = prefix or ""
+        if p in self.layer_bits:
+            return self.layer_bits[p]
+        mm = self._MTP_LAYER_RE.search(p)
+        if mm is not None and mm.group(1) in self.layer_bits:
+            return self.layer_bits[mm.group(1)]
+        m = self._LAYER_RE.search(p)
         if m is None:
             return self.bits
-        return self.layer_bits.get(int(m.group(1)), self.bits)
+        idx = int(m.group(1))
+        if idx in self.layer_bits:
+            return self.layer_bits[idx]
+        return self.layer_bits.get(str(idx), self.bits)
 
     def _matches_non_routed_exl3(self, prefix: str) -> bool:
         """Check if prefix matches non_routed_exl3: either layers dict keys or modules list."""
@@ -4144,6 +4224,21 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         layer._exl3_inners = inners
         mixed_k = len(set(k_values)) > 1
         layer._exl3_mixed_k = mixed_k
+        k_tuples = {
+            (
+                int(pack["up"].trellis.shape[-1] if gateless else pack["gate"].trellis.shape[-1]) // 16,
+                int(pack["up"].trellis.shape[-1]) // 16,
+                int(pack["down"].trellis.shape[-1]) // 16,
+            )
+            for pack in inners
+        }
+        if len(k_tuples) == 1:
+            _kt = next(iter(k_tuples))
+            layer._exl3_k_tuple = _kt
+            layer._exl3_coop_compat = bool((not gateless) and _kt[0] == _kt[1])
+        else:
+            layer._exl3_k_tuple = None
+            layer._exl3_coop_compat = False
         # Codebook flags (mcg, mul1) per projection for the fused kernel launch;
         # every expert in a layer must agree. Gateless layers have no gate
         # projection: the up module's flags stand in for the gate slots (the
@@ -4172,6 +4267,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # whole layer. Heterogeneous packed K uses exl3_moe_mixedk when available,
         # otherwise falls back to the LinearEXL3 loop.
         backend = get_moe_kernel_backend()
+        explicit_native = os.environ.get("VLLM_EXL3_MOE_KERNEL", "").strip().lower() == "native"
         if mixed_k:
             # Check for the mixed-K fused kernel in exllamav3_ext.
             try:
@@ -4179,7 +4275,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 has_mixedk = _ext is not None and hasattr(_ext, "exl3_moe_mixedk")
             except Exception:
                 has_mixedk = False
-            if has_mixedk and (fused_moe_enabled() or backend == "native"):
+            if has_mixedk and fused_moe_enabled():
                 try:
                     build_exl3_fused_state(layer, inners)
                     fused_ok = True
@@ -4195,7 +4291,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 layer._exl3_fused_temps = None
                 layer._exl3_fused_concurrency = 0
                 layer._exl3_mixedk_unified = False
-        elif fused_moe_enabled() or backend == "native":
+        elif fused_moe_enabled() or explicit_native:
             try:
                 has_native = backend == "native" and native_moe_kernel_available()
                 has_exllamav3 = _exllamav3_moe_available()
@@ -4734,9 +4830,18 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
 # n-gram lookup run behind vLLM custom ops, looked up by a stable layer name.
 # ---------------------------------------------------------------------------
 
-_EXL3_OPAQUE_LAYERS: dict[str, Any] = {}
-_EXL3_OPAQUE_METHODS: dict[str, Any] = {}
-_EXL3_OPS_READY = False
+if _TORCH_AVAILABLE and torch is not None:
+    if not hasattr(torch.ops, "_exl3_opaque_layers"):
+        setattr(torch.ops, "_exl3_opaque_layers", {})
+    if not hasattr(torch.ops, "_exl3_opaque_methods"):
+        setattr(torch.ops, "_exl3_opaque_methods", {})
+    _EXL3_OPAQUE_LAYERS: dict[str, Any] = getattr(torch.ops, "_exl3_opaque_layers")
+    _EXL3_OPAQUE_METHODS: dict[str, Any] = getattr(torch.ops, "_exl3_opaque_methods")
+    _EXL3_OPS_READY = bool(getattr(torch.ops, "_exl3_ops_ready", False))
+else:
+    _EXL3_OPAQUE_LAYERS = {}
+    _EXL3_OPAQUE_METHODS = {}
+    _EXL3_OPS_READY = False
 
 
 def _exl3_register_opaque_layer(
@@ -4836,6 +4941,8 @@ def _exl3_register_custom_ops() -> bool:
         logger.warning("EXL3 custom op registration failed; eager fallback: %r", exc)
         return False
     _EXL3_OPS_READY = True
+    if _TORCH_AVAILABLE and torch is not None:
+        setattr(torch.ops, "_exl3_ops_ready", True)
     return True
 
 
@@ -5369,29 +5476,89 @@ class Exl3LinearMethod(LinearMethodBase):
                     f"expected {MUL1_MARKER_SIGNED_INT32}"
                 )
 
-        # Build LinearEXL3 objects for EXL3 shards only (skip bf16 shards)
+        # Build LinearEXL3 objects for EXL3 shards only (skip bf16 shards).
+        # Coalesce consecutive shards that share identical suh, K, and codebook markers
+        # (e.g. Qwen3.5/Ornith in_proj_qkvz shards 0, 1, 2 from fused in_proj_qkv).
+        padded = bool(getattr(layer, "_exl3_linear_padded", False))
+        coalesce_shards = (
+            n_shards > 1
+            and not bf16_shards
+            and not padded
+            and os.environ.get("VLLM_EXL3_COALESCE_SHARDS", "1") != "0"
+        )
         linears = []
-        for i in range(n_shards):
-            if i in bf16_shards:
-                # bf16 shards don't use LinearEXL3; store None as placeholder
-                linears.append(None)
-                continue
-            trellis_shard = layer._exl3_shard_trellis[i].detach().contiguous()
-            if trellis_shard.numel() == 0:
-                raise RuntimeError(
-                    f"EXL3 linear shard {i}: trellis payload never loaded"
+        if coalesce_shards:
+            i = 0
+            while i < n_shards:
+                t0 = layer._exl3_shard_trellis[i].detach().contiguous()
+                if t0.numel() == 0:
+                    raise RuntimeError(
+                        f"EXL3 linear shard {i}: trellis payload never loaded"
+                    )
+                suh0 = layer.suh[i].contiguous()
+                mcg0 = int(mcg_vals[i].item())
+                mul10 = int(mul1_vals[i].item())
+                k_words0 = int(t0.shape[-1])
+                j = i + 1
+                while j < n_shards:
+                    tj = layer._exl3_shard_trellis[j]
+                    if tj.numel() == 0:
+                        raise RuntimeError(
+                            f"EXL3 linear shard {j}: trellis payload never loaded"
+                        )
+                    if (
+                        int(tj.shape[-1]) == k_words0
+                        and int(mcg_vals[j].item()) == mcg0
+                        and int(mul1_vals[j].item()) == mul10
+                        and torch.equal(suh0, layer.suh[j])
+                    ):
+                        j += 1
+                    else:
+                        break
+                if j == i + 1:
+                    trellis_merged = t0
+                else:
+                    trellis_merged = torch.cat(
+                        [layer._exl3_shard_trellis[s].detach() for s in range(i, j)],
+                        dim=1,
+                    ).contiguous()
+                svh_merged = layer.svh[
+                    sum(output_sizes[:i]) : sum(output_sizes[:j])
+                ].contiguous()
+                mcg_shard = layer.mcg[i].contiguous() if mcg0 != 0 else None
+                mul1_shard = layer.mul1[i].contiguous() if mul10 != 0 else None
+                linear = make_linear_exl3(
+                    trellis_merged,
+                    suh0,
+                    svh_merged,
+                    mcg_shard,
+                    mul1_shard,
+                    out_dtype=torch.float16,
                 )
-            suh_shard = layer.suh[i].contiguous()
-            svh_shard = layer.svh[
-                sum(output_sizes[:i]) : sum(output_sizes[: i + 1])
-            ].contiguous()
-            mcg_shard = layer.mcg[i].contiguous() if mcg_vals[i].item() != 0 else None
-            mul1_shard = layer.mul1[i].contiguous() if mul1_vals[i].item() != 0 else None
+                linears.append(linear)
+                i = j
+        else:
+            for i in range(n_shards):
+                if i in bf16_shards:
+                    # bf16 shards don't use LinearEXL3; store None as placeholder
+                    linears.append(None)
+                    continue
+                trellis_shard = layer._exl3_shard_trellis[i].detach().contiguous()
+                if trellis_shard.numel() == 0:
+                    raise RuntimeError(
+                        f"EXL3 linear shard {i}: trellis payload never loaded"
+                    )
+                suh_shard = layer.suh[i].contiguous()
+                svh_shard = layer.svh[
+                    sum(output_sizes[:i]) : sum(output_sizes[: i + 1])
+                ].contiguous()
+                mcg_shard = layer.mcg[i].contiguous() if mcg_vals[i].item() != 0 else None
+                mul1_shard = layer.mul1[i].contiguous() if mul1_vals[i].item() != 0 else None
 
-            linear = make_linear_exl3(
-                trellis_shard, suh_shard, svh_shard, mcg_shard, mul1_shard, out_dtype=torch.float16
-            )
-            linears.append(linear)
+                linear = make_linear_exl3(
+                    trellis_shard, suh_shard, svh_shard, mcg_shard, mul1_shard, out_dtype=torch.float16
+                )
+                linears.append(linear)
 
         layer._exl3_linears = linears
         layer._exl3_opaque_name = _exl3_register_opaque_layer(layer, "linear", self)

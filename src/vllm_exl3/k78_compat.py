@@ -37,6 +37,16 @@ def _validate_k(value: object, label: str) -> int:
     return k
 
 
+def _norm_layer_key(key: object) -> int | str:
+    if isinstance(key, int):
+        return key
+    s = str(key)
+    try:
+        return int(s)
+    except ValueError:
+        return s
+
+
 def _sanitize_non_routed(raw: object) -> tuple[object, dict[str, Any] | None]:
     if not isinstance(raw, dict):
         return raw, None
@@ -84,12 +94,14 @@ def install_k78_config_compat(exl3_module: object) -> bool:
         if original_layer_bits is not None:
             if not isinstance(original_layer_bits, dict):
                 raise ValueError("layer_bits must be a mapping")
-            restored_layer_bits: dict[int, int] = {}
+            restored_layer_bits: dict[int | str, int] = {}
             safe_layer_bits = {}
-            for key, value in original_layer_bits.items():
+            for idx, (key, value) in enumerate(original_layer_bits.items()):
                 k = _validate_k(value, f"layer_bits[{key}]")
-                restored_layer_bits[int(key)] = k
-                safe_layer_bits[key] = _safe_legacy_k(k)
+                nkey = _norm_layer_key(key)
+                restored_layer_bits[nkey] = k
+                safe_key = nkey if isinstance(nkey, int) else (-1000 - idx)
+                safe_layer_bits[safe_key] = _safe_legacy_k(k)
         else:
             restored_layer_bits = {}
 

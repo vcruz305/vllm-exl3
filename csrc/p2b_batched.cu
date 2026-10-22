@@ -7,8 +7,6 @@
 #include "util.cuh"
 
 #define EXL3_GEMM_ARGS const half*, const uint16_t*, void*, const int, const int, const int, int*, const half*, half*, const half*
-template <int, bool, int, int, int, bool>
-__device__ void exl3_gemv_kernel(EXL3_GEMM_ARGS);
 
 // Make the vendor GEMV body device-callable before the fast worklist uses its
 // fragment types and decode helpers.
