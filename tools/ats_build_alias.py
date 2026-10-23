@@ -53,8 +53,12 @@ def _mtp_layer_offset(model_dir: str) -> int | None:
     return None
 
 
+# Checkpoint expert-projection families: the historical layout is
+# layers.N.ffn.experts (DSV4.1); MiniMax-M3 stores its routed experts under
+# layers.N.block_sparse_moe.experts. Both must resolve for the
+# routing-histogram cold-set path (--select-npz) and the byte scan.
 _TRELLIS_RE = re.compile(
-    r"(?:^|\.)((?:layers|mtp)\.\d+)\.ffn\.experts\.(\d+)\.(w1|w2|w3)\.trellis$"
+    r"(?:^|\.)((?:layers|mtp)\.\d+)\.(ffn|block_sparse_moe)\.experts\.(\d+)\.(w1|w2|w3)\.trellis$"
 )
 
 
@@ -73,8 +77,9 @@ def _scan_expert_bytes(model_dir: str, weight_map: dict[str, str]):
         n, hdr = header(os.path.join(model_dir, shard))
         for k in keys:
             m = _TRELLIS_RE.search(k)
+            assert m is not None, k
             b, e = hdr[k]["data_offsets"]
-            ent = out.setdefault((m.group(1), int(m.group(2))), [0, []])
+            ent = out.setdefault((m.group(1), int(m.group(3))), [0, []])
             ent[0] += e - b
             ent[1].append(k)
     return {k: (v[0], v[1]) for k, v in out.items()}

@@ -1,0 +1,341 @@
+"""Milestone-3 tests: parity tool self-test, provisional alias selection,
+stats-based alias regeneration for the MiniMax expert family, the MiniMax
+route-stats recipe, and the DSpark draft-quantization decline contract.
+
+CPU-only, no vLLM, no GPU (the parity tool's GPU arms run in the dev image).
+"""
+
+from __future__ import annotations
+
+import importlib
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+import vllm_exl3.exl3 as exl3
+
+REPO = Path(__file__).resolve().parents[1]
+
+# ── GPU parity tool: the CPU self-test must pass as a subprocess ────────────
+
+
+def test_parity_tool_cpu_selftest_passes():
+    proc = subprocess.run(
+        [sys.executable, "tools/gb10_minimax_m3_parity.py", "--cpu-selftest"],
+        cwd=str(REPO),
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "GB10_MINIMAX_M3_PARITY SELFTEST PASS" in proc.stdout
+    assert "no hardware parity claim" in proc.stdout
+
+
+def test_parity_tool_case_b_offsets_are_the_branch_split():
+    sys.path.insert(0, str(REPO / "tools"))
+    try:
+        import gb10_minimax_m3_parity as tool
+    finally:
+        sys.path.pop(0)
+    # vllm linear.py fused split: [q | k | v | index_q | index_k] with
+    # output sizes 8192/512/512/512/128 at TP1.
+    assert tool.B_OUTS == (8192, 512, 512, 512, 128)
+    offs = list(tool.B_OFFSETS) + [sum(tool.B_OUTS)]
+    assert [offs[i + 1] - offs[i] for i in range(5)] == list(tool.B_OUTS)
+    # Case A covers exactly the pack's per-expert K census.
+    assert tool.MEM_BUDGET_GIB == 4.0
+
+
+# ── DSpark draft quantization: the plugin declines by construction ─────────
+
+
+def _dspark_quant_card():
+    """The exact quantization_config of pack/dspark/config.json."""
+    path = Path("/root/work/minimax-m31/pack/dspark_config.json")
+    if not path.is_file():
+        pytest.skip("pack/dspark_config.json not on this box")
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)["quantization_config"]
+
+
+def test_plugin_never_claims_the_dsparks_mxfp8_quant_method():
+    # The draft checkpoint tags quant_method "mxfp8"; the plugin's override
+    # only ever claims "exl3", so the draft resolves to vLLM's native
+    # ModelOptMxFp8Config (registry maps "mxfp8" -> ModelOptMxFp8Config) and
+    # the plugin is never the draft's quant config.
+    card = _dspark_quant_card()
+    assert card["quant_method"] == "mxfp8"
+    assert card["weight_block_size"] == [1, 32]
+    got = exl3.Exl3Config.override_quantization_method(
+        card, user_quant=None, hf_config=None
+    )
+    assert got is None
+
+
+def test_dsparks_rewritten_hf_config_is_not_the_minimax_target():
+    # vLLM rewrites the draft hf_config to model_type "minimax_m3_dspark"
+    # with architectures ["DSparkMiniMaxDraftModel"] (config/speculative.py).
+    # The plugin's MiniMax coverage marker must not fire for it: the draft
+    # would otherwise be handed EXL3 methods for MXFP8 tensors.
+    draft = SimpleNamespace(
+        model_type="minimax_m3_dspark",
+        architectures=["DSparkMiniMaxDraftModel"],
+    )
+    assert exl3._hf_config_is_minimax_m3(draft) is False
+    target = SimpleNamespace(
+        model_type="minimax_m3_vl",
+        architectures=["MiniMaxM3SparseForConditionalGeneration"],
+    )
+    assert exl3._hf_config_is_minimax_m3(target) is True
+
+
+def test_dsparks_ignored_layers_are_not_exl3_families():
+    # The ignored_layers entries the draft model actually instantiates are
+    # its own heads (markov/confidence/fc); those must be outside the
+    # plugin's MiniMax EXL3 coverage. The remaining entries are not draft
+    # modules at all: embed/lm_head are shared with the target (dspark.py
+    # docstring: the checkpoint ships neither), the block_sparse_moe.gate
+    # entries are unquantized router weights, and the vision entries do not
+    # exist in this text-only pack.
+    card = _dspark_quant_card()
+    ignored = card["ignored_layers"]
+    instantiated = [
+        n for n in ignored
+        if ".dspark." in n and "block_sparse_moe" not in n
+    ]
+    assert instantiated  # the four heads are in the list
+    for name in instantiated:
+        for fam in exl3.MINIMAX_NON_ROUTED_FAMILIES:
+            assert not name.endswith(fam), (name, fam)
+
+
+# ── Provisional alias selection ────────────────────────────────────────────
+
+
+def _synthetic_census(n_layers=3, n_experts=8):
+    """Census-shaped dict: layers 3..3+n-1, per-expert w1/w2/w3 trellises with
+    the pack's K-triple distribution scaled down."""
+    census = {}
+    triples = [(2, 2, 2), (2, 3, 2), (3, 3, 3)]
+    for li in range(n_layers):
+        layer = 3 + li
+        for eid in range(n_experts):
+            kg, kd, ku = triples[eid % len(triples)]
+            for proj, k in (("w1", kg), ("w2", kd), ("w3", ku)):
+                # bytes = in*out*K/16 elements * 2B, in=32 out=16 (scaled down)
+                census[
+                    f"language_model.model.layers.{layer}.block_sparse_moe."
+                    f"experts.{eid}.{proj}.trellis"
+                ] = {
+                    "dtype": "I16",
+                    "shape": [2, 1, 16 * k],
+                    "bytes": 2 * 1 * 16 * k * 2,
+                }
+    return census
+
+
+sys.path.insert(0, str(REPO / "tools"))
+import minimax_provisional_alias as mpa  # noqa: E402
+
+sys.path.pop(0)
+
+
+def _select(census, budget_bytes):
+    experts = mpa.parse_census(census)
+    mpa.validate(experts, 3, 8)
+    table = mpa.expert_table(experts)
+    return mpa.select_provisional(table, budget_bytes)
+
+
+def _layer_num(key: str) -> int:
+    return int(str(key).rsplit(".", 1)[1])
+
+
+def _chosen(sel):
+    return {
+        (int(str(l).rsplit(".", 1)[1]), e)
+        for l, eids in sel["experts"].items() for e in eids
+    }
+
+
+def test_provisional_alias_spreads_evenly_and_prefers_k222():
+    census = _synthetic_census()
+    # Budget for ~6 experts total: 2 per layer.
+    per_expert = sorted(
+        mpa.expert_table(mpa.parse_census(census)), key=lambda c: c["bytes"]
+    )
+    budget = 6 * per_expert[0]["bytes"]
+    sel = _select(census, budget)
+    layers = {
+        _layer_num(l): len(v) for l, v in sel["experts"].items()
+    }
+    assert sorted(layers) == [3, 4, 5]
+    assert set(layers.values()) <= {2, 3}
+    # Every chosen expert is a (2,2,2) expert (the smallest).
+    table = {
+        (c["layer"], c["eid"]): c for c in mpa.expert_table(mpa.parse_census(census))
+    }
+    for layer, eid in _chosen(sel):
+        assert table[(layer, eid)]["k"] == (2, 2, 2)
+
+
+def test_provisional_alias_is_deterministic_and_capped():
+    census = _synthetic_census()
+    total = sum(
+        c["bytes"] for c in mpa.expert_table(mpa.parse_census(census))
+    )
+    sel1 = _select(census, total // 2)
+    sel2 = _select(census, total // 2)
+    assert sel1["experts"] == sel2["experts"]
+    assert sel1["used_bytes"] <= total // 2
+    # Full-total budget selects every expert; over-budget selection is exact.
+    sel_all = _select(census, total)
+    assert sel_all["used_bytes"] == total
+    assert len(_chosen(sel_all)) == 24
+
+
+def test_provisional_alias_rejects_bad_censuses():
+    census = _synthetic_census()
+    experts = mpa.parse_census(census)
+    with pytest.raises(ValueError):  # wrong layer count
+        mpa.validate(experts, 4, 8)
+    with pytest.raises(ValueError):  # wrong expert count
+        mpa.validate(experts, 3, 9)
+    bad = dict(census)
+    key = next(iter(bad))
+    bad[key] = dict(bad[key], shape=[2, 1, 16 * 9])  # unsupported K
+    with pytest.raises(ValueError):
+        mpa.parse_census(bad)
+
+
+def test_provisional_alias_output_is_ats_build_alias_compatible(tmp_path):
+    # The selection file must be loadable by ats_build_alias.py --experts-json:
+    # pure {"layers.N": [eids]} with integer ids, nothing else at top level.
+    census = _synthetic_census()
+    sel = _select(census, 1 << 20)
+    data = json.loads(json.dumps(sel["experts"]))
+    parsed = {
+        str(k): sorted({int(x) for x in v}) for k, v in data.items() if v
+    }
+    assert parsed == {k: sorted(v) for k, v in parsed.items()}
+    assert all(k.startswith("layers.") for k in parsed)
+
+
+# ── Stats-based regeneration: the MiniMax expert family must resolve ───────
+
+
+def test_ats_build_alias_regex_matches_the_minimax_family():
+    sys.path.insert(0, str(REPO / "tools"))
+    try:
+        import ats_build_alias as aba
+    finally:
+        sys.path.pop(0)
+    good = (
+        "language_model.model.layers.3.block_sparse_moe.experts.5.w1.trellis"
+    )
+    legacy = "layers.38.ffn.experts.12.w2.trellis"
+    bad = "language_model.model.layers.3.block_sparse_moe.experts.5.w1.suh"
+    m = aba._TRELLIS_RE.search(good)
+    assert m is not None and m.group(1) == "layers.3"
+    assert m.group(2) == "block_sparse_moe"
+    assert m.group(3) == "5" and m.group(4) == "w1"
+    m = aba._TRELLIS_RE.search(legacy)
+    assert m is not None and m.group(2) == "ffn" and m.group(3) == "12"
+    assert aba._TRELLIS_RE.search(bad) is None
+
+
+def test_select_cold_maps_rows_back_to_layers_not_mtp(tmp_path):
+    # MiniMax recipe: ROUTE_STATS rows 0..59 are the target layers 0..59 and
+    # there are no MTP rows; mtp_offset must be set >= 60 so every histogram
+    # row maps back to layers.N (the default 40 would misread rows 40..59 as
+    # mtp.0..19 and silently drop those layers from cold-set selection).
+    import numpy as np
+
+    sys.path.insert(0, str(REPO / "tools"))
+    try:
+        import ats_build_alias as aba
+    finally:
+        sys.path.pop(0)
+    n_rows, n_exp = 60, 128
+    counts = np.zeros((n_rows, n_exp), dtype=np.int64)
+    rows = np.zeros((n_rows,), dtype=np.int64)
+    rows[:] = 1000
+    # Layer 3: heavily touched experts 0..99 (hot); 100..127 untouched.
+    counts[3, :100] = 5
+    # Layer 59: one touched expert; the rest untouched.
+    counts[59, 11] = 5
+    meta = np.array(json.dumps({"mtp_offset": 60}))
+    npz = tmp_path / "route_stats.npz"
+    np.savez(npz, counts_0=counts, rows_0=rows, meta=meta)
+    expert_bytes = {
+        ("layers.3", e): (1000, []) for e in range(n_exp)
+    }
+    expert_bytes.update({("layers.59", e): (1000, []) for e in range(n_exp)})
+    # Enough budget to exhaust layer 3's cold supply and reach layer 59.
+    sel = aba.select_cold(str(npz), 30000, expert_bytes, log=lambda *_: None)
+    assert sorted(sel) == ["layers.3", "layers.59"]
+    assert "mtp.19" not in sel and "mtp.0" not in sel
+    # The cold set excludes the touched experts, on both layers.
+    assert all(e >= 100 for e in sel["layers.3"])
+    assert 11 not in sel["layers.59"]
+
+
+def test_select_cold_default_offset_drops_high_layers(tmp_path):
+    # Negative control: with the DEFAULT mtp_offset (40, the DSV4.1 layout),
+    # histogram rows 40..59 are misread as mtp.0..19 and layer 59 silently
+    # disappears from selection. This is why the MiniMax recipe pins
+    # VLLM_EXL3_ROUTE_STATS_MTP_OFFSET=60.
+    import numpy as np
+
+    sys.path.insert(0, str(REPO / "tools"))
+    try:
+        import ats_build_alias as aba
+    finally:
+        sys.path.pop(0)
+    n_rows, n_exp = 60, 128
+    counts = np.zeros((n_rows, n_exp), dtype=np.int64)
+    rows = np.zeros((n_rows,), dtype=np.int64)
+    rows[:] = 1000
+    counts[3, :100] = 5
+    counts[59, 11] = 5
+    meta = np.array(json.dumps({}))
+    npz = tmp_path / "route_stats.npz"
+    np.savez(npz, counts_0=counts, rows_0=rows, meta=meta)
+    expert_bytes = {
+        ("layers.3", e): (1000, []) for e in range(n_exp)
+    }
+    expert_bytes.update({("layers.59", e): (1000, []) for e in range(n_exp)})
+    sel = aba.select_cold(str(npz), 30000, expert_bytes, log=lambda *_: None)
+    assert sorted(sel) == ["layers.3"]
+
+
+def test_route_stats_row_mapping_with_the_minimax_recipe(monkeypatch):
+    # The documented MiniMax env recipe (ROWS=60, EXPERTS=128, MTP_OFFSET=60)
+    # must map every routed layer name to its own histogram row.
+    monkeypatch.setenv("VLLM_EXL3_ROUTE_STATS", "1")
+    monkeypatch.setenv("VLLM_EXL3_ROUTE_STATS_DIR", "/tmp")
+    monkeypatch.setenv("VLLM_EXL3_ROUTE_STATS_ROWS", "60")
+    monkeypatch.setenv("VLLM_EXL3_ROUTE_STATS_EXPERTS", "128")
+    monkeypatch.setenv("VLLM_EXL3_ROUTE_STATS_MTP_OFFSET", "60")
+    from vllm_exl3 import route_stats
+
+    rs = importlib.reload(route_stats)
+    try:
+        assert rs.enabled() is True  # latches the env recipe
+        for layer in (3, 33, 59):
+            fake = SimpleNamespace(layer_name=f"model.layers.{layer}.block_sparse_moe")
+            assert rs._row_of(fake) == layer
+        # Expert ids are < 128, so the remainder() guard is the identity for
+        # real routes (the histogram is 60x128, not 48x384).
+        assert rs._N_ROWS == 60 and rs._N_EXP == 128
+        assert rs._MTP_OFFSET == 60
+    finally:
+        monkeypatch.delenv("VLLM_EXL3_ROUTE_STATS")
+        importlib.reload(route_stats)  # restore defaults (module is env-latched)
