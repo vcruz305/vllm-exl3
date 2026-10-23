@@ -177,6 +177,22 @@ MINIMAX_NON_ROUTED_FAMILIES = {
     "lm_head": 6,
 }
 
+# vLLM builds the MiniMax-M3 dense MLP and shared-expert MLP with one fused
+# MergedColumnParallelLinear named ``gate_up_proj`` (stacked_params_mapping
+# routes the pack's gate_proj -> shard 0 and up_proj -> shard 1), so
+# get_quant_method is queried with the FUSED prefix. The coverage families
+# above are pack-side (unfused) names; these fused names must be covered too,
+# otherwise the layer falls back to UnquantizedLinearMethod, the model's
+# load_weights drops the gate/up trellis tensors ("name not in params_dict:
+# continue") and the MLP runs on an uninitialized BF16 weight.
+MINIMAX_FUSED_LINEAR_MODULES = {
+    "mlp.gate_up_proj": ("mlp.gate_proj", "mlp.up_proj"),
+    "block_sparse_moe.shared_experts.gate_up_proj": (
+        "block_sparse_moe.shared_experts.gate_proj",
+        "block_sparse_moe.shared_experts.up_proj",
+    ),
+}
+
 # Process-wide marker set by Exl3Config.override_quantization_method when vLLM
 # hands it a MiniMax-M3 hf_config. vLLM resolves override_quantization_method
 # at config time (config/model.py:1418) and Exl3Config.from_config at model
@@ -1776,14 +1792,18 @@ def minimax_pack_detected(cfg: "Exl3Config") -> bool:
 def _derive_minimax_non_routed_coverage() -> dict[str, Any]:
     """non_routed_exl3 block for the MiniMax-M3 pack, from the architecture.
 
-    The 9 EXL3-covered module suffixes become the ``modules`` list (suffix
-    matching, like the tensor_storage-derived block); per-family K fallbacks
+    The 9 EXL3-covered module suffixes plus the two fused ``gate_up_proj``
+    names vLLM queries (MINIMAX_FUSED_LINEAR_MODULES) become the ``modules``
+    list (suffix matching, like the tensor_storage-derived block); per-family K fallbacks
     go to ``layer_bits``. The per-shard K is still read from each shard's own
     trellis at load, so the fallback only feeds config-level logging.
     """
+    layer_bits = dict(MINIMAX_NON_ROUTED_FAMILIES)
+    for fused, members in MINIMAX_FUSED_LINEAR_MODULES.items():
+        layer_bits[fused] = max(MINIMAX_NON_ROUTED_FAMILIES[m] for m in members)
     return {
-        "modules": list(MINIMAX_NON_ROUTED_FAMILIES),
-        "layer_bits": dict(MINIMAX_NON_ROUTED_FAMILIES),
+        "modules": list(MINIMAX_NON_ROUTED_FAMILIES) + list(MINIMAX_FUSED_LINEAR_MODULES),
+        "layer_bits": layer_bits,
         "bits": max(MINIMAX_NON_ROUTED_FAMILIES.values()),
         "codebook": "mcg",
     }

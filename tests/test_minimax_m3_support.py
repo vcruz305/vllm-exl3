@@ -214,7 +214,9 @@ def test_minimax_pack_config_derives_non_routed_coverage():
         assert exl3.minimax_pack_detected(cfg) is True
         assert cfg.non_routed_exl3, "MiniMax coverage must be derived"
         covered = set(cfg.non_routed_exl3.get("modules", []))
-        assert covered == set(exl3.MINIMAX_NON_ROUTED_FAMILIES)
+        assert covered == set(exl3.MINIMAX_NON_ROUTED_FAMILIES) | set(
+            exl3.MINIMAX_FUSED_LINEAR_MODULES
+        )
     finally:
         exl3._MINIMAX_M3_PACK_REQUESTED = False
 
@@ -264,3 +266,69 @@ def test_ats_alias_declares_the_minimax_embed_key():
         ats_alias.MINIMAX_EMBED_KEY
         == "language_model.model.embed_tokens.weight"
     )
+
+
+def _minimax_cfg():
+    hf_config = SimpleNamespace(
+        model_type="minimax_m3_vl",
+        architectures=["MiniMaxM3SparseForConditionalGeneration"],
+    )
+    exl3.Exl3Config.override_quantization_method(
+        {"quant_method": "exl3", "version": "0.0.2"}, None, hf_config
+    )
+    return exl3.Exl3Config.from_config({"quant_method": "exl3", "version": "0.0.2"})
+
+
+def _vllm_linear_prefixes():
+    """Every LinearBase prefix vLLM's MiniMax-M3 text model queries
+    get_quant_method with (construction-time names, wrapper-prefixed)."""
+    out = []
+    for i in range(60):
+        base = f"language_model.model.layers.{i}"
+        out += [f"{base}.self_attn.qkv_proj", f"{base}.self_attn.o_proj"]
+        if i < 3:
+            out += [f"{base}.mlp.gate_up_proj", f"{base}.mlp.down_proj"]
+        else:
+            out += [
+                f"{base}.block_sparse_moe.shared_experts.gate_up_proj",
+                f"{base}.block_sparse_moe.shared_experts.down_proj",
+            ]
+    out.append("language_model.lm_head")
+    return out
+
+
+def test_minimax_every_vllm_linear_prefix_routes_to_exl3():
+    # Regression: the fused gate_up_proj (dense MLP and shared experts) fell
+    # back to UnquantizedLinearMethod, so its EXL3 trellis was dropped at load
+    # and an uninitialized (6144, 6144)/(24576, 6144) BF16 weight was used.
+    try:
+        cfg = _minimax_cfg()
+        missing = [
+            p
+            for p in _vllm_linear_prefixes()
+            if not cfg._matches_non_routed_exl3(p.removeprefix("language_model."))
+        ]
+        assert missing == []
+    finally:
+        exl3._MINIMAX_M3_PACK_REQUESTED = False
+
+
+def test_minimax_router_gate_and_indexer_stay_unquantized():
+    try:
+        cfg = _minimax_cfg()
+        for i in (0, 3, 59):
+            for name in (
+                f"model.layers.{i}.block_sparse_moe.gate",
+                f"model.layers.{i}.self_attn.index_q_proj",
+                f"model.layers.{i}.self_attn.index_k_proj",
+            ):
+                assert not cfg._matches_non_routed_exl3(name), name
+    finally:
+        exl3._MINIMAX_M3_PACK_REQUESTED = False
+
+
+def test_minimax_fused_gate_up_members_are_pack_families():
+    for fused, members in exl3.MINIMAX_FUSED_LINEAR_MODULES.items():
+        assert fused.endswith("gate_up_proj")
+        for m in members:
+            assert m in exl3.MINIMAX_NON_ROUTED_FAMILIES, m

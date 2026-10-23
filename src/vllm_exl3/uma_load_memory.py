@@ -26,6 +26,14 @@ Switches (all default off; the recipe turns them on):
     the KV cache and loads the draft model. No routed expert is aliased
     unless an alias manifest asks for it.
 
+``VLLM_EXL3_DRAFT_VOCAB_META=1``
+    When the DSpark draft checkpoint carries no ``embed_tokens``/``lm_head``
+    tensors (vLLM shares the target's modules after the draft load), build
+    the draft's own placeholders on the meta device instead of allocating
+    two unused 200064 x 6144 BF16 tables (4.58 GiB) that are discarded a
+    moment later. Draft checkpoints that do ship either table are loaded
+    unchanged.
+
 ``VLLM_EXL3_MEM_PROBE=1``
     One ``MEMPROBE`` log line per trim point (defaults on whenever one of the
     two switches above is on).
@@ -248,16 +256,133 @@ def install_uma_load_memory(exl3: Any) -> None:
     install_postload_hook(DefaultModelLoader)
 
 
-def install_postload_hook(loader_cls: Any) -> None:
+# Draft architectures whose embed_tokens / lm_head are shared from the target
+# when the draft checkpoint omits them (vLLM v1 dspark/utils.py
+# load_dspark_model -> maybe_share_target_embed / lm_head share).
+VOCAB_SHARED_DRAFT_ARCHS = frozenset({"DSparkMiniMaxDraftModel"})
+_VOCAB_TABLE_MARKERS = ("embed_tokens", "lm_head")
+
+
+def draft_vocab_meta_enabled() -> bool:
+    return _flag("VLLM_EXL3_DRAFT_VOCAB_META")
+
+
+def _safetensors_keys(path: str) -> list[str]:
+    import json
+
+    with open(path, "rb") as fh:
+        n = int.from_bytes(fh.read(8), "little")
+        if n <= 0 or n > 256 * 2**20:
+            raise ValueError(f"implausible safetensors header length {n}: {path}")
+        header = json.loads(fh.read(n))
+    return [k for k in header if k != "__metadata__"]
+
+
+def checkpoint_has_vocab_tables(model_dir: str) -> bool | None:
+    """True/False from the checkpoint's own tensor names; None if unreadable."""
+    import glob
+
+    files = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
+    if not files:
+        return None
+    try:
+        for f in files:
+            if any(m in k for k in _safetensors_keys(f) for m in _VOCAB_TABLE_MARKERS):
+                return True
+    except Exception as exc:
+        logger.warning("draft vocab scan failed for %s: %r", model_dir, exc)
+        return None
+    return False
+
+
+def _architectures(model_config: Any) -> list[str]:
+    hf = getattr(model_config, "hf_config", None)
+    return list(getattr(hf, "architectures", None) or [])
+
+
+def is_vocab_shared_draft(model_config: Any) -> bool:
+    if model_config is None:
+        return False
+    if not set(_architectures(model_config)) & VOCAB_SHARED_DRAFT_ARCHS:
+        return False
+    model_dir = str(getattr(model_config, "model", "") or "")
+    if not model_dir or not os.path.isdir(model_dir):
+        return False
+    return checkpoint_has_vocab_tables(model_dir) is False
+
+
+class _MetaUnquantizedEmbeddings:
+    """Context: UnquantizedEmbeddingMethod.create_weights allocates on meta."""
+
+    def __init__(self, method_cls: Any):
+        self._cls = method_cls
+        self._orig = None
+        self.count = 0
+
+    def __enter__(self):
+        import torch
+
+        orig = self._cls.create_weights
+        self._orig = orig
+        ctx = self
+
+        def create_weights(method, layer, *args, **kwargs):
+            with torch.device("meta"):
+                out = orig(method, layer, *args, **kwargs)
+            layer._exl3_meta_vocab_placeholder = True
+            ctx.count += 1
+            return out
+
+        self._cls.create_weights = create_weights
+        return self
+
+    def __exit__(self, *exc):
+        self._cls.create_weights = self._orig
+        return False
+
+
+def _model_config_arg(args: tuple, kwargs: dict) -> Any:
+    if "model_config" in kwargs:
+        return kwargs["model_config"]
+    return args[1] if len(args) > 1 else None
+
+
+def install_postload_hook(loader_cls: Any, embedding_method_cls: Any = None) -> None:
     orig_load = loader_cls.load_model
     if getattr(orig_load, "_uma_postload", False):
         return
 
     @wraps(orig_load)
     def load_model(self, *args, **kwargs):
-        model = orig_load(self, *args, **kwargs)
+        model_config = _model_config_arg(args, kwargs)
+        draft = bool(set(_architectures(model_config)) & VOCAB_SHARED_DRAFT_ARCHS)
+        meta_cls = embedding_method_cls
+        if draft and draft_vocab_meta_enabled() and meta_cls is None:
+            try:
+                from vllm.model_executor.layers.vocab_parallel_embedding import (
+                    UnquantizedEmbeddingMethod as meta_cls,
+                )
+            except Exception:
+                meta_cls = None
+        if draft and meta_cls is not None and draft_vocab_meta_enabled() and is_vocab_shared_draft(
+            model_config
+        ):
+            with _MetaUnquantizedEmbeddings(meta_cls) as meta:
+                model = orig_load(self, *args, **kwargs)
+            STATS["draft_meta_vocab"] = STATS.get("draft_meta_vocab", 0) + meta.count
+            logger.info(
+                "EXL3 draft vocab tables on meta (shared from the target after load): %d",
+                meta.count,
+            )
+        else:
+            model = orig_load(self, *args, **kwargs)
         if postload_enabled():
-            postload(model)
+            if draft:
+                trim()  # the draft's tables are the target's; nothing to alias
+                if probe_enabled():
+                    logger.info("%s", mem_line("POST_DRAFT_LOAD"))
+            else:
+                postload(model)
         return model
 
     load_model._uma_postload = True

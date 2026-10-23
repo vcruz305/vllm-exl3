@@ -15,6 +15,7 @@ def _clean_env(monkeypatch):
         "VLLM_EXL3_TRIM_AFTER_LAYER",
         "VLLM_EXL3_UMA_POSTLOAD",
         "VLLM_EXL3_MEM_PROBE",
+        "VLLM_EXL3_DRAFT_VOCAB_META",
     ):
         monkeypatch.delenv(k, raising=False)
     for k in uma.STATS:
@@ -61,9 +62,11 @@ def test_install_is_idempotent():
     assert ex.prepare_trellis_arena_plan is first
 
 
-def _loader_cls(model):
+def _loader_cls(model, on_load=None):
     class Loader:
-        def load_model(self, *a, **k):
+        def load_model(self, vllm_config=None, model_config=None, prefix=""):
+            if on_load is not None:
+                on_load()
             return model
 
     return Loader
@@ -153,3 +156,98 @@ def test_diagnostic_abort_after_n_layers(monkeypatch):
     ex.prepare_trellis_arena_plan(object(), {})
     with pytest.raises(RuntimeError, match="diagnostic load stop"):
         ex.prepare_trellis_arena_plan(object(), {})
+
+
+def _write_safetensors(path, names):
+    import json
+    import struct
+
+    header = {n: {"dtype": "BF16", "shape": [1], "data_offsets": [0, 2]} for n in names}
+    raw = json.dumps(header).encode()
+    with open(path, "wb") as fh:
+        fh.write(struct.pack("<Q", len(raw)))
+        fh.write(raw)
+        fh.write(b"\0\0")
+
+
+def _draft_cfg(model_dir, arch="DSparkMiniMaxDraftModel"):
+    return types.SimpleNamespace(
+        model=str(model_dir), hf_config=types.SimpleNamespace(architectures=[arch])
+    )
+
+
+def test_checkpoint_vocab_scan(tmp_path):
+    _write_safetensors(tmp_path / "a.safetensors", ["model.layers.0.mlp.w1.weight"])
+    assert uma.checkpoint_has_vocab_tables(str(tmp_path)) is False
+    _write_safetensors(tmp_path / "b.safetensors", ["lm_head.weight"])
+    assert uma.checkpoint_has_vocab_tables(str(tmp_path)) is True
+    assert uma.checkpoint_has_vocab_tables(str(tmp_path / "missing")) is None
+
+
+def test_is_vocab_shared_draft_requires_arch_and_absent_tables(tmp_path):
+    _write_safetensors(tmp_path / "d.safetensors", ["language_model.model.dspark.fc.weight"])
+    assert uma.is_vocab_shared_draft(_draft_cfg(tmp_path)) is True
+    assert uma.is_vocab_shared_draft(_draft_cfg(tmp_path, "MiniMaxM3SparseForConditionalGeneration")) is False
+    _write_safetensors(tmp_path / "e.safetensors", ["model.embed_tokens.weight"])
+    assert uma.is_vocab_shared_draft(_draft_cfg(tmp_path)) is False
+
+
+class _FakeEmbedMethod:
+    def create_weights(self, layer, rows, cols):
+        import torch
+
+        layer.weight = torch.empty(rows, cols, dtype=torch.bfloat16)
+
+
+def test_draft_vocab_tables_built_on_meta_only_inside_draft_load(monkeypatch, tmp_path):
+    torch = pytest.importorskip("torch")
+    _write_safetensors(tmp_path / "d.safetensors", ["language_model.model.dspark.fc.weight"])
+    built = {}
+
+    def on_load():
+        layer = types.SimpleNamespace()
+        _FakeEmbedMethod().create_weights(layer, 200064, 64)
+        built["layer"] = layer
+
+    Loader = _loader_cls(object(), on_load)
+    uma.install_postload_hook(Loader, embedding_method_cls=_FakeEmbedMethod)
+    monkeypatch.setenv("VLLM_EXL3_DRAFT_VOCAB_META", "1")
+    Loader().load_model(None, _draft_cfg(tmp_path))
+    assert built["layer"].weight.device.type == "meta"
+    assert built["layer"]._exl3_meta_vocab_placeholder is True
+    assert uma.STATS["draft_meta_vocab"] == 1
+    # restored afterwards: a later (target) build allocates for real
+    later = types.SimpleNamespace()
+    _FakeEmbedMethod().create_weights(later, 4, 4)
+    assert later.weight.device.type == "cpu"
+
+
+def test_draft_with_its_own_tables_allocates_normally(monkeypatch, tmp_path):
+    pytest.importorskip("torch")
+    _write_safetensors(tmp_path / "d.safetensors", ["lm_head.weight"])
+    built = {}
+
+    def on_load():
+        layer = types.SimpleNamespace()
+        _FakeEmbedMethod().create_weights(layer, 8, 8)
+        built["layer"] = layer
+
+    Loader = _loader_cls(object(), on_load)
+    uma.install_postload_hook(Loader, embedding_method_cls=_FakeEmbedMethod)
+    monkeypatch.setenv("VLLM_EXL3_DRAFT_VOCAB_META", "1")
+    Loader().load_model(None, _draft_cfg(tmp_path))
+    assert built["layer"].weight.device.type == "cpu"
+
+
+def test_draft_load_never_runs_the_embedding_alias(monkeypatch, tmp_path):
+    from vllm_exl3 import ats_alias
+
+    seen = []
+    monkeypatch.setattr(ats_alias, "alias_embedding", lambda m: seen.append(m) or 1)
+    monkeypatch.setattr(uma, "trim", lambda: seen.append("trim"))
+    _write_safetensors(tmp_path / "d.safetensors", ["x.weight"])
+    Loader = _loader_cls(object())
+    uma.install_postload_hook(Loader, embedding_method_cls=_FakeEmbedMethod)
+    monkeypatch.setenv("VLLM_EXL3_UMA_POSTLOAD", "1")
+    Loader().load_model(None, _draft_cfg(tmp_path))
+    assert seen == ["trim"]
