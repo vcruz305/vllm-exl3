@@ -885,16 +885,15 @@ def test_decode_wrapper_boundary_convention(monkeypatch) -> None:
 
 def test_gb10_harness_frontend_checks_before_any_gpu_case() -> None:
     """The GB10 harness must run the sm_121 frontend compile check before
-    case 1 (fail fast with a clear message), and the check tool must
-    pin the sm_121 target and the uint8-view convention.
-    """
+    any GPU unit (fail fast with a clear message), and the check tool must
+    pin the sm_121 target and the uint8-view convention."""
     root = Path(__file__).resolve().parents[1]
     harness = (root / "tools" / "gb10_q4kv_parity.py").read_text()
     check = (root / "tools" / "q4kv_triton_frontend_check.py").read_text()
-    main_body = harness[harness.index("def main()") :]
-    gate = main_body.index("q4kv_triton_frontend_check.main()")
-    case1 = main_body.index("case1_w1_byte_exact()")
-    assert gate < case1, "frontend check must run before case 1"
+    units = harness[harness.index("    units = [") :]
+    gate = units.index('("0/frontend-check", _frontend_check_unit)')
+    first_gpu = units.index('("1a/w1-norm-rope-numerics", unit_1a)')
+    assert gate < first_gpu, "frontend check must run before the W1 units"
     assert 'GPUTarget("cuda", 121, 32)' in check
     assert '"index_q_out_ptr": "*u8"' in check
     assert '"index_cache_ptr": "*u8"' in check
@@ -1069,18 +1068,282 @@ def test_gb10_harness_validates_inputs_before_every_case() -> None:
         nxt = harness.index("\ndef ", start + 1)
         return harness[start:nxt]
 
-    for case, kernel in (
-        ("def case1_w1_byte_exact", "q4k.q4_w1_insert"),
-        ("def case2_r2_accuracy", "q4k.q4_sparse_decode"),
-        ("def case4_cuda_graph", "q4k.q4_sparse_decode"),
-        ("def _dry_run_case1", "ref.reference_w1_write"),
-        ("def _dry_run_decode", "ref.reference_sparse_attention"),
+    # The shared W1 evidence validates before the Triton launch, and
+    # every 1x unit consumes that evidence.
+    w1 = body("class _W1Evidence")
+    assert w1.index("hi.validate_w1_inputs") < w1.index("q4k.q4_w1_insert")
+    for unit in ("def unit_1a", "def unit_1b", "def unit_1c",
+                 "def unit_1d"):
+        assert "_w1_evidence()" in body(unit), (
+            f"{unit} must gate the shared W1 evidence"
+        )
+    # The decode fixture validates before any R2 launch (units 2 and 4
+    # reach the kernel only through _run_r2, which the fixture precedes).
+    dec = body("def _decode_fixture")
+    assert dec.index("hi.validate_decode_inputs") < dec.index("return inp")
+    for unit in ("def unit_2", "def unit_4"):
+        b = body(unit)
+        assert b.index("_decode_fixture()") < b.index("_run_r2")
+    run_r2 = body("def _run_r2")
+    assert run_r2.index("q4k.q4_sparse_decode") > 0
+    # The dry-run reference units validate their inputs too.
+    for unit, act in (
+        ("def _dry_w1_reference", "ref.reference_w1_write"),
+        ("def _dry_gate_a", "ref.gemma_rmsnorm"),
+        ("def _dry_gate_b", "ref.reference_w1_write"),
+        ("def _dry_decode", "ref.reference_sparse_attention"),
     ):
-        b = body(case)
-        gate = b.index("hi.validate_")
-        act = b.index(kernel)
-        assert gate < act, f"{case} must validate inputs before {kernel}"
-    dry = body("def cpu_dry_run")
-    assert "hi.validate_" not in dry  # validation lives in the case bodies
+        b = body(unit)
+        assert b.index("hi.validate_") < b.index(act), (
+            f"{unit} must validate inputs before {act}"
+        )
     main_body = harness[harness.index("def main") :]
     assert '"--cpu-dry-run"' in main_body and "cpu_dry_run()" in main_body
+
+
+def test_gb10_harness_runs_every_unit_to_completion() -> None:
+    """The GB10 val3 lesson: one run must give the full picture. The
+    harness must (a) wrap every unit so an exception is recorded as that
+    unit's FAIL instead of aborting the run, (b) print one PASS/FAIL
+    line per unit, (c) write the full diagnostics as a JSON receipt when
+    --json is given, and (d) exit non-zero when any unit failed."""
+    root = Path(__file__).resolve().parents[1]
+    harness = (root / "tools" / "gb10_q4kv_parity.py").read_text()
+    runner = harness[harness.index("def run_units") :]
+    assert "except Exception" in runner, "per-unit exception capture"
+    assert 'entry = {"case": name, "status"' in runner
+    assert "json.dumps(receipt" in runner
+    assert 'return 0 if verdict == "PASS" else 1' in runner
+    units = harness[harness.index("    units = [") :]
+    for name in (
+        "0/frontend-check",
+        "1a/w1-norm-rope-numerics",
+        "1b/w1-packing-bytes",
+        "1c/w1-index-bytes",
+        "1d/w1-rewrite-scope",
+        "2/r2-decode-accuracy",
+        "3/pool-bytes",
+        "4/cuda-graph-replay",
+    ):
+        assert f'("{name}"' in units, f"missing harness unit {name}"
+
+
+# ---------------------------------------------------------------------------
+# GB10 val3 follow-up: the parity gates (tools/q4kv_gates.py), the rz
+# payload-quotient primitive, and the kernel's mirror of it
+# ---------------------------------------------------------------------------
+
+_Q4KV_GATES = None
+
+
+def _gates_module():
+    """Load tools/q4kv_gates.py (pure torch; no triton needed)."""
+    global _Q4KV_GATES
+    if _Q4KV_GATES is None:
+        import importlib.util
+
+        root = Path(__file__).resolve().parents[1]
+        path = root / "tools" / "q4kv_gates.py"
+        spec = importlib.util.spec_from_file_location("q4kv_gates", path)
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["q4kv_gates"] = mod
+        spec.loader.exec_module(mod)
+        _Q4KV_GATES = mod
+    return _Q4KV_GATES
+
+
+def test_gate_bf16_numerics_semantics() -> None:
+    """Gate (a): sparse 1-ulp noise (the expected kernel-vs-reference
+    shape) passes; a uniform 1-ulp shift (systematic bias), gross
+    corruption, sign flips and one-sided NaN fail; the reported metrics
+    are exact."""
+    g = _gates_module()
+    gen = torch.Generator().manual_seed(0)
+    base = torch.randn(64, 128, generator=gen).to(torch.bfloat16)
+    # identical rows: pass with zero damage.
+    r = g.gate_bf16_numerics(base, base, "t")
+    assert r["passed"] and r["max_ulp"] == 0 and r["n_mismatch"] == 0
+    assert abs(r["cosine"] - 1.0) < 1e-9
+    # sparse 1-ulp perturbation: must PASS (this is the whole point of
+    # the val3 rework — the reference's precise 1/sqrt vs the kernel's
+    # hardware approx legitimately lands here).
+    sparse = g.bf16_ulp_step(base, +1, fraction=1 / 1024, seed=0)
+    r = g.gate_bf16_numerics(sparse, base, "t")
+    assert r["passed"], r
+    assert r["max_ulp"] == 1
+    assert 0 < r["n_mismatch"] <= base.numel() // 1024 + 1
+    assert r["cosine"] >= g.COS_LIMIT
+    # uniform 1-ulp shift: a systematic 2^-8-relative bias is a bug even
+    # though every element is within the ulp limit — the cosine gate
+    # catches it.
+    uniform = g.bf16_ulp_step(base, +1, fraction=1.0, seed=0)
+    r = g.gate_bf16_numerics(uniform, base, "t")
+    assert not r["passed"]
+    assert r["max_ulp"] == 1 and r["cosine"] < g.COS_LIMIT
+    # gross corruption and sign flips fail outright.
+    gross = (base.to(torch.float32) * 1.01).to(torch.bfloat16)
+    assert not g.gate_bf16_numerics(gross, base, "t")["passed"]
+    assert not g.gate_bf16_numerics(-base, base, "t")["passed"]
+    # one-sided NaN fails on finiteness, never silently.
+    nan = base.clone()
+    nan.view(-1)[0] = float("nan")
+    r = g.gate_bf16_numerics(nan, base, "t")
+    assert not r["passed"] and "finiteness" in r["reason"]
+    # shape/dtype mismatches fail with a reason, not an exception.
+    r = g.gate_bf16_numerics(base[:32], base, "t")
+    assert not r["passed"] and "expected equal-shape" in r["reason"]
+    r = g.gate_bf16_numerics(base.to(torch.float32), base, "t")
+    assert not r["passed"]
+
+
+def test_gate_bytes_exact_semantics() -> None:
+    """Gate (b): byte-identical passes; a single flipped nibble or scale
+    byte fails with the exact mismatch count and first offset."""
+    g = _gates_module()
+    gen = torch.Generator().manual_seed(0)
+    data = torch.randint(0, 256, (64, 128), generator=gen,
+                         dtype=torch.uint8)
+    r = g.gate_bytes_exact(data, data, "t")
+    assert r["passed"] and r["n_mismatch"] == 0
+    assert r["first_mismatch_offset"] == -1
+    one = data.clone()
+    one.view(-1)[3] ^= 0x01  # a single flipped nibble
+    r = g.gate_bytes_exact(one, data, "t")
+    assert not r["passed"]
+    assert r["n_mismatch"] == 1 and r["first_mismatch_offset"] == 3
+    assert r["mismatch_fraction"] == 1 / data.numel()
+    two = data.clone()
+    two.view(-1)[7] ^= 0xF0
+    two.view(-1)[8111] ^= 0x80
+    r = g.gate_bytes_exact(two, data, "t")
+    assert not r["passed"] and r["n_mismatch"] == 2
+
+
+def test_gate_e4m3_codes_semantics() -> None:
+    """Gate (c): sparse 1-code-step noise passes; a 3-code-step jump and a
+    one-sided NaN code fail; the distance is measured in
+    representable-value steps."""
+    g = _gates_module()
+    gen = torch.Generator().manual_seed(0)
+    # valid finite magnitude codes only (0x00..0x7E, no NaN code 0x7F).
+    base = torch.randint(0, 0x7F, (4096,), generator=gen,
+                        dtype=torch.uint8)
+    r = g.gate_e4m3_codes(base, base, "t")
+    assert r["passed"] and r["max_code_distance"] == 0
+    sparse = g.e4m3_code_step(base, +1, fraction=1 / 4096, seed=0)
+    r = g.gate_e4m3_codes(sparse, base, "t")
+    assert r["passed"], r
+    assert r["max_code_distance"] == 1 and r["n_mismatch"] == 1
+    jump = g.e4m3_code_step(base, +3, fraction=1 / 4096, seed=0)
+    r = g.gate_e4m3_codes(jump, base, "t")
+    assert not r["passed"] and "code distance" in r["reason"]
+    nan = base.clone()
+    nan.view(-1)[0] = 0x7F  # the NaN code on one side only
+    r = g.gate_e4m3_codes(nan, base, "t")
+    assert not r["passed"] and "NaN" in r["reason"]
+
+
+def test_rz_rounded_product_is_true_rz() -> None:
+    """ref.rz_rounded_product is exactly RZ of the exact product: it
+    never moves the result away from zero past the exact product, it
+    equals the RN product wherever RN rounded down, it differs from RN
+    exactly on the upward-rounded elements, and pack_q4_row bytes are
+    unchanged (the factor-out is behavior-preserving)."""
+    gen = torch.Generator().manual_seed(0)
+    x = torch.randn(4096, 16, generator=gen) * 3
+    c = torch.rand(4096, 16, generator=gen) * 4 + 0.5
+    rz = ref.rz_rounded_product(x, c)
+    rn = x * c
+    exact = x.to(torch.float64) * c.to(torch.float64)
+    # (a) RZ never exceeds the exact product in magnitude.
+    signed = (rz.to(torch.float64) - exact) * torch.sign(exact)
+    assert (signed <= 0).all()
+    # (b) equals RN wherever RN did not land on the away-from-zero side;
+    # differs from RN exactly on the away-side elements, for BOTH signs
+    # (the correction is live, not vacuous, and symmetric).
+    away = rn.to(torch.float64).abs() > exact.abs()
+    assert torch.equal(rz == rn, ~away)
+    n_fix = int((rz != rn).sum())
+    n_fix_neg = int(((rz != rn) & (exact < 0)).sum())
+    assert n_fix > 0, "the RZ correction never triggers on this grid"
+    assert n_fix_neg > 0, "the RZ correction is asymmetric (sign bug)"
+    # (c) differential: the PRE-FIX signed condition (p > exact, the
+    # original inline emulation) violates the RZ magnitude property on
+    # negative products that rounded away from zero; the shipped
+    # implementation must not.
+    safe_zero = torch.zeros_like(rn)
+    pre_fix = torch.where(
+        (rn.to(torch.float64) > exact) & torch.isfinite(rn),
+        torch.nextafter(rn, safe_zero),
+        rn,
+    )
+    signed_pre = (
+        (pre_fix.to(torch.float64) - exact) * torch.sign(exact)
+    )
+    assert (signed_pre > 0).any(), (
+        "the pre-fix bug is not reproduced on this grid"
+    )
+    assert not (signed > 0).any(), (
+        "the shipped rz_rounded_product exceeds the exact magnitude"
+    )
+
+
+def test_kernel_pack_quotient_mirrors_the_reference_rz() -> None:
+    """The Triton packer must compute the payload quotient through
+    _rz_product (the bit-for-bit mirror of ref.rz_rounded_product), not a
+    plain RN product."""
+    root = Path(__file__).resolve().parents[1]
+    kernels = (
+        root / "src" / "vllm_exl3" / "minimax_q4kv_kernels.py"
+    ).read_text()
+    assert "def _rz_product(x, c):" in kernels
+    assert "q = _rz_product(xb, 1.0 / s_vec)" in kernels
+    assert "q = xb * (1.0 / s_vec)" not in kernels
+    assert "rz_rounded_product" in kernels  # pinned to the reference by name
+
+
+def test_harness_packing_gate_uses_the_kernels_own_rows() -> None:
+    """Unit 1b must read the kernel's OWN processed rows back from qkv
+    and run the reference packer on them (packing byte-exactness decoupled
+    from norm rounding); unit 1a must gate q_out and the processed K and
+    index_k rows; unit 1c must gate the fp8 index bytes."""
+    root = Path(__file__).resolve().parents[1]
+    harness = (root / "tools" / "gb10_q4kv_parity.py").read_text()
+
+    def body(marker: str, stop: str) -> str:
+        return harness[harness.index(marker):harness.index(stop)]
+
+    unit_1b = body("def unit_1b", "def unit_1c")
+    assert "slots_after()" in unit_1b  # the kernel's processed K readback
+    assert "_scatter_q4_tokens" in unit_1b  # the reference packer
+    assert "gate_bytes_exact" in unit_1b
+    unit_1a = body("def unit_1a", "def unit_1b")
+    for label in ("q_out", "processed-K", "processed-index_k"):
+        assert f'"{label}"' in unit_1a
+    assert "gate_bf16_numerics" in unit_1a
+    unit_1c = body("def unit_1c", "def unit_1d")
+    for label in ("index_q bytes", "index_k scatter bytes"):
+        assert f'"{label}"' in unit_1c
+    assert "gate_e4m3_codes" in unit_1c
+
+
+def test_cpu_dry_run_exercises_the_new_gates() -> None:
+    """--cpu-dry-run must self-test the gates on synthetic perturbations:
+    a sparse 1-ulp perturbation and a 1-code-step perturbation must PASS,
+    a single flipped nibble / scale byte must FAIL, and the reference
+    paths must still run to completion."""
+    root = Path(__file__).resolve().parents[1]
+    harness = (root / "tools" / "gb10_q4kv_parity.py").read_text()
+    for name in (
+        "dry/0-w1-reference-runs",
+        "dry/1a-gate-numerics-selftest",
+        "dry/1b-gate-bytes-selftest",
+        "dry/1c-gate-index-codes-selftest",
+        "dry/2-decode-reference-runs",
+        "dry/3-pool-bytes",
+    ):
+        assert f'("{name}"' in harness, f"missing dry-run unit {name}"
+    assert "bf16_ulp_step" in harness  # the 1-ulp perturbation is exercised
+    assert "e4m3_code_step" in harness
+    assert "^= 0x01" in harness  # single flipped nibble/scale byte must fail

@@ -228,6 +228,47 @@ def e2m1_code_values() -> tuple[float, ...]:
 # ---------------------------------------------------------------------------
 
 
+def rz_rounded_product(x: torch.Tensor, recip: torch.Tensor) -> torch.Tensor:
+    """Round-toward-zero (at fp32 precision) of the exact product ``x * recip``.
+
+    This is the payload-quotient primitive of the quantization semantics
+    (step 3 in the module docstring): the fp32 RN product is compared
+    against the exact (f64) product and stepped one representable fp32
+    value toward zero whenever RN landed on the away-from-zero side.
+    That is exactly RZ of the exact product, for both signs: when RN
+    landed on the zero side the RN result already is the representable
+    value nearest the product in the direction of zero, and when it
+    landed on the away-from-zero side, stepping back the single rounding
+    restores that value. NaN and infinite products are passed through
+    unmodified (the caller's code ladder saturates them). The Triton
+    packer mirrors this function bit-for-bit (``_rz_product`` in
+    :mod:`vllm_exl3.minimax_q4kv_kernels`): any kernel that keeps the
+    plain RN product here produces, at the e2m1 decision boundaries,
+    payload bytes the spec'd packer does not emit.
+    """
+    product_rn = x * recip
+    product_exact = (
+        x.to(torch.float64) * recip.to(torch.float64)
+    )
+    # RZ: the representable value nearest the exact product in the
+    # direction of ZERO. RN lands on one side or the other; when it
+    # landed on the away-from-zero side (|p| > |exact|), one step toward
+    # zero restores RZ — for BOTH signs (the original inline emulation
+    # only tested the signed comparison p > exact, which left negative
+    # products that had rounded away from zero above the exact magnitude).
+    away_from_zero = (
+        (product_rn.to(torch.float64) - product_exact)
+        * torch.sign(product_exact)
+        > 0
+    )
+    safe_zero = torch.zeros_like(product_rn)
+    return torch.where(
+        away_from_zero & torch.isfinite(product_rn),
+        torch.nextafter(product_rn, safe_zero),
+        product_rn,
+    )
+
+
 def pack_q4_row(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack [..., 128] values into ([..., 64] data bytes, [..., 8] scale bytes).
 
@@ -246,18 +287,8 @@ def pack_q4_row(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     scale_bytes = e4m3_encode_satfinite(s)
     s_value = e4m3_decode(scale_bytes)
     reciprocal = 1.0 / s_value  # RN(1/s); s_value >= 2^-9 so this is finite
-    # rz(x * rn(1/s)): emulate round-toward-zero of the fp32 product.
-    product_rn = grouped * reciprocal.unsqueeze(-1)
-    product_exact = (
-        grouped.to(torch.float64) * reciprocal.unsqueeze(-1).to(torch.float64)
-    )
-    rounded_up = product_rn.to(torch.float64) > product_exact
-    safe_zero = torch.zeros_like(product_rn)
-    quotient = torch.where(
-        rounded_up & torch.isfinite(product_rn),
-        torch.nextafter(product_rn, safe_zero),
-        product_rn,
-    )
+    # rz(x * rn(1/s)): the payload quotient is RZ at fp32 precision.
+    quotient = rz_rounded_product(grouped, reciprocal.unsqueeze(-1))
     codes = e2m1_code(quotient.abs())
     # Zero is stored as +0: clear the sign of every zero-magnitude nibble.
     signed = torch.where(

@@ -2,44 +2,70 @@
 
 Run ONLY on a DGX Spark GB10 with the MiniMax-M3.1-Flash vLLM image
 (Triton + CUDA available). This VPS has no GPU and no triton: the GPU
-cases are documented here and validated on GB10; the CPU parts of every
-case (input construction, consistency validation and the pure-torch
-reference paths) are exercised on the VPS by ``--cpu-dry-run``.
+cases are validated on GB10; the CPU parts of every case (input
+construction, consistency validation, the pure-torch reference paths
+and the gate functions themselves on synthetic perturbations) are
+exercised on the VPS by ``--cpu-dry-run``.
 
 Exact commands (from the plugin worktree root):
 
-    python tools/gb10_q4kv_parity.py               # GB10 only
-    python tools/gb10_q4kv_parity.py --cpu-dry-run  # any CPU (incl. VPS)
+    python tools/gb10_q4kv_parity.py --json q4kv.json  # GB10 only
+    python tools/gb10_q4kv_parity.py --cpu-dry-run     # any CPU (incl. VPS)
 
-Step 0 (run first, in-main): tools/q4kv_triton_frontend_check.py
-frontend-compiles W1 and R2 for sm_121 without a GPU; any Triton
-frontend type error (e.g. an fp8 pointer handed to a raw-byte kernel)
-aborts here with a clear message instead of inside case 1.
+Structure (the GB10 val3 lesson: the harness must NEVER stop at the
+first failure — one run must give the full picture). Every unit below
+runs to completion, prints exactly one PASS/FAIL line, and records its
+full diagnostics in a JSON receipt (``--json PATH``); the process exits
+non-zero if any unit failed.
 
-Every case builds its inputs from tools/q4kv_harness_inputs.py and runs
+Units:
+  0.  Frontend check (tools/q4kv_triton_frontend_check.py): W1 and R2
+      must frontend-compile for sm_121 in every host dtype variant
+      before any GPU math.
+  1a. W1 norm+RoPE numerics: the kernel's post-norm+RoPE bf16 rows — the
+      q_out buffer and the processed K / index_k rows it writes back into
+      qkv in place — must stay within 2 bf16 ulp of the pure-torch
+      reference everywhere, with cosine >= 0.99999. Bit-exactness is NOT
+      the gate here: the kernel's hardware sqrt.approx and Triton's
+      reduction order legitimately move a handful of fp32 ulps, which
+      after bf16 rounding shows up as <= 1 ulp on a small fraction of
+      elements (see tools/q4kv_gates.py for the bound analysis).
+  1b. W1 packing byte-exactness, decoupled from the norm rounding: the
+      reference packer run on the kernel's OWN processed rows (read back
+      from qkv after the call; V is not normed) must reproduce the
+      kernel's pool bytes — data nibbles AND e4m3 scale bytes —
+      byte-for-byte. Both packers see bit-identical inputs there, so any
+      differing byte is a real packing bug. Unmapped pool pages must
+      stay zero.
+  1c. W1 fp8 index outputs: the index_q bytes and the index_k scatter
+      bytes are e4m3 encodings of fp32 in-register values (the vendor op
+      does the same), so no bf16 readback exists to byte-compare against;
+      they are gated on e4m3 code distance (<= 2 representable-value
+      steps) and decoded cosine (>= 0.99999) against the reference.
+  1d. W1 rewrite scope: only the K and index_k rows of qkv may change in
+      place; the Q, V and index_q rows must be bit-identical to the
+      input (nothing downstream consumes an in-place Q on the q4 path —
+      the sparse layer reads its query from the dedicated q_out buffer).
+  2.  R2 decode accuracy: on real-shaped random data, the q4 decode
+      attention output has cosine >= 0.99 against the fp8 baseline AND
+      against the fp32 oracle, with no NaN/Inf.
+  3.  Pool bytes: the allocated pool is 73728 B/page and 576
+      B/token/layer for 4 KV heads (spec arithmetic).
+  4.  CUDA-graph capture of R2: capture and replay reproduce the eager
+      output bit-identically.
+
+Every unit builds its inputs from tools/q4kv_harness_inputs.py and runs
 that module's input-consistency validator BEFORE any kernel or reference
-call. A harness data bug (e.g. the GB10 val2 crash: positions beyond
-the rotary cache) aborts the case with a message naming the input, never
-as an IndexError that looks like a kernel bug.
-
-Cases (all must pass; any failure exits non-zero):
-  1. W1 byte-exact: the Triton fused write kernel's pool bytes, q_out,
-     index_q bytes AND index_k scatter bytes are byte-identical to the
-     pure-torch reference packer (reference_w1_write run on CPU from
-     the same inputs).
-  2. R2 decode accuracy: on real-shaped random data, the q4 decode
-     attention output has cosine >= 0.99 against the fp8 baseline
-     (exact attention over the fp8-quantized pool) AND against the fp32
-     oracle (exact attention over the unquantized values).
-  3. Pool bytes measured: the allocated pool is 73728 B/page and
-     576 B/token/layer for 4 KV heads (spec arithmetic).
-  4. CUDA-graph capture of R2: capture and replay produce the eager
-     output bit-identically.
+call. A harness data bug aborts the unit with a message naming the
+input, never as an IndexError that looks like a kernel bug.
 """
 
 from __future__ import annotations
 
+import datetime
+import json
 import sys
+import traceback
 from pathlib import Path
 
 import torch
@@ -48,6 +74,7 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+import q4kv_gates as gates  # noqa: E402
 import q4kv_harness_inputs as hi  # noqa: E402
 from vllm_exl3 import minimax_q4kv_kernels as q4k  # noqa: E402
 from vllm_exl3 import minimax_q4kv_reference as ref  # noqa: E402
@@ -66,52 +93,227 @@ def _cuda(*ts: torch.Tensor) -> tuple[torch.Tensor, ...]:
     return tuple(t.cuda() for t in ts)
 
 
-def case1_w1_byte_exact() -> None:
-    """Triton W1 must reproduce the reference packer byte-for-byte."""
-    inp = hi.w1_inputs()
-    hi.validate_w1_inputs(inp)
-    nw = inp["norm_ws"]
-    (qkv, q_nw, k_nw, iq_nw, ik_nw, cos_sin, positions, slot_mapping,
-     index_slot_mapping, pool, index_cache, q_out, index_q_out) = _cuda(
-        inp["qkv"], nw["q"], nw["k"], nw["iq"], nw["ik"], inp["cos_sin"],
-        inp["positions"], inp["slot_mapping"], inp["index_slot_mapping"],
-        inp["pool"], inp["index_cache"], inp["q_out"], inp["index_q_out"],
-    )
-    q4k.q4_w1_insert(
-        qkv, q_nw, k_nw, cos_sin, positions,
-        NQ, NKV, ROTARY, EPS, iq_nw, ik_nw, NIQ,
-        slot_mapping, index_slot_mapping, pool, index_cache, BLOCK,
-        q_out, index_q_out,
-    )
+def _cos(a, b):
+    return gates._cosine(a, b)
 
-    # Reference on CPU from the same inputs (independent device path).
-    out = ref.reference_w1_write(
-        inp["qkv"], nw["q"], nw["k"], nw["iq"], nw["ik"], inp["cos_sin"],
-        inp["positions"], EPS, ROTARY, NQ, NKV, NIQ,
-        inp["slot_mapping"], inp["index_slot_mapping"],
+
+# ---------------------------------------------------------------------------
+# Shared W1 evidence: run the Triton kernel and the reference ONCE, then let
+# every 1x unit gate the same evidence. Construction failures propagate to
+# each unit independently (each unit still gets its own verdict line).
+# ---------------------------------------------------------------------------
+
+_W1_EVIDENCE = None
+
+
+def _w1_evidence():
+    global _W1_EVIDENCE
+    if _W1_EVIDENCE is None:
+        _W1_EVIDENCE = _W1Evidence()
+    return _W1_EVIDENCE
+
+
+class _W1Evidence:
+    """The kernel's outputs and the reference's outputs for the same inputs."""
+
+    def __init__(self) -> None:
+        inp = hi.w1_inputs()
+        hi.validate_w1_inputs(inp)
+        self.inp = inp
+        n = inp["qkv"].shape[0]
+        self.n = n
+        nw = inp["norm_ws"]
+        (qkv, q_nw, k_nw, iq_nw, ik_nw, cos_sin, positions, slot_mapping,
+         index_slot_mapping, pool, index_cache, q_out, index_q_out) = _cuda(
+            inp["qkv"], nw["q"], nw["k"], nw["iq"], nw["ik"], inp["cos_sin"],
+            inp["positions"], inp["slot_mapping"], inp["index_slot_mapping"],
+            inp["pool"], inp["index_cache"], inp["q_out"], inp["index_q_out"],
+        )
+        q4k.q4_w1_insert(
+            qkv, q_nw, k_nw, cos_sin, positions,
+            NQ, NKV, ROTARY, EPS, iq_nw, ik_nw, NIQ,
+            slot_mapping, index_slot_mapping, pool, index_cache, BLOCK,
+            q_out, index_q_out,
+        )
+        torch.cuda.synchronize()
+        # The kernel's own outputs, read back after the call.
+        self.qkv_after = qkv.cpu()
+        self.q_out = q_out.cpu()
+        self.index_q_bytes = index_q_out.cpu().view(torch.uint8)
+        self.pool_after = (
+            pool.cpu().reshape(NUM_PAGES, 2 * NKV, ref.SLOT_REGION)
+        )
+        self.index_cache_after = index_cache.cpu().view(torch.uint8)
+        # The reference paths (CPU, independent device path).
+        self.ref_out = ref.reference_w1_write(
+            inp["qkv"], nw["q"], nw["k"], nw["iq"], nw["ik"],
+            inp["cos_sin"], inp["positions"], EPS, ROTARY, NQ, NKV, NIQ,
+            inp["slot_mapping"], inp["index_slot_mapping"],
+        )
+        x = inp["qkv"].to(torch.float32).view(n, -1, ref.HEAD_DIM)
+        cs = (
+            inp["cos_sin"].to(torch.float32)[inp["positions"]][:, :ROTARY]
+        )
+        self.qn = ref.rope_partial_neox(
+            ref.gemma_rmsnorm(x[:, :NQ], nw["q"], EPS), cs
+        )
+        self.kn = ref.rope_partial_neox(
+            ref.gemma_rmsnorm(x[:, NQ:NQ + NKV], nw["k"], EPS), cs
+        )
+        self.ikn = ref.rope_partial_neox(
+            ref.gemma_rmsnorm(x[:, -1], nw["ik"], EPS), cs
+        )
+
+    def slots_after(self) -> torch.Tensor:
+        return self.qkv_after.view(self.n, -1, ref.HEAD_DIM)
+
+    def slots_before(self) -> torch.Tensor:
+        return self.inp["qkv"].view(self.n, -1, ref.HEAD_DIM)
+
+
+def unit_1a() -> dict:
+    """Norm+RoPE numerics of q_out and the processed K/index_k rows."""
+    ev = _w1_evidence()
+    n = ev.n
+    checks = [
+        gates.gate_bf16_numerics(
+            ev.q_out, ev.qn.to(torch.bfloat16), "q_out"
+        ),
+        gates.gate_bf16_numerics(
+            ev.slots_after()[:, NQ:NQ + NKV].reshape(n * NKV, ref.HEAD_DIM),
+            ev.kn.to(torch.bfloat16).reshape(n * NKV, ref.HEAD_DIM),
+            "processed-K",
+        ),
+        gates.gate_bf16_numerics(
+            ev.slots_after()[:, -1], ev.ikn.to(torch.bfloat16),
+            "processed-index_k",
+        ),
+    ]
+    return {
+        "passed": all(c["passed"] for c in checks),
+        "checks": checks,
+        "summary": "; ".join(
+            f"{c['label']}: max_ulp={c['max_ulp']} "
+            f"mismatch={c['n_mismatch']}/{c['n_elements']} "
+            f"cos={c['cosine']:.8f}"
+            for c in checks
+        ),
+    }
+
+
+def unit_1b() -> dict:
+    """Packing byte-exactness on the kernel's OWN processed rows."""
+    ev = _w1_evidence()
+    n = ev.n
+    n_pages = ev.ref_out["pool"].shape[0]
+    # The kernel's own rows: the processed K it wrote back into qkv, and
+    # the (un-normed) V rows it packed. bf16 rounding is idempotent, so
+    # the reference packer sees exactly the fp32 values the kernel packed.
+    k_rows = ev.slots_after()[:, NQ:NQ + NKV].to(torch.float32)
+    v_rows = ev.slots_before()[
+        :, NQ + NKV:NQ + 2 * NKV
+    ].to(torch.float32)
+    sm = ev.inp["slot_mapping"]
+    want = torch.zeros_like(ev.ref_out["pool"])
+    for head in range(NKV):
+        want[:, 2 * head] = ref._scatter_q4_tokens(
+            k_rows[:, head], sm, n_pages, 2 * head
+        )
+        want[:, 2 * head + 1] = ref._scatter_q4_tokens(
+            v_rows[:, head], sm, n_pages, 2 * head + 1
+        )
+    checks = [
+        gates.gate_bytes_exact(
+            ev.pool_after[:n_pages], want,
+            "pool data nibbles + e4m3 scale bytes",
+        ),
+    ]
+    unmapped = ev.pool_after[n_pages:]
+    unmapped_ok = bool(unmapped.numel() == 0 or int(unmapped.sum()) == 0)
+    checks.append({
+        "gate": "bytes-exact",
+        "label": "unmapped pool pages stay zero",
+        "passed": unmapped_ok,
+        "reason": None if unmapped_ok else "kernel wrote unmapped pages",
+        "n_elements": int(unmapped.numel()),
+        "n_mismatch": 0 if unmapped_ok else 1,
+    })
+    failed = [c for c in checks if not c["passed"]]
+    return {
+        "passed": not failed,
+        "checks": checks,
+        "summary": (
+            "reference packer on the kernel's own rows is byte-identical; "
+            "unmapped pages zero"
+            if not failed
+            else "; ".join(f"{c['label']}: {c['reason']}" for c in failed)
+        ),
+    }
+
+
+def unit_1c() -> dict:
+    """fp8 index byte outputs: e4m3 code-distance gate (no bf16 readback
+    exists for the fp32 values the vendor op and the reference encode)."""
+    ev = _w1_evidence()
+    ic_want = torch.zeros_like(ev.inp["index_cache"]).view(torch.uint8)
+    valid = ev.inp["index_slot_mapping"] >= 0
+    ism = ev.inp["index_slot_mapping"][valid]
+    ic_want.view(-1, BLOCK)[ism] = ev.ref_out["index_k"][valid]
+    checks = [
+        gates.gate_e4m3_codes(
+            ev.index_q_bytes, ev.ref_out["index_q"], "index_q bytes"
+        ),
+        gates.gate_e4m3_codes(
+            ev.index_cache_after, ic_want, "index_k scatter bytes"
+        ),
+    ]
+    return {
+        "passed": all(c["passed"] for c in checks),
+        "checks": checks,
+        "summary": "; ".join(
+            f"{c['label']}: max_code_distance={c['max_code_distance']} "
+            f"mismatch={c['n_mismatch']}/{c['n_elements']} "
+            f"cos={c['decoded_cosine']:.8f}"
+            for c in checks
+        ),
+    }
+
+
+def unit_1d() -> dict:
+    """Rewrite scope: only the K and index_k rows of qkv may change."""
+    ev = _w1_evidence()
+    before = ev.slots_before()
+    after = ev.slots_after()
+    untouched = (
+        list(range(0, NQ))
+        + list(range(NQ + NKV, NQ + 2 * NKV))
+        + list(range(NQ + 2 * NKV, NQ + 2 * NKV + NIQ))
     )
-    assert torch.equal(q_out.cpu(), out["q"]), "W1 q_out mismatch"
-    assert torch.equal(
-        index_q_out.cpu().view(torch.uint8), out["index_q"]
-    ), "W1 index_q mismatch"
-    pool_cpu = pool.cpu().reshape(NUM_PAGES, 2 * NKV, ref.SLOT_REGION)
-    n_ref = out["pool"].shape[0]
-    assert torch.equal(
-        pool_cpu[:n_ref], out["pool"]
-    ), "W1 pool bytes mismatch"
-    assert int(pool_cpu[n_ref:].sum()) == 0, "W1 wrote outside mapped pages"
-    # index_k scatter: the reference returns the per-token e4m3 bytes and
-    # the caller scatters them at index_slot_mapping * 128; compare the
-    # full scattered index cache byte-for-byte.
-    ic_cpu = torch.zeros_like(inp["index_cache"]).view(torch.uint8)
-    valid = inp["index_slot_mapping"] >= 0
-    ism = inp["index_slot_mapping"][valid]
-    ic_cpu.view(-1, 128)[ism] = out["index_k"][valid]
-    assert torch.equal(
-        index_cache.cpu().view(torch.uint8), ic_cpu
-    ), "W1 index_k scatter mismatch"
-    print("case 1 OK: W1 byte-exact vs torch reference "
-          "(pool+q+index_q+index_k scatter)")
+    changed = [
+        i for i in untouched if not torch.equal(before[:, i], after[:, i])
+    ]
+    # K and index_k are rewritten in place (the readback gate 1a covers
+    # their numerics); every other row must be bit-identical.
+    k_changed = not torch.equal(
+        before[:, NQ:NQ + NKV], after[:, NQ:NQ + NKV]
+    )
+    ik_changed = not torch.equal(before[:, -1], after[:, -1])
+    passed = not changed and k_changed and ik_changed
+    return {
+        "passed": passed,
+        "summary": (
+            f"unexpectedly changed rows: {changed}"
+            if changed
+            else "only K/index_k rewritten in place"
+        )
+        + ("" if k_changed else "; processed K was NOT written back")
+        + ("" if ik_changed else "; processed index_k was NOT written back"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# R2 (decode) units
+# ---------------------------------------------------------------------------
 
 
 def _fp8_baseline(fp8_pool, block_table, topk, q, sm_scale):
@@ -131,64 +333,87 @@ def _fp8_baseline(fp8_pool, block_table, topk, q, sm_scale):
     )
 
 
-def _cos(a, b):
-    a = a.reshape(-1).to(torch.float32)
-    b = b.reshape(-1).to(torch.float32)
-    return float((a @ b) / (a.norm() * b.norm()))
-
-
-def case2_r2_accuracy(device) -> torch.Tensor:
-    """R2 cosine >= 0.99 vs fp8 baseline and fp32 oracle."""
+def _decode_fixture():
     inp = hi.decode_inputs()
     hi.validate_decode_inputs(inp)
-    (q, pool, fp8_pool, block_table, topk, seq_lens) = _cuda(
-        inp["q"], inp["pool"], inp["fp8_pool"], inp["block_table"],
-        inp["topk"], inp["seq_lens"],
-    )
-    out = torch.zeros_like(q)
-    q4k.q4_sparse_decode(
-        q, pool, topk, block_table, seq_lens, NKV, inp["sm_scale"], out, 1
-    )
-    base = _fp8_baseline(fp8_pool, block_table, topk, q, inp["sm_scale"])
-    oracle = ref.reference_sparse_attention(
-        q.to(torch.float32),
-        inp["k_vals"].contiguous(),
-        inp["v_vals"].contiguous(),
-        inp["block_table"], inp["topk"][0],
-        torch.full((q.shape[0],), TOPK * BLOCK - 1), inp["sm_scale"],
-    )
-    cos_base = _cos(out.cpu(), base)
-    cos_oracle = _cos(out.cpu(), oracle)
-    print(f"case 2: cos(R2, fp8 baseline) = {cos_base:.6f}")
-    print(f"case 2: cos(R2, fp32 oracle)  = {cos_oracle:.6f}")
-    assert cos_base >= 0.99, "R2 vs fp8 baseline below 0.99"
-    assert cos_oracle >= 0.99, "R2 vs fp32 oracle below 0.99"
-    print("case 2 OK: R2 decode cosine >= 0.99")
-    return out
-
-
-def case3_pool_bytes() -> None:
-    """Measured pool bytes must match the spec arithmetic."""
-    page_bytes = NUM_PAGES * 2 * NKV * ref.SLOT_REGION
-    assert page_bytes == NUM_PAGES * ref.q4_pool_page_bytes(NKV)
-    per_token = ref.q4_pool_bytes_per_token(NKV)
-    assert per_token == 2 * NKV * 72 == 576, per_token
-    print(f"case 3 OK: pool = {page_bytes} B total, "
-          f"{ref.q4_pool_page_bytes(NKV)} B/page, {per_token} B/token/layer")
-
-
-def case4_cuda_graph(device, eager_out) -> None:
-    """R2 must be CUDA-graph capturable with identical output."""
-    inp = hi.decode_inputs()
-    hi.validate_decode_inputs(inp)
-    # Deterministic builders: the case-4 fixture must be the very bytes
-    # case 2 ran on (otherwise the eager/graph comparison is vacuous).
     inp2 = hi.decode_inputs()
+    # Deterministic builders: case 4 must see the very bytes case 2 ran
+    # on (otherwise the eager/graph comparison is vacuous).
     for key, t in inp.items():
         if isinstance(t, torch.Tensor):
             assert torch.equal(t, inp2[key]), (
                 f"decode fixture is not deterministic in {key}"
             )
+    return inp
+
+
+def _run_r2(inp, out):
+    (q, pool, block_table, topk, seq_lens) = _cuda(
+        inp["q"], inp["pool"], inp["block_table"], inp["topk"],
+        inp["seq_lens"],
+    )
+    q4k.q4_sparse_decode(
+        q, pool, topk, block_table, seq_lens, NKV, inp["sm_scale"], out, 1
+    )
+    torch.cuda.synchronize()
+    return out.cpu()
+
+
+def unit_2() -> dict:
+    """R2 decode cosine >= 0.99 vs fp8 baseline and fp32 oracle."""
+    inp = _decode_fixture()
+    out = _run_r2(inp, torch.zeros_like(inp["q"]))
+    base = _fp8_baseline(
+        inp["fp8_pool"], inp["block_table"], inp["topk"], inp["q"],
+        inp["sm_scale"],
+    )
+    oracle = ref.reference_sparse_attention(
+        inp["q"].to(torch.float32),
+        inp["k_vals"].contiguous(),
+        inp["v_vals"].contiguous(),
+        inp["block_table"], inp["topk"][0],
+        torch.full((inp["q"].shape[0],), TOPK * BLOCK - 1),
+        inp["sm_scale"],
+    )
+    cos_base = _cos(out, base)
+    cos_oracle = _cos(out, oracle)
+    finite = bool(torch.isfinite(out).all())
+    passed = finite and cos_base >= 0.99 and cos_oracle >= 0.99
+    return {
+        "passed": passed,
+        "cos_vs_fp8_baseline": cos_base,
+        "cos_vs_fp32_oracle": cos_oracle,
+        "output_finite": finite,
+        "summary": (
+            f"cos(R2, fp8 baseline)={cos_base:.6f} "
+            f"cos(R2, fp32 oracle)={cos_oracle:.6f} finite={finite}"
+        ),
+    }
+
+
+def unit_3() -> dict:
+    """Measured pool bytes must match the spec arithmetic."""
+    page_bytes = NUM_PAGES * 2 * NKV * ref.SLOT_REGION
+    per_token = ref.q4_pool_bytes_per_token(NKV)
+    ok = (
+        page_bytes == NUM_PAGES * ref.q4_pool_page_bytes(NKV)
+        and per_token == 2 * NKV * 72 == 576
+    )
+    return {
+        "passed": ok,
+        "pool_bytes_per_page": ref.q4_pool_page_bytes(NKV),
+        "pool_bytes_per_token_per_layer": per_token,
+        "summary": (
+            f"pool = {page_bytes} B total, {ref.q4_pool_page_bytes(NKV)} "
+            f"B/page, {per_token} B/token/layer"
+        ),
+    }
+
+
+def unit_4() -> dict:
+    """R2 must be CUDA-graph capturable with identical output."""
+    inp = _decode_fixture()
+    eager = _run_r2(inp, torch.zeros_like(inp["q"]))
     (q, pool, topk, block_table, seq_lens) = _cuda(
         inp["q"], inp["pool"], inp["topk"], inp["block_table"],
         inp["seq_lens"],
@@ -213,17 +438,72 @@ def case4_cuda_graph(device, eager_out) -> None:
     out.zero_()
     g.replay()
     torch.cuda.synchronize()
-    assert torch.equal(out, eager_out), "CUDA-graph replay differs from eager"
-    print("case 4 OK: CUDA-graph capture of R2 reproduces eager output")
+    replay = out.cpu()
+    identical = bool(torch.equal(replay, eager))
+    return {
+        "passed": identical,
+        "summary": (
+            "capture replay bit-identical to eager"
+            if identical
+            else "capture replay differs from eager"
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
-# CPU dry run: build every case's inputs, validate them and run every
-# pure-torch reference path on CPU (no triton, no GPU). Runs on the VPS.
+# Runner: every unit runs to completion; one line per unit; JSON receipt;
+# non-zero exit if anything failed.
 # ---------------------------------------------------------------------------
 
 
-def _dry_run_case1() -> None:
+def _short_error(exc: BaseException) -> str:
+    lines = traceback.format_exc(limit=6).strip().splitlines()
+    return lines[-1] if lines else f"{type(exc).__name__}: {exc}"
+
+
+def run_units(units, json_path: str | None, header: str) -> int:
+    results: list[dict] = []
+    print(header)
+    for name, fn in units:
+        try:
+            diag = fn()
+            diag = dict(diag)
+        except Exception as exc:  # noqa: BLE001 - one verdict per unit
+            diag = {"passed": False, "error": _short_error(exc)}
+        passed = bool(diag.get("passed"))
+        entry = {"case": name, "status": "PASS" if passed else "FAIL"}
+        entry.update(diag)
+        results.append(entry)
+        line = f"case {name}: {entry['status']}"
+        if passed and diag.get("summary"):
+            line += f" — {diag['summary']}"
+        elif not passed:
+            line += f" — {diag.get('reason') or diag.get('summary') or diag.get('error')}"
+        print(line)
+    verdict = "PASS" if all(r["status"] == "PASS" for r in results) else "FAIL"
+    receipt = {
+        "harness": "gb10_q4kv_parity",
+        "generated": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "verdict": verdict,
+        "results": results,
+    }
+    if json_path:
+        Path(json_path).write_text(json.dumps(receipt, indent=2) + "\n")
+        print(f"receipt written to {json_path}")
+    print(f"VERDICT: {verdict} ({sum(r['status'] == 'PASS' for r in results)}"
+          f"/{len(results)} units passed)")
+    return 0 if verdict == "PASS" else 1
+
+
+# ---------------------------------------------------------------------------
+# CPU dry run: build every case's inputs, validate them, run every
+# pure-torch reference path on CPU (no triton, no GPU), and exercise the
+# gate functions themselves on synthetic perturbations.
+# ---------------------------------------------------------------------------
+
+
+def _dry_w1_reference() -> dict:
+    """The reference packer runs and writes exactly the mapped pages."""
     inp = hi.w1_inputs()
     hi.validate_w1_inputs(inp)
     nw = inp["norm_ws"]
@@ -232,7 +512,6 @@ def _dry_run_case1() -> None:
         inp["positions"], EPS, ROTARY, NQ, NKV, NIQ,
         inp["slot_mapping"], inp["index_slot_mapping"],
     )
-    # The reference must complete and write exactly the mapped pages.
     sm = inp["slot_mapping"][inp["slot_mapping"] >= 0]
     want_pages = sorted({int(p) for p in (sm // BLOCK).tolist()})
     n_ref = out["pool"].shape[0]
@@ -252,32 +531,190 @@ def _dry_run_case1() -> None:
     kn = ref.rope_partial_neox(
         ref.gemma_rmsnorm(x[:, NQ:NQ + NKV], nw["k"], EPS), cos_sin
     )
-    deq = ref.dequant_pool_pages(out["pool"])  # [pages, 2*nkv, 128, 128]
+    deq = ref.dequant_pool_pages(out["pool"])
     for i, sm_i in enumerate(inp["slot_mapping"].tolist()):
         if sm_i < 0:
             continue
         page, tok = sm_i // BLOCK, sm_i % BLOCK
         for head in range(NKV):
             got_k = deq[page, 2 * head, tok]
-            want_k = ref.unpack_q4_row(
-                *ref.pack_q4_row(kn[i, head])
-            )
-            assert torch.equal(got_k, want_k), f"K scatter offsets t{i}h{head}"
+            want_k = ref.unpack_q4_row(*ref.pack_q4_row(kn[i, head]))
+            assert torch.equal(got_k, want_k), f"K offsets t{i}h{head}"
             got_v = deq[page, 2 * head + 1, tok]
             want_v = ref.unpack_q4_row(
                 *ref.pack_q4_row(x[i, NQ + NKV + head].to(torch.bfloat16))
             )
-            assert torch.equal(got_v, want_v), f"V scatter offsets t{i}h{head}"
-    # index_k scatter bytes: e4m3 of clamp(processed, +-448).
+            assert torch.equal(got_v, want_v), f"V offsets t{i}h{head}"
     ikn = ref.rope_partial_neox(
         ref.gemma_rmsnorm(x[:, -1], nw["ik"], EPS), cos_sin
     )
     assert torch.equal(out["index_k"], ref._e4m3_clamped(ikn))
-    print("dry run case 1 OK: inputs valid, reference packer runs and "
-          "writes exactly the mapped pages/slots")
+    return {
+        "passed": True,
+        "summary": "inputs valid; reference packer runs and writes "
+        "exactly the mapped pages/slots",
+    }
 
 
-def _dry_run_decode() -> None:
+def _dry_gate_a() -> dict:
+    """Gate (a) self-test on the reference's own rows: a sparse 1-ulp
+    perturbation must PASS, gross corruption must FAIL."""
+    inp = hi.w1_inputs()
+    hi.validate_w1_inputs(inp)
+    nw = inp["norm_ws"]
+    n = inp["qkv"].shape[0]
+    x = inp["qkv"].to(torch.float32).view(n, -1, ref.HEAD_DIM)
+    cs = inp["cos_sin"].to(torch.float32)[inp["positions"]][:, :ROTARY]
+    base = ref.rope_partial_neox(
+        ref.gemma_rmsnorm(x[:, :NQ], nw["q"], EPS), cs
+    ).to(torch.bfloat16)
+    scenarios = []
+    # 1) sparse 1-ulp perturbation (the expected kernel-vs-reference
+    #    noise shape): must pass.
+    sparse = gates.bf16_ulp_step(base, +1, fraction=1 / 1024, seed=0)
+    scenarios.append(
+        ("sparse-1ulp-must-pass",
+         gates.gate_bf16_numerics(sparse, base, "selftest"), True)
+    )
+    # 2) identical rows: must pass.
+    scenarios.append(
+        ("identical-must-pass",
+         gates.gate_bf16_numerics(base, base, "selftest"), True)
+    )
+    # 3) gross corruption (1% additive): must fail.
+    gross = base + (torch.randn(base.shape) * 0.05).to(torch.bfloat16)
+    scenarios.append(
+        ("gross-must-fail",
+         gates.gate_bf16_numerics(gross, base, "selftest"), False)
+    )
+    # 4) one-sided NaN: must fail.
+    nan = base.clone()
+    nan.view(-1)[0] = float("nan")
+    scenarios.append(
+        ("one-sided-nan-must-fail",
+         gates.gate_bf16_numerics(nan, base, "selftest"), False)
+    )
+    bad = [
+        (name, c["passed"])
+        for name, c, want in scenarios
+        if c["passed"] != want
+    ]
+    return {
+        "passed": not bad,
+        "summary": (
+            "gate behaves as specified on all 4 scenarios"
+            if not bad
+            else f"gate misbehaved on {bad}"
+        ),
+        "scenarios": [
+            {"scenario": name, "expected_pass": want, **c}
+            for name, c, want in scenarios
+        ],
+    }
+
+
+def _dry_gate_b() -> dict:
+    """Gate (b) self-test: byte-identical must pass; a single flipped
+    nibble and a single flipped scale byte must fail."""
+    inp = hi.w1_inputs()
+    hi.validate_w1_inputs(inp)
+    nw = inp["norm_ws"]
+    out = ref.reference_w1_write(
+        inp["qkv"], nw["q"], nw["k"], nw["iq"], nw["ik"], inp["cos_sin"],
+        inp["positions"], EPS, ROTARY, NQ, NKV, NIQ,
+        inp["slot_mapping"], inp["index_slot_mapping"],
+    )
+    pool = out["pool"]
+    scenarios = [
+        ("identical-must-pass",
+         gates.gate_bytes_exact(pool, pool, "selftest"), True),
+    ]
+    # A single flipped data nibble (offset 0 of the packed region).
+    flipped = pool.clone()
+    flipped.view(-1)[0] ^= 0x01
+    scenarios.append(
+        ("single-flipped-nibble-must-fail",
+         gates.gate_bytes_exact(flipped, pool, "selftest"), False),
+    )
+    # A single flipped e4m3 scale byte (inside the scale region).
+    flipped = pool.clone()
+    flipped.view(-1)[ref.DATA_REGION + 17] ^= 0x01
+    scenarios.append(
+        ("single-flipped-scale-byte-must-fail",
+         gates.gate_bytes_exact(flipped, pool, "selftest"), False),
+    )
+    bad = [
+        (name, c["passed"])
+        for name, c, want in scenarios
+        if c["passed"] != want
+    ]
+    return {
+        "passed": not bad,
+        "summary": (
+            "gate behaves as specified on all 3 scenarios"
+            if not bad
+            else f"gate misbehaved on {bad}"
+        ),
+        "scenarios": [
+            {"scenario": name, "expected_pass": want, **c}
+            for name, c, want in scenarios
+        ],
+    }
+
+
+def _dry_gate_c() -> dict:
+    """Gate (c) self-test: byte-identical and sparse 1-code-step noise
+    must pass; a 3-code-step jump and a one-sided NaN code must fail."""
+    inp = hi.w1_inputs()
+    hi.validate_w1_inputs(inp)
+    base = torch.zeros((64, ref.HEAD_DIM), dtype=torch.uint8)
+    base.view(-1).random_(0, 0x7F)  # valid finite e4m3 magnitude codes
+    scenarios = [
+        ("identical-must-pass",
+         gates.gate_e4m3_codes(base, base, "selftest"), True),
+    ]
+    sparse = gates.e4m3_code_step(
+        base, +1, fraction=4 / base.numel(), seed=0
+    )
+    scenarios.append(
+        ("sparse-1-code-step-must-pass",
+         gates.gate_e4m3_codes(sparse, base, "selftest"), True),
+    )
+    jump = gates.e4m3_code_step(
+        base, +3, fraction=4 / base.numel(), seed=1
+    )
+    scenarios.append(
+        ("3-code-step-jump-must-fail",
+         gates.gate_e4m3_codes(jump, base, "selftest"), False),
+    )
+    nan = base.clone()
+    nan.view(-1)[0] = 0x7F  # the NaN code on one side only
+    scenarios.append(
+        ("one-sided-nan-code-must-fail",
+         gates.gate_e4m3_codes(nan, base, "selftest"), False),
+    )
+    bad = [
+        (name, c["passed"])
+        for name, c, want in scenarios
+        if c["passed"] != want
+    ]
+    return {
+        "passed": not bad,
+        "summary": (
+            "gate behaves as specified on all 4 scenarios"
+            if not bad
+            else f"gate misbehaved on {bad}"
+        ),
+        "scenarios": [
+            {"scenario": name, "expected_pass": want, **c}
+            for name, c, want in scenarios
+        ],
+    }
+
+
+def _dry_decode() -> dict:
+    """Decode fixture validity: the fp8 baseline and the fp32 oracle run
+    to completion on CPU and agree before any kernel runs."""
     inp = hi.decode_inputs()
     hi.validate_decode_inputs(inp)
     base = _fp8_baseline(
@@ -293,45 +730,91 @@ def _dry_run_decode() -> None:
     assert torch.isfinite(base).all(), "fp8 baseline produced NaN/inf"
     assert torch.isfinite(oracle).all(), "fp32 oracle produced NaN/inf"
     cos = _cos(base, oracle)
-    print(f"dry run cases 2/4: cos(fp8 baseline, fp32 oracle) = "
-          f"{cos:.6f}")
-    assert cos >= 0.99, "baseline and oracle disagree before any kernel"
-    print("dry run cases 2/4 OK: decode fixture valid; baseline and "
-          "oracle run to completion on CPU (Triton R2 skipped)")
+    return {
+        "passed": cos >= 0.99,
+        "cos_baseline_oracle": cos,
+        "summary": f"cos(fp8 baseline, fp32 oracle) = {cos:.6f}; "
+        "both reference paths run to completion",
+    }
 
 
-def cpu_dry_run() -> None:
-    print("cpu dry run: no GPU/triton required (reference paths only)")
-    _dry_run_case1()
-    _dry_run_decode()
-    case3_pool_bytes()
-    print("ALL CPU dry-run q4 KV parity checks PASSED "
-          "(inputs consistent; reference paths run; Triton skipped)")
+def cpu_dry_run() -> int:
+    units = [
+        ("dry/0-w1-reference-runs", _dry_w1_reference),
+        ("dry/1a-gate-numerics-selftest", _dry_gate_a),
+        ("dry/1b-gate-bytes-selftest", _dry_gate_b),
+        ("dry/1c-gate-index-codes-selftest", _dry_gate_c),
+        ("dry/2-decode-reference-runs", _dry_decode),
+        ("dry/3-pool-bytes", unit_3),
+    ]
+    return run_units(
+        units,
+        None,
+        "cpu dry run: no GPU/triton required (reference paths and gate "
+        "self-tests only)",
+    )
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+
+def _frontend_check_unit() -> dict:
+    import q4kv_triton_frontend_check
+
+    try:
+        q4kv_triton_frontend_check.main()
+    except SystemExit as exc:
+        ok = exc.code in (0, None)
+        return {
+            "passed": ok,
+            "summary": (
+                "W1 + R2 frontend-compile for sm_121 in every variant"
+                if ok
+                else "frontend compile failure (see the errors above)"
+            ),
+        }
+    return {"passed": True, "summary": "frontend check returned"}
 
 
 def main() -> None:
     argv = list(sys.argv[1:])
-    if argv == ["--cpu-dry-run"]:
-        cpu_dry_run()
-        return
-    if argv:
-        sys.exit(f"unknown arguments {argv} (only --cpu-dry-run is supported)")
+    json_path: str | None = None
+    dry = False
+    it = iter(argv)
+    for a in it:
+        if a == "--cpu-dry-run":
+            dry = True
+        elif a == "--json":
+            json_path = next(it, None)
+            if json_path is None:
+                sys.exit("--json requires a PATH argument")
+        else:
+            sys.exit(f"unknown argument {a} (only --json PATH and "
+                     "--cpu-dry-run are supported)")
+    if dry:
+        sys.exit(cpu_dry_run())
     if not torch.cuda.is_available():
         sys.exit("GB10 only: CUDA is required (use --cpu-dry-run on the VPS)")
     cap = torch.cuda.get_device_capability()
     print(f"device: {torch.cuda.get_device_name()} sm_{cap[0]}{cap[1]}")
-    dev = "cuda"
-    # Frontend-compile W1/R2 for sm_121 FIRST (no GPU math involved):
-    # a kernel that cannot compile must fail here with a clear message,
-    # not inside case 1 (the GB10 val1 failure class).
-    import q4kv_triton_frontend_check
-
-    q4kv_triton_frontend_check.main()
-    case1_w1_byte_exact()
-    eager_out = case2_r2_accuracy(dev)
-    case3_pool_bytes()
-    case4_cuda_graph(dev, eager_out)
-    print("ALL GB10 q4 KV parity cases PASSED")
+    units = [
+        ("0/frontend-check", _frontend_check_unit),
+        ("1a/w1-norm-rope-numerics", unit_1a),
+        ("1b/w1-packing-bytes", unit_1b),
+        ("1c/w1-index-bytes", unit_1c),
+        ("1d/w1-rewrite-scope", unit_1d),
+        ("2/r2-decode-accuracy", unit_2),
+        ("3/pool-bytes", unit_3),
+        ("4/cuda-graph-replay", unit_4),
+    ]
+    sys.exit(
+        run_units(
+            units, json_path,
+            f"GB10 q4 KV parity: {len(units)} units, all run to completion",
+        )
+    )
 
 
 if __name__ == "__main__":

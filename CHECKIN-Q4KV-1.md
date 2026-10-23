@@ -320,5 +320,130 @@ pre-existing failures as the unmodified tree (verified by stash/run/pop)
 Unverified on this VPS (no GPU, no triton): the actual GB10 re-run of
 cases 1, 2 and 4 — W1 byte-exactness against the now-real rotary
 cache and index cache, R2 cosine on real-shaped data, and CUDA-graph
-capture. The exact GB10 command is unchanged except nothing; the
-CPU dry run must precede it.
+capture. The exact GB10 command is unchanged except nothing; the CPU dry
+run must precede it.
+
+## Post-val3 fix: gate what matters, run everything, JSON receipt (this commit)
+
+GB10 val3 result: step 0 passed (W1+R2 frontend-compile for sm_121),
+then case 1 died at `assert torch.equal(q_out, ...)` — the Triton W1
+kernel's post-QK-norm+RoPE Q differs from the pure-torch reference by
+last-bit fp32 noise, and the harness stopped there: nothing about K/V
+pool bytes, index bytes, R2 cosine, pool bytes or CUDA-graph capture
+was measured. The CHECKIN already documented that bit-exact bf16
+Q/K after norm+RoPE is NOT a realistic gate (the reference uses a
+precisely-rounded 1/sqrt, the kernel the hardware `sqrt.approx.f32`
+like the vendor op's `rsqrtf` — verified in the image csrc
+`fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu:141` — and the
+sum-of-squares reduction order differs). The gate was wrong, not the
+kernel.
+
+**Analysis first (what can legitimately differ, and what cannot):**
+the two noise sources are bounded at a handful of fp32 ulps (~2^-21
+relative). After bf16 rounding such a perturbation either rounds to
+the same bf16 number or to the adjacent one, so kernel-vs-reference
+bf16 rows differ by at most 1 bf16 ulp on a small fraction of
+elements. Everything else in the kernel was re-derived against the
+reference and the vendor csrc: partial NeoX RoPE pairing for rotary
+dim 64 (partner d±32, halved cos/sin indexing) is bit-identical to
+the reference; the norm is Gemma-style `x*rsqrt(mean+eps)*(1+w)` with
+the same eps, the same (1+w) and reduction length 128 in both; and
+the vendor op encodes index_q/index_k e4m3 bytes from the fp32
+in-register values (no bf16 materialization), exactly as the reference
+and our kernel do.
+
+**Real bug found and fixed — the payload quotient.** The reference
+spec pins the payload quotient as RZ at fp32 precision
+(`rz(x * rn(1/s))`, `rz_rounded_product`), but the Triton packer
+computed the plain RN product (`q = xb * (1/s_vec)`): at the e2m1
+decision boundaries the kernel emitted payload bytes the spec'd packer
+does not. Worse, auditing the reference's own emulation (now factored
+into `rz_rounded_product`) showed its correction condition was
+SIGNED (`p > exact`), which is true RZ only for positive products:
+negative quotients that had rounded away from zero kept a magnitude
+ABOVE the exact product. Both are fixed: the quotient steps one
+representable value toward zero iff the RN product landed on the
+away-from-zero side of the exact (f64) product, for BOTH signs — the
+literal definition of RZ. The Triton `_rz_product` mirrors the
+reference bit-for-bit (f64 product compare + sign-magnitude bit
+pattern decrement); the fp64 mul is two slow ops on a write path,
+carried for exactness. The CPU tests pin the property differentially:
+the shipped implementation never exceeds the exact magnitude on
+either sign, the correction triggers on both signs, and the PRE-FIX
+condition is reproduced violating the property.
+
+**New gate module `tools/q4kv_gates.py` (pure torch):**
+- `gate_bf16_numerics` (gate a): max bf16 ulp distance (monotone-key
+  bit distance), max_abs, mismatched count/fraction, cosine; PASS iff
+  max ulp <= 2 AND cos >= 0.99999 AND finiteness agrees. The 2-ulp
+  limit carries a full 2x margin over the <= 1 ulp the two legitimate
+  noise sources can produce; a uniform 1-ulp shift (a systematic
+  2^-8-relative bias no legitimate noise source produces) fails the
+  cosine leg (~1 - 2^-15 < 0.99999).
+- `gate_bytes_exact` (gate b): byte-identical or fail, with the exact
+  mismatch count and first mismatching flat offset.
+- `gate_e4m3_codes` (gate c): for the fp8 index bytes (no bf16
+  readback exists — vendor and reference encode fp32 directly): max
+  distance in representable-value code steps (sign-magnitude monotone
+  key) and decoded cosine; PASS iff <= 2 code steps AND cos >=
+  0.99999 AND no one-sided NaN code. The fp32 noise can move a byte by
+  at most 1 code step with probability ~2^-18 per element.
+- `bf16_ulp_step` / `e4m3_code_step`: synthetic-perturbation helpers
+  for the dry run and tests.
+
+**Harness restructure (`tools/gb10_q4kv_parity.py`):** every unit runs
+to completion inside its own try/except — one PASS/FAIL line per unit,
+full per-gate diagnostics, JSON receipt via `--json PATH`, final
+verdict, exit non-zero iff any unit failed. Units: 0 frontend check;
+1a norm+RoPE numerics (q_out + the processed K/index_k rows read back
+from qkv, gate a); 1b packing byte-exactness DECOUPLED from the norm
+rounding — the reference packer run on the kernel's OWN processed
+rows (read back after the call; V is not normed) must reproduce the
+kernel's pool bytes byte-for-byte (bf16 rounding is idempotent, so
+both packers see identical fp32 inputs there; any differing byte is a
+real packing bug), plus unmapped-pages-stay-zero; 1c index_q/index_k
+bytes (gate c — byte-exactness is impossible by design, and the
+receipt says so); 1d rewrite scope (only K/index_k rows of qkv change;
+Q/V/index_q rows bit-identical — nothing downstream consumes an
+in-place Q on the q4 path, the sparse layer reads its query from the
+dedicated q_out buffer, image model.py:642); 2 R2 cosine >= 0.99 vs
+fp8 baseline AND fp32 oracle, NaN-free; 3 pool bytes; 4 CUDA-graph
+replay bit-identical to eager (case 4 now runs its own eager pass, so
+a case-2 failure no longer blanks case 4).
+
+**CPU dry run extended:** the reference paths still run to completion
+(mapped pages/slots, dequant round-trip, index_k bytes,
+baseline-vs-oracle cosine 0.999628) and every gate is self-tested on
+synthetic perturbations: sparse 1-ulp passes, uniform 1-ulp and gross
+corruption fail; a single flipped nibble and a single flipped scale
+byte fail; sparse 1-code-step passes, 3-code-step and one-sided NaN
+fail. VERDICT PASS (6/6 units) on this VPS.
+
+**Tests:** 8 new (39/39 green in `tests/test_minimax_q4kv.py`): gate
+semantics (a/b/c, exact metrics and first-mismatch offsets), the rz
+property + pre-fix differential, the kernel's `_rz_product` source
+pin, the harness's per-unit completion/JSON/non-zero-exit pins, the
+kernel's-own-rows pin for unit 1b, and the dry-run gate self-test
+pins. Full suite: 610 passed, 39 skipped, the same 8 pre-existing
+failures as the unmodified tree — failure set identical to the
+baseline.
+
+**Exact GB10 command (parent executes; the worktree is mounted
+read-only, the toolchain lives in the image, and the receipt must be
+written to the mounted receipts volume):**
+
+```
+docker run <minimax-m3.1-flash vllm image, vLLM 0.1.dev23341+g8744dd2fb> \
+  -v <this worktree>:/plugin:ro -v <receipts dir>:/receipts \
+  -w /plugin -e PYTHONPATH=/plugin/src \
+  python3 tools/gb10_q4kv_parity.py --json /receipts/val4/q4kv.json
+```
+
+Unverified on this VPS (no GPU, no triton): the sm_121 compile of the
+new `_rz_product` (fp64 ops in Triton — if the frontend refuses fp64
+on sm_121, unit 0 fails loudly and the fallback is an fma-based
+two-product emulation of the same RZ condition), and every GPU unit's
+actual verdict. One GB10 run now yields the full picture: the receipt
+will contain per-gate ulp/code-distance/mismatch/cosine numbers for
+q_out, processed K, index_k, the packing byte comparison, both R2
+cosines, the pool byte counts and the CUDA-graph replay result.

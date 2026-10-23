@@ -165,6 +165,25 @@ def _build_kernels():
         return tl.where(in_rope, rotated, xn)
 
     @triton.jit
+    def _rz_product(x, c):
+        # RZ(x * c) at fp32 precision, mirroring ref.rz_rounded_product
+        # bit-for-bit: p is the fp32 RN product; when p landed on the
+        # away-from-zero side of the exact (f64) product, step it one
+        # representable value toward zero (sign-magnitude bit pattern
+        # - 1) — for BOTH signs. Non-finite products pass through
+        # unmodified (the e2m1 ladder saturates them), exactly as the
+        # reference's isfinite guard does.
+        p = x * c
+        pd = x.to(tl.float64) * c.to(tl.float64)
+        sign_pd = tl.where(pd < 0.0, -1.0, 1.0)
+        away = (p.to(tl.float64) - pd) * sign_pd > 0.0
+        finite = (p == p) & (p != float("inf")) & (p != float("-inf"))
+        fix = away & finite
+        bits = tl.cast(p, tl.int32, bitcast=True)
+        bits = tl.where(fix, bits - 1, bits)
+        return tl.cast(bits, tl.float32, bitcast=True)
+
+    @triton.jit
     def _pack_q4(xb, tok, side):
         # xb: [128] fp32 (already bf16-materialized); returns (data [64]
         # uint8, scale_bytes [8] uint8). side: 0 = K (linear scale layout),
@@ -176,7 +195,9 @@ def _build_kernels():
         s_code = _e4m3_mag_code(s).to(tl.uint8)  # [1, 8]
         s_val = tl.reshape(_e4m3_decode(s_code), (8,))
         s_vec = tl.reshape(_expand16(tl.reshape(s_val, (1, 8))), (128,))
-        q = xb * (1.0 / s_vec)
+        # Payload quotient: RZ(x * RN(1/s)) exactly as the reference packer
+        # (ref.rz_rounded_product) — NOT the plain RN product.
+        q = _rz_product(xb, 1.0 / s_vec)
         code = _e2m1_code(tl.abs(q))
         sign = (tl.cast(q, tl.int32, bitcast=True) < 0).to(tl.int64)
         nib = tl.where(code == 0, 0, code | (sign * 8))
