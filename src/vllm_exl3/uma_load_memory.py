@@ -268,6 +268,29 @@ def trim_before_kv_enabled() -> bool:
     return _flag("VLLM_EXL3_TRIM_BEFORE_KV")
 
 
+def process_table(top: int = 6) -> str:
+    """RssAnon/RssFile per visible process (largest anon first)."""
+    rows = []
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/status") as fh:
+                st = dict(
+                    line.split(":", 1) for line in fh.read().splitlines() if ":" in line
+                )
+            anon = int(st.get("RssAnon", "0 kB").split()[0])
+            filek = int(st.get("RssFile", "0 kB").split()[0])
+            rows.append((anon, filek, d, st.get("Name", "?").strip()))
+        except Exception:  # noqa: BLE001 - processes come and go
+            continue
+    rows.sort(reverse=True)
+    body = " ".join(
+        f"{name}[{pid}]:anon={_gib(a):.2f}/file={_gib(f):.2f}" for a, f, pid, name in rows[:top]
+    )
+    return f"PROCS total_anon={_gib(sum(r[0] for r in rows)):.2f}GiB {body}"
+
+
 def _staged(fn: Any, tag: str) -> Any:
     @wraps(fn)
     def run(self, *args, **kwargs):
@@ -276,11 +299,18 @@ def _staged(fn: Any, tag: str) -> Any:
                 logger.info("%s", mem_line(f"PRE_{tag}_UNTRIMMED"))
             trim()
             STATS[f"trim_{tag.lower()}"] = STATS.get(f"trim_{tag.lower()}", 0) + 1
+        census = _flag("VLLM_EXL3_MEM_PROBE_TENSORS")
         if probe_enabled():
             logger.info("%s", mem_line(f"PRE_{tag}"))
+            if census:
+                logger.info("%s tag=PRE_%s", process_table(), tag)
+                logger.info("%s tag=PRE_%s", tensor_census(top=10), tag)
+                logger.info("%s tag=PRE_%s", tensor_census(top=24, device="cuda"), tag)
         out = fn(self, *args, **kwargs)
         if probe_enabled():
             logger.info("%s", mem_line(f"POST_{tag}"))
+            if census:
+                logger.info("%s tag=POST_%s", process_table(), tag)
         return out
 
     run._uma_staged = True

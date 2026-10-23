@@ -302,3 +302,8 @@ def test_target_load_installs_worker_hooks_lazily(monkeypatch):
     Loader().load_model(None, target_cfg)
     assert getattr(Worker.initialize_from_config, "_uma_staged", False)
     assert getattr(Worker.compile_or_warm_up_model, "_uma_staged", False)
+
+
+def test_process_table_reads_proc():
+    line = uma.process_table(top=3)
+    assert line.startswith("PROCS total_anon=")
