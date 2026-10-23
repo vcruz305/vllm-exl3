@@ -44,7 +44,13 @@ def register() -> None:
 
     # Optional 4-bit (nvfp4-layout) main KV cache for MiniMax-M3 on GB10
     # (sm_121). Default off: without the flag nothing is patched and engine
-    # behavior is byte-identical.
+    # behavior is byte-identical. install() imports every binding module
+    # itself and patches the hook attributes on each of them, so it does NOT
+    # depend on the import order of the modules above or below: a module
+    # that already imported a hook by value (e.g. minimax_m3/nvidia/model.py)
+    # is patched on its own attribute here. VLLM_EXL3_Q4KV reaches the
+    # EngineCore process with the rest of the environment (mp spawn inherits
+    # os.environ; the Ray path copies every VLLM_-prefixed variable).
     import os
 
     if os.environ.get("VLLM_EXL3_Q4KV") == "1":

@@ -726,6 +726,12 @@ def q4_sparse_decode(
     total_q, num_heads, head_dim = q.shape
     if head_dim != 128:
         raise ValueError("q4 decode requires head_dim == 128")
+    if pool.dtype is not torch.uint8:
+        raise ValueError(
+            "q4 decode requires the pool as raw uint8 bytes, got "
+            f"{_dtype_name(pool)}; the overlay must re-view the container "
+            "before dispatch"
+        )
     if pool.dim() != 4 or pool.shape[1] != 2 * num_kv_heads:
         raise ValueError("q4 pool geometry mismatch")
     if pool.stride(2) != 72 or pool.stride(1) != 9216 or pool.stride(3) != 1:

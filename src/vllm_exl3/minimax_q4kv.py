@@ -26,6 +26,17 @@ draft pool stay fp8 and are untouched):
 
 All wrappers fail closed: they raise on any unsupported combination rather
 than silently miscomputing.
+
+Binding audit (why ``install`` patches module ATTRIBUTES on every importer):
+upstream modules import the hooks BY VALUE (``from ... import hook``), so
+patching only the defining module's attribute never reaches an importer that
+was already loaded -- exactly the boot17 failure, where
+``models/minimax_m3/nvidia/model.py:128``'s by-value import of
+``select_main_backend_and_impl_cls`` kept the original SM100-only selector
+and the engine died at model init. ``install`` therefore imports every
+binding module itself and patches the attribute on each of them; the
+binding sites are enumerated in ``_REQUIRED_BINDING_SITES`` /
+``_OPTIONAL_BINDING_SITES`` and verified by a fail-closed self-check.
 """
 
 from __future__ import annotations
@@ -74,6 +85,28 @@ def _assert_unit_scale(name: str, scale: object) -> None:
             f"q4 KV milestone 1 implements the unit global scale only; "
             f"{name} must be None or 1.0, got {scale}"
         )
+
+
+def _q4_pool_bytes(pool: torch.Tensor) -> torch.Tensor:
+    """The bound q4 container as raw uint8 bytes (fail closed otherwise).
+
+    vLLM's Triton impl views ANY quantized pool as its fp8 dtype before the
+    reader hooks -- ``use_fp8_kv = is_quantized_kv_cache("nvfp4")`` is True
+    (vllm/models/minimax_m3/common/sparse_attention.py:465 with
+    vllm/v1/kv_cache_interface.py:116), and the impl's forward re-views the
+    pool at sparse_attention.py:480. The bound container is one byte per
+    element either way; re-view it to uint8 (same storage) so the
+    byte-level kernels see raw bytes. A wider dtype cannot be the bound
+    container and is refused.
+    """
+    if pool.dtype is torch.uint8:
+        return pool
+    if pool.element_size() != 1:
+        raise ValueError(
+            "q4 pool elements must be 1 byte; refusing to re-view "
+            f"dtype {pool.dtype}"
+        )
+    return pool.view(torch.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -147,9 +180,23 @@ def _route_q4(kv_cache_dtype: str) -> bool:
     return True
 
 
-def _make_select_main(original):
-    backend_cls = _build_backend_cls()
+def _q4_backend_cls():
+    """Build the overlay backend class lazily (once), at first q4 routing.
 
+    Building at install time would drag ``vllm.utils.torch_utils`` /
+    ``vllm.v1.kv_cache_interface`` in eagerly; the class is only needed on
+    the q4 route, and the lazy import fails loudly there if unavailable.
+    """
+    global _Q4_BACKEND_CLS
+    if _Q4_BACKEND_CLS is None:
+        _Q4_BACKEND_CLS = _build_backend_cls()
+    return _Q4_BACKEND_CLS
+
+
+_Q4_BACKEND_CLS = None
+
+
+def _make_select_main(original):
     def select_main_backend_and_impl_cls(
         *,
         topk_blocks: int,
@@ -168,7 +215,7 @@ def _make_select_main(original):
                 kv_cache_dtype,
                 topk_blocks,
             )
-            return backend_cls, MiniMaxM3SparseTritonImpl
+            return _q4_backend_cls(), MiniMaxM3SparseTritonImpl
         return original(
             topk_blocks=topk_blocks,
             kv_cache_dtype=kv_cache_dtype,
@@ -225,6 +272,7 @@ def _make_w1_wrapper(original):
         pool = bound.get("kv_cache")
         if not _is_q4_pool(pool):
             return original(*args, **kwargs)
+        pool = _q4_pool_bytes(pool)
         # ---- q4 route (fail closed) ----
         if bound.get("kv_cache_dtype") != "nvfp4":
             raise ValueError(
@@ -313,6 +361,7 @@ def _make_decode_wrapper(original):
                 k_scale=k_scale,
                 v_scale=v_scale,
             )
+        kv_cache = _q4_pool_bytes(kv_cache)
         _assert_unit_scale("k_scale", k_scale)
         _assert_unit_scale("v_scale", v_scale)
         from vllm_exl3 import minimax_q4kv_kernels as kernels
@@ -364,6 +413,7 @@ def _make_prefill_wrapper(original):
                 k_scale=k_scale,
                 v_scale=v_scale,
             )
+        kv_cache = _q4_pool_bytes(kv_cache)
         _assert_unit_scale("k_scale", k_scale)
         _assert_unit_scale("v_scale", v_scale)
         # Milestone-1 staging: dequantize the selected physical pages to
@@ -392,35 +442,233 @@ def _make_prefill_wrapper(original):
 # Install
 # ---------------------------------------------------------------------------
 
+# Attribute that marks every overlay wrapper (install idempotency + the
+# fail-closed self-check).
+_Q4KV_WRAPPER_MARKER = "__vllm_exl3_q4kv_wrapper__"
+
+# (module path, attribute name, hook) for every binding of the four hooked
+# callables. REQUIRED sites exist on every platform the overlay can serve;
+# an unpatched one is exactly the boot17 failure mode (the engine keeps the
+# upstream SM100-only selector), so import failure or a missing attribute
+# is a hard error. Verified against the current vllm-image:
+#   - common/ops/__init__.py:11 re-exports the reader hooks by value;
+#   - common/sparse_attention.py:35/:40 imports them by value (common.ops
+#     off ROCm, amd.ops on ROCm) and :525 defines the selector;
+#   - nvidia/model.py:128 imports the selector BY VALUE (boot17);
+#   - amd/model.py:133 imports the selector BY VALUE;
+#   - nvidia/sparse_attention_msa.py:29 imports the decode hook by value;
+#   - amd/ops/sparse_attn.py:18 re-exports the decode hook by value.
+# The W1 op is called only as ``ops.<name>`` on the ``vllm._custom_ops``
+# module object (nvidia/model.py:22, amd/model.py:26, dspark.py:16), so the
+# single module-attribute patch covers every call site.
+_REQUIRED_BINDING_SITES = (
+    ("vllm._custom_ops", "fused_minimax_m3_qknorm_rope_kv_insert", "w1"),
+    (
+        "vllm.models.minimax_m3.common.ops.sparse_attn",
+        "minimax_m3_sparse_attn",
+        "prefill",
+    ),
+    (
+        "vllm.models.minimax_m3.common.ops.sparse_attn",
+        "minimax_m3_sparse_attn_decode",
+        "decode",
+    ),
+    (
+        "vllm.models.minimax_m3.common.ops",
+        "minimax_m3_sparse_attn",
+        "prefill",
+    ),
+    (
+        "vllm.models.minimax_m3.common.ops",
+        "minimax_m3_sparse_attn_decode",
+        "decode",
+    ),
+    (
+        "vllm.models.minimax_m3.common.sparse_attention",
+        "select_main_backend_and_impl_cls",
+        "selector",
+    ),
+    (
+        "vllm.models.minimax_m3.common.sparse_attention",
+        "minimax_m3_sparse_attn",
+        "prefill",
+    ),
+    (
+        "vllm.models.minimax_m3.common.sparse_attention",
+        "minimax_m3_sparse_attn_decode",
+        "decode",
+    ),
+    (
+        "vllm.models.minimax_m3.nvidia.model",
+        "select_main_backend_and_impl_cls",
+        "selector",
+    ),
+)
+
+# Platform-specific by-value bindings: the SM100-only MSA module and the
+# ROCm-only AMD modules. The q4 overlay never routes on SM100 or ROCm
+# (_route_q4 returns False there), so an unpatched binding is
+# behavior-neutral; patch them whenever the module is importable here and
+# log the ones that are not.
+_OPTIONAL_BINDING_SITES = (
+    (
+        "vllm.models.minimax_m3.nvidia.sparse_attention_msa",
+        "minimax_m3_sparse_attn_decode",
+        "decode",
+    ),
+    (
+        "vllm.models.minimax_m3.amd.model",
+        "select_main_backend_and_impl_cls",
+        "selector",
+    ),
+    (
+        "vllm.models.minimax_m3.amd.ops.sparse_attn",
+        "minimax_m3_sparse_attn",
+        "prefill",
+    ),
+    (
+        "vllm.models.minimax_m3.amd.ops.sparse_attn",
+        "minimax_m3_sparse_attn_decode",
+        "decode",
+    ),
+)
+
+# The defining module of each hook: where the ORIGINAL callable lives.
+_HOOK_DEFINING_SITES = {
+    "selector": (
+        "vllm.models.minimax_m3.common.sparse_attention",
+        "select_main_backend_and_impl_cls",
+    ),
+    "w1": ("vllm._custom_ops", "fused_minimax_m3_qknorm_rope_kv_insert"),
+    "decode": (
+        "vllm.models.minimax_m3.common.ops.sparse_attn",
+        "minimax_m3_sparse_attn_decode",
+    ),
+    "prefill": (
+        "vllm.models.minimax_m3.common.ops.sparse_attn",
+        "minimax_m3_sparse_attn",
+    ),
+}
+
+_HOOK_FACTORIES = {
+    "selector": _make_select_main,
+    "w1": _make_w1_wrapper,
+    "decode": _make_decode_wrapper,
+    "prefill": _make_prefill_wrapper,
+}
+
+
+def _import_binding_module(path: str):
+    """Import a binding module (seam; the CPU tests substitute fakes)."""
+    import importlib
+
+    return importlib.import_module(path)
+
+
+def _is_q4kv_wrapper(fn: object) -> bool:
+    return getattr(fn, _Q4KV_WRAPPER_MARKER, False) is True
+
+
+def _make_hook_wrapper(hook: str, original):
+    fn = _HOOK_FACTORIES[hook](original)
+    setattr(fn, _Q4KV_WRAPPER_MARKER, True)
+    setattr(fn, "__q4kv_original__", original)
+    return fn
+
 
 def install() -> None:
-    """Patch the four hook points. Idempotent; raises if vllm is missing."""
-    import vllm._custom_ops as ops
-    from vllm.models.minimax_m3.common import sparse_attention
-    from vllm.models.minimax_m3.common.ops import sparse_attn
+    """Patch every binding of the four hook points, robust to import order.
 
-    # 1. Backend/impl selection: un-raise nvfp4 off SM100 and route to the
-    #    overlay backend (spec arithmetic + [128] block sizes unchanged).
-    sparse_attention.select_main_backend_and_impl_cls = (
-        _make_select_main(sparse_attention.select_main_backend_and_impl_cls)
-    )
-    # select_main_impl_cls delegates to the module-global selector above, so
-    # it picks up the patch; keep its attribute intact for direct callers.
+    Upstream modules import the hooks BY VALUE, so patching only the
+    defining module's attribute never reaches an importer that was already
+    loaded (the boot17 failure: ``models/minimax_m3/nvidia/model.py:128``
+    kept the original SM100-only selector). ``install`` therefore
 
-    # 2. Cache update: q4 pool -> W1; everything else -> original op.
-    ops.fused_minimax_m3_qknorm_rope_kv_insert = _make_w1_wrapper(
-        ops.fused_minimax_m3_qknorm_rope_kv_insert
+    1. imports every binding module itself (required sites must exist);
+    2. patches the attribute on EVERY binding module -- the defining
+       modules, the re-exporting ``common.ops`` package, and the by-value
+       importers (``nvidia/model.py``, ``amd/model.py``, the SM100 MSA and
+       ROCm AITER modules whenever those are importable here);
+    3. logs one INFO line listing every patched binding;
+    4. fails closed: if any importable binding site is not the overlay
+       wrapper at the end, raises naming the unpatched site.
+
+    Platform-specific modules that cannot be imported here (the SM100-only
+    ``nvidia.sparse_attention_msa`` on GB10, the ROCm-only ``amd.*`` modules
+    on CUDA) are logged as unpatched and skipped: the q4 overlay never
+    routes on SM100 or ROCm, so their bindings stay upstream there.
+    Idempotent; raises if vllm is missing.
+    """
+    # Import each binding module once, required sites first.
+    loaded: dict = {}
+    unavailable: list = []
+    for path, name, hook in _REQUIRED_BINDING_SITES + _OPTIONAL_BINDING_SITES:
+        if path in loaded or path in unavailable:
+            continue
+        try:
+            loaded[path] = _import_binding_module(path)
+        except ImportError as exc:
+            if (path, name, hook) in _REQUIRED_BINDING_SITES:
+                raise RuntimeError(
+                    "q4 KV overlay: required binding module "
+                    f"{path!r} is not importable ({exc}); refusing to "
+                    "install a partial overlay (the engine would keep the "
+                    "upstream SM100-only nvfp4 selector)"
+                ) from exc
+            unavailable.append(path)
+
+    # One wrapper per hook, built from the ORIGINAL callable of the
+    # defining module (never from a previously-installed wrapper).
+    wrappers: dict = {}
+    for hook, (path, name) in _HOOK_DEFINING_SITES.items():
+        original = getattr(loaded[path], name, None)
+        if original is None:
+            raise RuntimeError(
+                f"q4 KV overlay: defining module {path!r} no longer "
+                f"exposes {name!r}; upstream vLLM has drifted -- refusing"
+            )
+        if _is_q4kv_wrapper(original):
+            wrappers[hook] = original  # already installed; keep as-is
+        else:
+            wrappers[hook] = _make_hook_wrapper(hook, original)
+
+    # Patch every binding site.
+    patched: list = []
+    for path, name, hook in _REQUIRED_BINDING_SITES + _OPTIONAL_BINDING_SITES:
+        if path in unavailable:
+            continue
+        current = getattr(loaded[path], name, None)
+        if current is None:
+            raise RuntimeError(
+                f"q4 KV overlay: binding site {path}.{name} is missing; "
+                "upstream vLLM has drifted -- refusing"
+            )
+        setattr(loaded[path], name, wrappers[hook])
+        patched.append(f"{path}.{name}")
+
+    logger.info(
+        "vllm-exl3 q4 KV overlay installed (VLLM_EXL3_Q4KV=1); patched "
+        "bindings: %s%s",
+        ", ".join(patched),
+        (
+            "; platform-specific modules not importable here (left to "
+            "upstream, the q4 overlay never routes there): "
+            + ", ".join(sorted({f"{p}.{n}" for p, n, _ in
+                                _OPTIONAL_BINDING_SITES
+                                if p in unavailable}))
+        )
+        if unavailable
+        else "",
     )
 
-    # 3/4. Readers: q4 pool -> R2 / staged prefill; else original kernels.
-    # Patch both the ops module and the impl module's imported names.
-    decode_wrapper = _make_decode_wrapper(
-        sparse_attn.minimax_m3_sparse_attn_decode
-    )
-    prefill_wrapper = _make_prefill_wrapper(
-        sparse_attn.minimax_m3_sparse_attn
-    )
-    sparse_attn.minimax_m3_sparse_attn_decode = decode_wrapper
-    sparse_attn.minimax_m3_sparse_attn = prefill_wrapper
-    sparse_attention.minimax_m3_sparse_attn_decode = decode_wrapper
-    sparse_attention.minimax_m3_sparse_attn = prefill_wrapper
+    # Fail-closed self-check: every importable binding must be ours.
+    for path, name, _hook in _REQUIRED_BINDING_SITES + _OPTIONAL_BINDING_SITES:
+        if path in unavailable:
+            continue
+        fn = getattr(loaded[path], name, None)
+        if not _is_q4kv_wrapper(fn):
+            raise RuntimeError(
+                f"q4 KV overlay self-check failed: {path}.{name} is not "
+                "the overlay wrapper -- the q4 KV path would silently fall "
+                "back to the upstream implementation. Refusing to continue."
+            )

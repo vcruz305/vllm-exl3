@@ -522,3 +522,152 @@ next val run must show both R2 cosines >= 0.99 and the two-stage
 graph-replay result. The device gate and mover are proven only in
 simulation (meta) and by source pins; their first hardware exercise is
 that same run.
+
+## Post-boot17 fix: serve wiring — every hook binding patched, fail-closed self-check (this commit)
+
+The first real serve attempt with `VLLM_EXL3_Q4KV=1` +
+`--kv-cache-dtype nvfp4` (receipts/boot17/container.log) died at model
+init: `model.py:866 -> sparse_attention.py:567` — the ORIGINAL
+SM100-only selector ran, and the log showed no overlay line at all.
+
+**Root cause (by-value name binding).** `models/minimax_m3/nvidia/model.py:128`
+does `from ...sparse_attention import (..., select_main_backend_and_impl_cls,
+...)`. Patching the `sparse_attention` module attribute (the old install)
+never reaches `model.py` once it is imported: its local name holds the
+original function object. The identical problem exists at other sites.
+
+**Binding audit (every site in the image that holds one of the four
+callables, verified by grep of the vllm-image):**
+
+- `select_main_backend_and_impl_cls`: defined
+  `common/sparse_attention.py:525`; **by-value importers**
+  `nvidia/model.py:128` (the boot17 site) and `amd/model.py:133`.
+  `select_main_impl_cls` (`:602`) delegates to the module-global name,
+  so it picks up the patched attribute; it has no by-value importers.
+- `fused_minimax_m3_qknorm_rope_kv_insert`: defined
+  `vllm/_custom_ops.py:2711`; every call site resolves the attribute on
+  the `vllm._custom_ops` MODULE OBJECT at call time
+  (`nvidia/model.py:22/722/1055`, `amd/model.py:26`, `dspark.py:16` —
+  all `from vllm import _custom_ops as ops`), so the single
+  module-attribute patch covers them; nothing imports it by value.
+- `minimax_m3_sparse_attn_decode` / `minimax_m3_sparse_attn`:
+  defined `common/ops/sparse_attn.py:616/:529`; **by-value bindings** in
+  `common/ops/__init__.py:11` (package re-export),
+  `common/sparse_attention.py:35/:40` (the impl's forward calls these
+  local names at :489/:507), `nvidia/sparse_attention_msa.py:29` (SM100
+  Triton fallback decode, used at :399) and `amd/ops/sparse_attn.py:18`
+  (ROCm re-export). The AMD AITER variant
+  (`minimax_m3_sparse_attn_decode_aiter`) is a different callable, not a
+  hook.
+
+**install() rewrite (`src/vllm_exl3/minimax_q4kv.py`):**
+
+1. A binding-site registry (`_REQUIRED_BINDING_SITES` /
+   `_OPTIONAL_BINDING_SITES`) enumerates every (module, attribute, hook).
+   install imports each module ITSELF (so the patch is robust to import
+   order: a module imported earlier, by the plugin or by vLLM, is
+   patched on its own attribute), then patches the attribute on EVERY
+   importable site with ONE wrapper per hook.
+2. Required sites (defining modules, the `common.ops` re-export,
+   `nvidia/model.py`): import failure or a missing attribute raises a
+   named RuntimeError — a partial overlay would silently reproduce
+   boot17. Platform-specific sites (`nvidia/sparse_attention_msa.py`,
+   `amd/model.py`, `amd/ops/sparse_attn.py`) are patched when
+   importable and otherwise logged as left-to-upstream: the q4 overlay
+   never routes on SM100 or ROCm (`_route_q4` returns False there).
+3. One INFO log line lists every patched `module.attribute` (so the next
+   boot log positively shows the overlay) plus the skipped ones.
+4. Fail-closed self-check at the end: every importable binding site must
+   carry the overlay marker, else a RuntimeError names the unpatched
+   site. Install is idempotent (a marked wrapper is never re-wrapped;
+   the upstream original is preserved as the delegation target).
+5. The overlay backend class is now built lazily at first q4 routing
+   (install no longer imports `vllm.utils.torch_utils` /
+   `vllm.v1.kv_cache_interface` eagerly).
+
+**Second serve blocker found and fixed — the impl's fp8 view.**
+`MiniMaxM3SparseImpl.__init__` sets
+`use_fp8_kv = is_quantized_kv_cache("nvfp4")` = True
+(`common/sparse_attention.py:465` with `v1/kv_cache_interface.py:116`),
+and the Triton impl's forward views the pool as fp8 before calling the
+reader hooks (`:480`). The q4 container would therefore arrive at the
+R2/prefill wrappers typed `float8_e4m3fn` — the exact val1
+frontend-failure class at the kernel boundary. The overlay now re-views
+a q4-geometry pool to raw uint8 bytes of the same storage
+(`_q4_pool_bytes`, 1-byte dtypes only; wider dtypes refused) before
+dispatch, and the R2 kernel boundary independently refuses non-uint8
+pools. The W1 path receives the raw uint8 container (model.py hands
+`self.kv_cache` over un-viewed; `bind_kv_cache` stores it as-is,
+`attention_layer_base.py:27`), but the same normalization applies.
+
+**Other nvfp4/SM100 init branches audited (item 5, file:line):**
+
+- `nvidia/model.py:169` `_supports_qkv_fused_epilogue`: returns False off
+  SM100 — the fused MXFP8 epilogue is disabled on GB10 and the layer
+  takes the W1 op path we wrap. No action needed; this is the supported
+  path.
+- `nvidia/model.py:844` `kv_cache_dtype_str_to_dtype("nvfp4")` ->
+  `torch.uint8` (`utils/torch_utils.py:54`): the pool container is
+  uint8, matching `_is_q4_pool`'s byte-level contract.
+- `nvidia/model.py:1078-79`: the W1 call passes `_k_scale`/`_v_scale`
+  only when `use_nvfp4_kv`; `set_default_quant_scales`
+  (`layers/attention/attention.py`) pins them to 1.0, so the overlay's
+  unit-global-scale gate passes by construction.
+- Indexer: `indexer_kv_dtype` does NOT mirror `--kv-cache-dtype` —
+  `resolve_indexer_kv_dtype("bf16")` (`config/attention.py:187-191`)
+  only substitutes "auto", so with nvfp4 main KV the indexer keeps its
+  own configured dtype (bf16 default / fp8) and its Triton impl. An
+  explicit `indexer_kv_dtype="nvfp4"` request raises upstream's own
+  named NotImplementedError (`common/indexer.py:534-545`, SM100/103/107
+  only) — fail-closed by upstream, matching milestone-1 scope (the
+  indexer cache stays fp8/bf16). No overlay action.
+- Pool sizing: the spec arithmetic is consumed generically with no
+  platform check (`v1/kv_cache_interface.py:526-560` num_head_slots /
+  state_content_bytes; `v1/worker/utils.py:474-481` calls the SELECTED
+  backend's `customize_spec`, i.e. ours) and the dtype gate
+  (`v1/attention/backend.py:111-116`) passes because the overlay backend
+  publishes `supported_kv_cache_dtypes=["nvfp4"]`. Block size stays 128
+  (`get_supported_kernel_block_sizes` is unconditional `[128]`).
+- `topk_blocks`: the q4 route ignores topk at selection (any width is
+  served by the same wrapper); the only topk==16 assumption in the image
+  is the SM100 MSA indexer path we never touch.
+- Env reach: EngineCore is started via multiprocessing spawn
+  (`v1/engine/utils.py:325` `proc.start()`), which inherits
+  `os.environ` wholesale; the Ray path copies every `VLLM_`-prefixed
+  variable (`ray/ray_env.py:40` `DEFAULT_ENV_VAR_PREFIXES`). The
+  APIServer's "Unknown vLLM environment variable detected" warning is
+  the envs allowlist, not a propagation failure. register() calls
+  install() before every other installer (`__init__.py:50-53`); after
+  this commit the order is irrelevant because install imports the
+  binding modules itself.
+
+**Tests (red venv):** 9 new (51/51 green in
+`tests/test_minimax_q4kv.py`): the real import path fails closed naming
+`vllm._custom_ops` when vllm is absent; a full fake-module simulation of
+the pre-install by-value state (every binding holds the upstream
+original) is patched at every required site including the boot17
+`nvidia.model` site, one wrapper object per hook, originals preserved as
+delegation targets, the INFO log lists every patched and skipped site,
+and non-q4 traffic still delegates to the original; the self-check
+raises naming the site on upstream drift (missing attribute) and on an
+unimportable required module; install is idempotent; the fp8-view
+normalization is pinned at the helper, wrapper (W1 and R2, same
+storage/data_ptr, real fp8 pools still fall through) and kernel-boundary
+(non-uint8 pool refused, nothing launched) levels. Default-off is
+unchanged: with the env unset, register() imports and patches nothing
+(pinned by the pre-existing default-off tests). Full suite: **622
+passed, 39 skipped, the same 8 pre-existing failures** — failure set
+identical to the baseline.
+
+**Unverified on this VPS (no GPU, no triton, no vLLM install):** the
+real-container import of `vllm.models.minimax_m3.nvidia.model` at install
+time (it was already imported in the boot17 process per the root cause,
+so the import is expected to be a no-op there); whether the SM100 MSA /
+AMD modules import on GB10 (either way is handled and logged); the real
+allocator's pool tensor shape/strides matching `_is_q4_pool`'s geometry
+(the harness pinned the layout from the vendor csrc, but the
+allocator-produced container is only observable at a real boot); and the
+whole end-to-end serve — the next GB10 boot with
+`VLLM_EXL3_Q4KV=1 --kv-cache-dtype nvfp4` must show the new install INFO
+line (every binding listed), the q4 selector line, and 576 B/token/layer
+pool sizing, or fail with one of the named refusals.

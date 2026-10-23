@@ -15,10 +15,19 @@ Covers:
   uint8 pool is passed as-is, and the GB10 harness frontend-checks the
   kernels before any GPU case;
 - harness input consistency (the GB10 val2 follow-up): the reference
-  raises a named ValueError (not an IndexError) when positions exceed
-  the rotary cache, the shared case builders build a real partial-RoPE
+  raises a named ValueError (not an IndexError) when positions exceed the
+  rotary cache, the shared case builders build a real partial-RoPE
   cache (theta 5e6) sized from positions, and the input validators
-  fail closed on every out-of-range index before any kernel runs.
+  fail closed on every out-of-range index before any kernel runs;
+- serve wiring (the boot17 follow-up): upstream modules import the four
+  hooks BY VALUE, so install() imports every binding module itself and
+  patches the attribute on each (defining modules, the common.ops
+  re-export, nvidia/model.py's by-value selector import); it logs every
+  patched binding, fails closed when a required site is missing or a
+  module is not importable, and is idempotent. The vendor Triton impl
+  views the q4 pool as fp8 before the reader hooks, so the overlay
+  re-views it to raw uint8 bytes and the kernel boundary refuses
+  non-uint8 pools.
 
 Triton is not importable on this VPS and there is no GPU: the Triton W1/R2
 kernels are validated on GB10 by tools/gb10_q4kv_parity.py, not here.
@@ -1474,3 +1483,262 @@ def test_device_gate_does_not_replace_the_geometry_checks(monkeypatch) -> None:
             torch.zeros(4, NKV, 128, 256, dtype=torch.uint8),  # fp8 pool
             w1["index_cache"], 128, w1["q_out"], w1["index_q_out"],
         )
+
+
+# ---------------------------------------------------------------------------
+# Serve wiring: every binding site patched, fail-closed self-check
+# ---------------------------------------------------------------------------
+
+
+def _original_callable(tag, calls):
+    """The upstream original a fake module holds BY VALUE before install."""
+
+    def original(*args, **kwargs):
+        calls.append((f"original:{tag}", args, kwargs))
+        return f"original:{tag}"
+
+    setattr(original, "hook_tag", tag)
+    return original
+
+
+def _binding_fakes(calls, *, absent=(), unavailable=()):
+    """Fake every binding module in the EXACT pre-install state of the real
+    vllm image: each holds the upstream original bound by value. ``absent``
+    drops an attribute (upstream drift); ``unavailable`` makes a module
+    unimportable (the platform-specific case)."""
+    orig = {h: _original_callable(h, calls) for h in ("selector", "w1",
+                                                     "decode", "prefill")}
+    attrs = {
+        "vllm._custom_ops": {"fused_minimax_m3_qknorm_rope_kv_insert":
+                            orig["w1"]},
+        "vllm.models.minimax_m3.common.ops.sparse_attn": {
+            "minimax_m3_sparse_attn": orig["prefill"],
+            "minimax_m3_sparse_attn_decode": orig["decode"],
+        },
+        # common/ops/__init__.py re-exports both reader hooks by value.
+        "vllm.models.minimax_m3.common.ops": {
+            "minimax_m3_sparse_attn": orig["prefill"],
+            "minimax_m3_sparse_attn_decode": orig["decode"],
+        },
+        # sparse_attention.py imports both readers by value and defines the
+        # selector; nvidia/model.py:128 imports the selector by value.
+        "vllm.models.minimax_m3.common.sparse_attention": {
+            "select_main_backend_and_impl_cls": orig["selector"],
+            "minimax_m3_sparse_attn": orig["prefill"],
+            "minimax_m3_sparse_attn_decode": orig["decode"],
+        },
+        "vllm.models.minimax_m3.nvidia.model": {
+            "select_main_backend_and_impl_cls": orig["selector"],
+        },
+    }
+    modules = {}
+    for path, module_attrs in attrs.items():
+        mod = ModuleType(path)
+        for name in module_attrs:
+            if (path, name) not in absent:
+                setattr(mod, name, module_attrs[name])
+        modules[path] = mod
+
+    def load(module_path):
+        if module_path in unavailable or module_path not in modules:
+            raise ImportError(f"No module named {module_path!r}")
+        return modules[module_path]
+
+    return modules, load
+
+
+def test_install_fails_closed_without_vllm() -> None:
+    """The real import path: with vllm not importable (this CPU venv),
+    install must fail closed naming the first required binding site instead
+    of silently installing a partial overlay."""
+    with pytest.raises(RuntimeError, match="vllm._custom_ops"):
+        q4kv.install()
+
+
+def test_install_patches_every_by_value_binding(monkeypatch, caplog) -> None:
+    """boot17: nvidia/model.py keeps a BY-VALUE import of the selector, so
+    patching only the defining module never reaches it. install() must
+    patch the attribute on EVERY binding module, log each one, and leave the
+    platform-specific modules (SM100 MSA / ROCm AITer) to upstream."""
+    import logging
+
+    calls: list = []
+    modules, load = _binding_fakes(calls)
+    monkeypatch.setattr(q4kv, "_import_binding_module", load)
+    with caplog.at_level(logging.INFO, logger="vllm_exl3.minimax_q4kv"):
+        q4kv.install()
+
+    # Every required binding is the overlay wrapper (one per hook).
+    for path, name, hook in q4kv._REQUIRED_BINDING_SITES:
+        fn = getattr(modules[path], name)
+        assert getattr(fn, q4kv._Q4KV_WRAPPER_MARKER, False) is True, (
+            f"{path}.{name} is not the overlay wrapper"
+        )
+        # The original is preserved as the delegation target.
+        assert fn.__q4kv_original__.hook_tag == hook
+    # The boot17 site (by-value import in nvidia/model.py) is patched.
+    boot17 = modules["vllm.models.minimax_m3.nvidia.model"]
+    assert getattr(
+        boot17.select_main_backend_and_impl_cls,
+        q4kv._Q4KV_WRAPPER_MARKER,
+        False,
+    ) is True
+    # One wrapper object per hook across all of its binding sites.
+    selectors = {
+        modules["vllm.models.minimax_m3.common.sparse_attention"]
+        .select_main_backend_and_impl_cls,
+        boot17.select_main_backend_and_impl_cls,
+    }
+    assert len(selectors) == 1
+
+    # The install log lists every patched binding and every skipped one.
+    log = caplog.text
+    for path, name, _hook in q4kv._REQUIRED_BINDING_SITES:
+        assert f"{path}.{name}" in log
+    for path, name, _hook in q4kv._OPTIONAL_BINDING_SITES:
+        assert f"{path}.{name}" in log
+    assert "not importable here" in log
+
+    # A patched binding still delegates non-q4 traffic to the original.
+    fp8_pool = torch.zeros(4, NKV, 128, 256, dtype=torch.uint8)
+    wrapper = (
+        modules["vllm.models.minimax_m3.common.ops.sparse_attn"]
+        .minimax_m3_sparse_attn_decode
+    )
+    wrapper(*_decode_args(fp8_pool), k_scale=None, v_scale=None)
+    assert calls[-1][0] == "original:decode"
+
+
+def test_install_selfcheck_raises_on_missing_binding(monkeypatch) -> None:
+    """Upstream drift: a binding module that no longer exposes the hook must
+    be named by a hard error, never silently left unpatched."""
+    calls: list = []
+    modules, load = _binding_fakes(
+        calls,
+        absent=(("vllm.models.minimax_m3.common.ops",
+                 "minimax_m3_sparse_attn"),),
+    )
+    monkeypatch.setattr(q4kv, "_import_binding_module", load)
+    with pytest.raises(RuntimeError, match=(
+        r"vllm\.models\.minimax_m3\.common\.ops\.minimax_m3_sparse_attn"
+    )):
+        q4kv.install()
+
+
+def test_install_fails_closed_when_by_value_importer_missing(
+    monkeypatch,
+) -> None:
+    """If the by-value importer module (nvidia/model.py) cannot be imported,
+    install must fail closed: a later fresh import of that module would bind
+    the ORIGINAL selector and reproduce boot17."""
+    calls: list = []
+    modules, load = _binding_fakes(
+        calls,
+        unavailable=("vllm.models.minimax_m3.nvidia.model",),
+    )
+    monkeypatch.setattr(q4kv, "_import_binding_module", load)
+    with pytest.raises(RuntimeError, match=(
+        r"vllm\.models\.minimax_m3\.nvidia\.model"
+    )):
+        q4kv.install()
+
+
+def test_install_idempotent(monkeypatch) -> None:
+    """A second install must not double-wrap: the wrapper object stays the
+    same and the preserved original stays the upstream callable."""
+    calls: list = []
+    modules, load = _binding_fakes(calls)
+    monkeypatch.setattr(q4kv, "_import_binding_module", load)
+    q4kv.install()
+    site = modules["vllm._custom_ops"]
+    first = site.fused_minimax_m3_qknorm_rope_kv_insert
+    q4kv.install()
+    second = site.fused_minimax_m3_qknorm_rope_kv_insert
+    assert first is second
+    assert second.__q4kv_original__.hook_tag == "w1"
+
+
+def test_q4_pool_bytes_reviews_the_impls_fp8_view() -> None:
+    """vLLM's Triton impl views any quantized pool as its fp8 dtype before
+    the reader hooks (use_fp8_kv is True for nvfp4), so the q4 container can
+    arrive typed float8_e4m3fn. The overlay must re-view it to raw uint8
+    bytes of the same storage; a wider dtype is refused."""
+    pool = _make_pool(4)
+    # uint8 passes through unchanged.
+    assert q4kv._q4_pool_bytes(pool) is pool
+    # the impl's fp8 view re-views to the same uint8 bytes.
+    viewed = pool.view(torch.float8_e4m3fn)
+    assert viewed.dtype is torch.float8_e4m3fn
+    as_bytes = q4kv._q4_pool_bytes(viewed)
+    assert as_bytes.dtype is torch.uint8
+    assert as_bytes.data_ptr() == pool.data_ptr()
+    # a 2-byte dtype with q4 geometry cannot be the container: refused.
+    with pytest.raises(ValueError, match="1 byte"):
+        q4kv._q4_pool_bytes(pool.view(torch.int16))
+
+
+def test_decode_wrapper_reviews_fp8_typed_q4_pool(monkeypatch) -> None:
+    """End to end through the patched binding: a q4 pool that arrives as the
+    impl's fp8 view still routes to R2 as raw uint8 bytes (same storage),
+    while a real fp8 pool still falls through to the original."""
+    calls: list = []
+    _stub_kernels(monkeypatch, calls)
+    orig = _original_callable("decode", calls)
+    wrapper = q4kv._make_decode_wrapper(orig)
+    pool = _make_pool(4)
+    viewed = pool.view(torch.float8_e4m3fn)
+    wrapper(*_decode_args(viewed), k_scale=torch.tensor(1.0), v_scale=None)
+    assert calls[0][0] == "decode"
+    handed = calls[0][1][1]
+    assert handed.dtype is torch.uint8
+    assert handed.data_ptr() == pool.data_ptr()
+    # a real fp8 pool never matches the q4 geometry -> original.
+    calls.clear()
+    wrapper(
+        *_decode_args(torch.zeros(4, NKV, 128, 256, dtype=torch.uint8)),
+        k_scale=None,
+        v_scale=None,
+    )
+    assert calls[-1][0] == "original:decode"
+
+
+def test_w1_wrapper_reviews_fp8_typed_q4_pool(monkeypatch) -> None:
+    """Same convention on the write path: a q4 pool that arrives as an
+    fp8-typed view is handed to W1 as raw uint8 bytes of the same storage."""
+    calls: list = []
+    _stub_kernels(monkeypatch, calls)
+    orig = _original_callable("w1", calls)
+    wrapper = q4kv._make_w1_wrapper(orig)
+    pool = _make_pool(4)
+    spec = _w1_call_args(pool.view(torch.float8_e4m3fn))
+    wrapper(
+        *spec["args"],
+        q_fp8_out=None,
+        q_fp8_scale=1.0,
+        kv_k_scale=torch.tensor(1.0),
+        kv_v_scale=None,
+        write_qkv=True,
+    )
+    assert calls[0][0] == "w1"
+    handed = calls[0][1][14]  # pool position in the W1 signature
+    assert handed.dtype is torch.uint8
+    assert handed.data_ptr() == pool.data_ptr()
+
+
+def test_decode_kernel_refuses_non_uint8_pool(monkeypatch) -> None:
+    """Defense in depth: the R2 kernel boundary itself refuses a pool that is
+    not raw uint8 bytes, even when the device gate is satisfied."""
+    calls: list = []
+    _install_kernel_recorders(monkeypatch, calls)
+    monkeypatch.setattr(q4kernels, "_REQUIRED_DEVICE_TYPE", "cpu")
+    pool = _make_pool(4).view(torch.float8_e4m3fn)
+    q = torch.zeros(2, NQ, 128, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="raw uint8"):
+        q4kernels.q4_sparse_decode(
+            q, pool,
+            torch.zeros(NKV, 2, 8, dtype=torch.int32),
+            torch.zeros(2, 8, dtype=torch.int32),
+            torch.full((2,), 8 * 128, dtype=torch.int32),
+            NKV, 0.08, torch.zeros(2, NQ, 128, dtype=torch.bfloat16), 1,
+        )
+    assert calls == []  # nothing launched
