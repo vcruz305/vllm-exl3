@@ -5365,14 +5365,27 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
 # n-gram lookup run behind vLLM custom ops, looked up by a stable layer name.
 # ---------------------------------------------------------------------------
 
+def _process_dict(holder: Any, attr: str) -> dict[str, Any]:
+    """Process-wide registry dict stored as a plain attribute of ``holder``.
+
+    Read through ``vars()``, never ``hasattr``/``getattr``: ``torch.ops``
+    (torch 2.14) materializes an ``_OpNamespace`` for ANY attribute name, so
+    the old ``hasattr(torch.ops, ...)`` guard was always true and the
+    "registry" was an op namespace that rejects item assignment.
+    """
+    reg = vars(holder).get(attr)
+    if not isinstance(reg, dict):
+        reg = {}
+        setattr(holder, attr, reg)
+    return reg
+
+
 if _TORCH_AVAILABLE and torch is not None:
-    if not hasattr(torch.ops, "_exl3_opaque_layers"):
-        setattr(torch.ops, "_exl3_opaque_layers", {})
-    if not hasattr(torch.ops, "_exl3_opaque_methods"):
-        setattr(torch.ops, "_exl3_opaque_methods", {})
-    _EXL3_OPAQUE_LAYERS: dict[str, Any] = getattr(torch.ops, "_exl3_opaque_layers")
-    _EXL3_OPAQUE_METHODS: dict[str, Any] = getattr(torch.ops, "_exl3_opaque_methods")
-    _EXL3_OPS_READY = bool(getattr(torch.ops, "_exl3_ops_ready", False))
+    # Stored on the torch module (a process singleton) so every import of this
+    # module, under any package path, shares one registry.
+    _EXL3_OPAQUE_LAYERS: dict[str, Any] = _process_dict(torch, "_exl3_opaque_layers")
+    _EXL3_OPAQUE_METHODS: dict[str, Any] = _process_dict(torch, "_exl3_opaque_methods")
+    _EXL3_OPS_READY = vars(torch).get("_exl3_ops_ready") is True
 else:
     _EXL3_OPAQUE_LAYERS = {}
     _EXL3_OPAQUE_METHODS = {}
@@ -5477,7 +5490,7 @@ def _exl3_register_custom_ops() -> bool:
         return False
     _EXL3_OPS_READY = True
     if _TORCH_AVAILABLE and torch is not None:
-        setattr(torch.ops, "_exl3_ops_ready", True)
+        setattr(torch, "_exl3_ops_ready", True)
     return True
 
 
