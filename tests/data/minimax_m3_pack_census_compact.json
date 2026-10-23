@@ -1,5 +1,5 @@
 {
- "_comment": "Compact per-family digest of the MiniMax-M3.1-Flash EXL3 SAGE pack header census (vcruz305/MiniMax-M3.1-Flash-EXL3-SAGE-2.15bpw, rev 687cbff). N = layer or expert index. Generated from the parent's census_tensors.json (89952 tensors); counts and shapes are exact.",
+ "_comment": "Compact per-family digest of the MiniMax-M3.1-Flash EXL3 SAGE pack header census (vcruz305/MiniMax-M3.1-Flash-EXL3-SAGE-2.15bpw, rev e2682d0; the repo history was squashed 2026-10-23 and all 16 shard LFS sha256 oids are IDENTICAL across the squash, so this census is exact at the new revision). N = layer or expert index. Generated from the parent's census_tensors.json (89952 tensors); counts and shapes are exact.",
  "_total_tensors": 89952,
  "families": {
   "language_model.lm_head.mul1": [

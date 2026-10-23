@@ -134,17 +134,57 @@ def test_case_e_skips_without_a_token_file():
     assert "skip" in res and "pass" not in res
 
 
+def test_case_e_refuses_every_non_pinned_revision():
+    # The Hub repo's history was squashed on 2026-10-23: the pre-squash
+    # revision 687cbff (now 404) and the pinned e2682d0 carry byte-identical
+    # shards (LFS sha256 proven equal in both tree listings), so the pin was
+    # moved -- but ONLY to that revision. Any other revision must be
+    # refused BEFORE a token is read or a network request is made, because
+    # the fixture digest and the live header cross-check are only valid for
+    # the pinned shard bytes.
+    tool = _tool()
+    for bad_rev in (
+        "687cbff2c210b7514d18c5f6a4d1db3417b316c4",  # pre-squash, now 404
+        "e2682d076e220e71e2a7ea7b9885e70390c2769",  # truncated
+        "main",
+        "",
+    ):
+        with pytest.raises(RuntimeError, match="refusing Hub revision"):
+            tool._hf_range("never-read", 0, 8, rev=bad_rev)
+        with pytest.raises(RuntimeError, match="refusing Hub revision"):
+            tool.ensure_pinned_revision(bad_rev)
+    # The pinned revision itself is accepted (no network, no token use).
+    tool.ensure_pinned_revision(tool.E_REVISION)
+
+
 def test_case_e_constants_and_fixture_are_pinned():
     tool = _tool()
     assert tool.E_REPO == "vcruz305/MiniMax-M3.1-Flash-EXL3-SAGE-2.15bpw"
-    assert tool.E_REVISION == "687cbff2c210b7514d18c5f6a4d1db3417b316c4"
+    assert tool.E_REVISION == "e2682d076e220e71e2a7ea7b9885e70390c27698"
     assert tool.E_SHARD == "model-00001-of-00016.safetensors"
     assert tool.E_MS == (1, 64)
     fixture = json.loads(
         (REPO / "tests/data/minimax_m3_layer0_real_shards.json").read_text()
     )
-    assert len(fixture) == 16
-    assert all(v["file"] == tool.E_SHARD for v in fixture.values())
+    tensors = {k: v for k, v in fixture.items() if not k.startswith("_")}
+    assert len(tensors) == 16
+    assert all(v["file"] == tool.E_SHARD for v in tensors.values())
+    # The fixture provenance is pinned to the post-squash revision and to
+    # the shard's Hub LFS identity, which was PROVEN identical in the tree
+    # listings of the pre-squash revision 687cbff (now 404) and e2682d0:
+    # the shard bytes -- and therefore every live header cross-check -- are
+    # unchanged by the history squash.
+    assert fixture["_revision"] == tool.E_REVISION
+    assert fixture["_shard_lfs"] == {
+        tool.E_SHARD: {
+            "size": tool.E_SHARD_SIZE,
+            "sha256": tool.E_SHARD_LFS_SHA256,
+        }
+    }
+    assert tool.E_SHARD_SIZE == 7580232304
+    assert tool.E_SHARD_LFS_SHA256 == (
+        "430b5d545955d2dc4d42ba7e0129c691a0a27673456ec5e694d047758674d3f3"
+    )
     # The pack's mixed per-shard K: q K4, k/v K5 (trellis last dim / 16).
     ks = {}
     for p in ("q", "k", "v"):
@@ -173,7 +213,7 @@ def test_case_e_constants_and_fixture_are_pinned():
     census_path = Path("/root/work/minimax-m31/pack/census_tensors.json")
     if census_path.is_file():
         census = json.loads(census_path.read_text())
-        for name, ent in fixture.items():
+        for name, ent in tensors.items():
             assert census[name] == ent, name
 
 
@@ -325,9 +365,21 @@ def test_case_f_fixture_is_the_per_k_tuple_digest():
     if not fixture.is_file():
         pytest.skip("layer-3 expert fixture not on this box")
     entries = json.loads(fixture.read_text())
-    assert len(entries) == 36
+    tensors = {k: v for k, v in entries.items() if not k.startswith("_")}
+    assert len(tensors) == 36
     assert all(v["file"] == "model-00001-of-00016.safetensors"
-              for v in entries.values())
+              for v in tensors.values())
+    # Same pinned provenance as the layer-0 fixture: the post-squash
+    # revision plus the shard LFS identity proven identical across the
+    # history squash (see test_case_e_constants_and_fixture_are_pinned).
+    assert entries["_revision"] == tool.E_REVISION
+    assert entries["_shard_lfs"] == {
+        tool.E_SHARD: {
+            "size": tool.E_SHARD_SIZE,
+            "sha256": tool.E_SHARD_LFS_SHA256,
+        }
+    }
+    entries = tensors
     ks = []
     for e in tool.F_EXPERTS:
         tup = []

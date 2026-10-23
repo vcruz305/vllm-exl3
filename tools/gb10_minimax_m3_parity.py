@@ -100,10 +100,36 @@ D_N, D_K, D_TOKENS = 12288, 6144, 64
 # Case E: layer 0 of the real pack. The 16 tensors live in shard 1; their
 # census digest is pinned in tests/data/minimax_m3_layer0_real_shards.json.
 E_REPO = "vcruz305/MiniMax-M3.1-Flash-EXL3-SAGE-2.15bpw"
-E_REVISION = "687cbff2c210b7514d18c5f6a4d1db3417b316c4"
+# Re-pinned 2026-10-23: the Hub repo's history was squashed (old revision
+# 687cbff2c210b7514d18c5f6a4d1db3417b316c4 now returns 404) and e2682d0...
+# is the sole surviving commit. Before re-pinning, the shard identity was
+# PROVEN from the Hub tree API listings of BOTH revisions: shard 1 (the
+# only shard Cases E/F read) has LFS sha256
+# 430b5d545955d2dc4d42ba7e0129c691a0a27673456ec5e694d047758674d3f3 and
+# size 7580232304 in both trees, and all 16 shard oids+sizes are identical
+# across the squash -- so the shard BYTES are unchanged and the live header
+# cross-check keeps every fixture offset valid.
+E_REVISION = "e2682d076e220e71e2a7ea7b9885e70390c27698"
 E_SHARD = "model-00001-of-00016.safetensors"
+E_SHARD_SIZE = 7580232304
+E_SHARD_LFS_SHA256 = (
+    "430b5d545955d2dc4d42ba7e0129c691a0a27673456ec5e694d047758674d3f3"
+)
 E_TOKEN_FILE = "/run/hf_token"
 E_MS = (1, 64)
+
+
+def ensure_pinned_revision(rev: str) -> None:
+    """Cases E/F read real pack bytes over HTTP from exactly ONE Hub
+    revision. Any other revision must be refused outright: the fixtures
+    pin the census digest of the shard bytes at E_REVISION, and the
+    live shard-header cross-check only proves the offsets for THOSE
+    bytes. A different revision is unverified by construction."""
+    if rev != E_REVISION:
+        raise RuntimeError(
+            f"refusing Hub revision {rev!r}: the real-pack parity cases "
+            f"are pinned to {E_REVISION}; any other revision is unverified"
+        )
 
 # Case A2 (mixed-K): the real pack's per-expert (K_gate, K_up, K_down)
 # tuples -- layer 3 of the census, w1->gate / w3->up / w2->down -- with two
@@ -1000,7 +1026,8 @@ def _fixture_entries(path: str = E_FIXTURE) -> dict[str, Any]:
         return json.load(fh)
 
 
-def _hf_range(token: str, start: int, length: int) -> bytes:
+def _hf_range(token: str, start: int, length: int,
+              rev: str | None = None) -> bytes:
     """One authenticated HTTP range read. The token is sent ONLY to
     huggingface.co: the resolve URL answers 302 with a signed CDN URL, and
     the CDN request carries no Authorization. The token is never printed,
@@ -1008,8 +1035,10 @@ def _hf_range(token: str, start: int, length: int) -> bytes:
     import urllib.error
     import urllib.request
 
+    rev = E_REVISION if rev is None else rev
+    ensure_pinned_revision(rev)
     url = (
-        f"https://huggingface.co/{E_REPO}/resolve/{E_REVISION}/{E_SHARD}"
+        f"https://huggingface.co/{E_REPO}/resolve/{rev}/{E_SHARD}"
     )
     rng = f"bytes={start}-{start + length - 1}"
 
@@ -1542,9 +1571,18 @@ def _selftest() -> int:
     # Case E fixture consistency (offline): the pinned layer-0 digest must
     # describe exactly the fused layer's tensors with the pack's mixed K.
     entries = _fixture_entries()
+    provenance = {k: v for k, v in entries.items() if k.startswith("_")}
+    entries = {k: v for k, v in entries.items() if not k.startswith("_")}
     ok_e = len(entries) == 16 and all(
         v.get("file") == E_SHARD for v in entries.values()
     )
+    # The fixture must carry the pinned provenance: the revision the census
+    # digest was taken at, and the shard's Hub LFS identity (size + sha256),
+    # proven identical across the 2026-10-23 history squash.
+    ok_e = ok_e and provenance.get("_revision") == E_REVISION
+    ok_e = ok_e and provenance.get("_shard_lfs") == {
+        E_SHARD: {"size": E_SHARD_SIZE, "sha256": E_SHARD_LFS_SHA256}
+    }
     ks = []
     for p in ("q", "k", "v"):
         t = entries[f"language_model.model.layers.0.self_attn.{p}_proj.trellis"]
@@ -1565,7 +1603,24 @@ def _selftest() -> int:
            bool(ok_e))
     _check("case E repo/revision pinned",
            E_REPO == "vcruz305/MiniMax-M3.1-Flash-EXL3-SAGE-2.15bpw"
-           and E_REVISION == "687cbff2c210b7514d18c5f6a4d1db3417b316c4")
+           and E_REVISION == "e2682d076e220e71e2a7ea7b9885e70390c27698")
+    # Any revision other than the pinned one must be refused BEFORE any
+    # network read: the pre-squash revision (now 404) and a stranger must
+    # both raise, and the pinned one must not.
+    refused = True
+    for bad_rev in ("687cbff2c210b7514d18c5f6a4d1db3417b316c4",
+                   "e2682d076e220e71e2a7ea7b9885e70390c2769", "main"):
+        try:
+            _hf_range("token-not-read", 0, 8, rev=bad_rev)
+            refused = False
+        except RuntimeError:
+            pass
+    ensure_pinned_revision(E_REVISION)
+    _check("case E/F refuse every non-pinned revision", refused)
+    _check("case E shard identity pinned (LFS sha256 proven identical"
+           " across the history squash)",
+           E_SHARD_SIZE == 7580232304 and E_SHARD_LFS_SHA256
+           == "430b5d545955d2dc4d42ba7e0129c691a0a27673456ec5e694d047758674d3f3")
 
     # Case E tensors from the FIXTURE SHAPES, through the loader's own
     # helpers, BEFORE any kernel call: the fetched region must become the
@@ -1689,9 +1744,15 @@ def _selftest() -> int:
     # shard 1, and the per-projection Ks derived from the trellis widths are
     # the pack's census tuples.
     fentries = _fixture_entries(F_FIXTURE)
+    fprovenance = {k: v for k, v in fentries.items() if k.startswith("_")}
+    fentries = {k: v for k, v in fentries.items() if not k.startswith("_")}
     ok_f = len(fentries) == 36 and all(
         v.get("file") == E_SHARD for v in fentries.values()
     )
+    ok_f = ok_f and fprovenance.get("_revision") == E_REVISION
+    ok_f = ok_f and fprovenance.get("_shard_lfs") == {
+        E_SHARD: {"size": E_SHARD_SIZE, "sha256": E_SHARD_LFS_SHA256}
+    }
     fks = []
     for e in F_EXPERTS:
         tup = []
