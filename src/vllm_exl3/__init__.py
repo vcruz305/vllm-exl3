@@ -42,6 +42,22 @@ def register() -> None:
     from .tp_geometry_compat import install_tp_geometry_compat
     from .uva_offload import install_uva_expert_validation
 
+    # Optional 4-bit (nvfp4-layout) main KV cache for MiniMax-M3 on GB10
+    # (sm_121). Default off: without the flag nothing is patched and engine
+    # behavior is byte-identical. install() imports every binding module
+    # itself and patches the hook attributes on each of them, so it does NOT
+    # depend on the import order of the modules above or below: a module
+    # that already imported a hook by value (e.g. minimax_m3/nvidia/model.py)
+    # is patched on its own attribute here. VLLM_EXL3_Q4KV reaches the
+    # EngineCore process with the rest of the environment (mp spawn inherits
+    # os.environ; the Ray path copies every VLLM_-prefixed variable).
+    import os
+
+    if os.environ.get("VLLM_EXL3_Q4KV") == "1":
+        from .minimax_q4kv import install as install_q4kv
+
+        install_q4kv()
+
     # Accept K7/K8 config values before model-family/runtime wrappers inspect the
     # quantization config. ExLlamaV3's normal EXL3 MoE family covers K1-K8;
     # vllm-exl3's custom native p2b path remains independently gated to K2-K4.
