@@ -87,9 +87,17 @@ def _gemv_ref(x: torch.Tensor, pack: dict, k: int) -> torch.Tensor:
     """Per-expert dequant GEMM reference (the proven native-map entry)."""
     import vllm_exl3_c
 
-    return vllm_exl3_c.exl3_gemv(
-        x, pack["trellis"], pack["suh"], pack["svh"], k, True
-    )
+    # The native GEMV accepts 1 <= m <= 8 rows per launch: run the reference in 8-row chunks.
+    squeeze = x.dim() == 1
+    rows = x.unsqueeze(0) if squeeze else x
+    outs = [
+        vllm_exl3_c.exl3_gemv(
+            rows[i : i + 8].contiguous(), pack["trellis"], pack["suh"], pack["svh"], k, True
+        )
+        for i in range(0, rows.shape[0], 8)
+    ]
+    out = torch.cat(outs, dim=0)
+    return out.squeeze(0) if squeeze else out
 
 
 def _oai(gate: torch.Tensor, up: torch.Tensor, limit: float) -> torch.Tensor:
