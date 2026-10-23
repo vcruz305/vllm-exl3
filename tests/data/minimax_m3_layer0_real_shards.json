@@ -1,0 +1,134 @@
+{
+ "language_model.model.layers.0.self_attn.index_k_proj.weight": {
+  "bytes": 786432,
+  "dtype": "F8_E4M3",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   128,
+   6144
+  ]
+ },
+ "language_model.model.layers.0.self_attn.index_k_proj.weight_scale_inv": {
+  "bytes": 24576,
+  "dtype": "U8",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   128,
+   192
+  ]
+ },
+ "language_model.model.layers.0.self_attn.index_q_proj.weight": {
+  "bytes": 3145728,
+  "dtype": "F8_E4M3",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   512,
+   6144
+  ]
+ },
+ "language_model.model.layers.0.self_attn.index_q_proj.weight_scale_inv": {
+  "bytes": 98304,
+  "dtype": "U8",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   512,
+   192
+  ]
+ },
+ "language_model.model.layers.0.self_attn.k_proj.mul1": {
+  "bytes": 4,
+  "dtype": "I32",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": []
+ },
+ "language_model.model.layers.0.self_attn.k_proj.suh": {
+  "bytes": 12288,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   6144
+  ]
+ },
+ "language_model.model.layers.0.self_attn.k_proj.svh": {
+  "bytes": 1024,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   512
+  ]
+ },
+ "language_model.model.layers.0.self_attn.k_proj.trellis": {
+  "bytes": 1966080,
+  "dtype": "I16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   384,
+   32,
+   80
+  ]
+ },
+ "language_model.model.layers.0.self_attn.q_proj.mul1": {
+  "bytes": 4,
+  "dtype": "I32",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": []
+ },
+ "language_model.model.layers.0.self_attn.q_proj.suh": {
+  "bytes": 12288,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   6144
+  ]
+ },
+ "language_model.model.layers.0.self_attn.q_proj.svh": {
+  "bytes": 16384,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   8192
+  ]
+ },
+ "language_model.model.layers.0.self_attn.q_proj.trellis": {
+  "bytes": 25165824,
+  "dtype": "I16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   384,
+   512,
+   64
+  ]
+ },
+ "language_model.model.layers.0.self_attn.v_proj.mul1": {
+  "bytes": 4,
+  "dtype": "I32",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": []
+ },
+ "language_model.model.layers.0.self_attn.v_proj.suh": {
+  "bytes": 12288,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   6144
+  ]
+ },
+ "language_model.model.layers.0.self_attn.v_proj.svh": {
+  "bytes": 1024,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   512
+  ]
+ },
+ "language_model.model.layers.0.self_attn.v_proj.trellis": {
+  "bytes": 1966080,
+  "dtype": "I16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   384,
+   32,
+   80
+  ]
+ }
+}

@@ -53,6 +53,130 @@ def test_parity_tool_case_b_offsets_are_the_branch_split():
     assert tool.MEM_BUDGET_GIB == 4.0
 
 
+# ── Codebook contract: run-1 Case B failed on a codebook mismatch ──────────
+#
+# The pack's EXL3 tensors carry the mul1 marker (census: a `.mul1` I32 next
+# to every trellis/suh/svh triple); the loader validates it and every
+# production decode path resolves the mul1 codebook. Run 1 of GPU_JOB-2
+# built markerless synthetic packs and an MCG-codebook reference, so the
+# layer decoded the plain codebook while the reference decoded MCG --
+# cosine ~0 by construction, not a kernel defect.
+
+
+def _tool():
+    sys.path.insert(0, str(REPO / "tools"))
+    try:
+        import gb10_minimax_m3_parity as tool
+    finally:
+        sys.path.pop(0)
+    return tool
+
+
+def test_gemv_reference_defaults_to_the_mul1_codebook():
+    import inspect
+
+    tool = _tool()
+    # The native GEMV entry maps mcg=False to the mul1 decoder; the
+    # reference must default to it (run 1 hardcoded True = the MCG
+    # codebook, uncorrelated with the layer output).
+    sig = inspect.signature(tool._gemv_ref)
+    assert "mcg" in sig.parameters
+    assert sig.parameters["mcg"].default is False
+
+
+def test_synthetic_shards_carry_the_loader_markers():
+    tool = _tool()
+    # The loader's per-shard marker value, and the post-load launch flags
+    # for a mul1 pack: (mcg, mul1) = (False, True) per projection.
+    marker = tool._mul1_marker(torch.device("cpu"))
+    assert int(marker[0].item()) == exl3.MUL1_MARKER_SIGNED_INT32
+    assert tool._loader_codebook_flags([(False, True)] * 3) == (False, True) * 3
+    with pytest.raises(ValueError):
+        tool._loader_codebook_flags([(False, True)] * 2)
+    # Case A's fake layer records the loader's flags for marker-carrying
+    # inners (the MCG legacy default would test the wrong codebook).
+    src = (REPO / "tools/gb10_minimax_m3_parity.py").read_text()
+    assert "_loader_codebook_flags([(False, True)] * 3)" in src
+    assert "None, _mul1_marker(device)," in src
+
+
+def test_case_b_runs_both_dispatch_families():
+    tool = _tool()
+    # m=1 exercises the small-m GEMV family the decode batch uses;
+    # m=64 the reconstruct+hgemm prefill family. Run 1 only tested m=64.
+    assert tool.B_MS == (1, 64)
+
+
+def test_case_c_tp_probe_needs_no_vllm_layer():
+    # The TP>1 rejection's preconditions resolve without constructing a
+    # vLLM linear: _indexer_shards keys on the class NAME and
+    # _resolve_tp_geometry on the declared tp_size. Run 1 subclassed
+    # QKVParallelLinear and died with a TypeError in __init__, so the
+    # rejection contract was never exercised at all.
+    tool = _tool()
+
+    class MinimaxM3QKVParallelLinearWithIndexer:  # noqa: N801
+        tp_size = 2
+
+    probe = MinimaxM3QKVParallelLinearWithIndexer()
+    method = exl3.Exl3LinearMethod(
+        exl3.Exl3Config.__new__(exl3.Exl3Config), bits=4
+    )
+    assert method._indexer_shards(probe, 5) == (3, 4)
+    assert exl3._resolve_tp_geometry(probe) == (0, 2)
+
+
+def test_case_e_skips_without_a_token_file():
+    # No mounted token file -> an explicit SKIP receipt entry, never a
+    # silent pass and never a crash.
+    tool = _tool()
+    res = tool._case_e(torch.device("cpu"), "/nonexistent-token-file")
+    assert "skip" in res and "pass" not in res
+
+
+def test_case_e_constants_and_fixture_are_pinned():
+    tool = _tool()
+    assert tool.E_REPO == "vcruz305/MiniMax-M3.1-Flash-EXL3-SAGE-2.15bpw"
+    assert tool.E_REVISION == "687cbff2c210b7514d18c5f6a4d1db3417b316c4"
+    assert tool.E_SHARD == "model-00001-of-00016.safetensors"
+    assert tool.E_MS == (1, 64)
+    fixture = json.loads(
+        (REPO / "tests/data/minimax_m3_layer0_real_shards.json").read_text()
+    )
+    assert len(fixture) == 16
+    assert all(v["file"] == tool.E_SHARD for v in fixture.values())
+    # The pack's mixed per-shard K: q K4, k/v K5 (trellis last dim / 16).
+    ks = {}
+    for p in ("q", "k", "v"):
+        t = fixture[
+            f"language_model.model.layers.0.self_attn.{p}_proj.trellis"
+        ]
+        assert t["dtype"] == "I16"
+        assert t["bytes"] == 2 * t["shape"][0] * t["shape"][1] * t["shape"][2]
+        ks[p] = t["shape"][2] // 16
+        mul1 = fixture[
+            f"language_model.model.layers.0.self_attn.{p}_proj.mul1"
+        ]
+        assert mul1["dtype"] == "I32" and mul1["shape"] == []
+    assert ks == {"q": 4, "k": 5, "v": 5}
+    # The indexer payload/scale geometry: F8_E4M3 [out, 6144] + U8
+    # block-32 scales [out, 192].
+    for p, out_f in (("index_q", 512), ("index_k", 128)):
+        w = fixture[f"language_model.model.layers.0.self_attn.{p}_proj.weight"]
+        s = fixture[
+            f"language_model.model.layers.0.self_attn.{p}_proj.weight_scale_inv"
+        ]
+        assert w["dtype"] == "F8_E4M3" and w["shape"] == [out_f, 6144]
+        assert s["dtype"] == "U8" and s["shape"] == [out_f, 192]
+    # The fixture must be byte-identical to the parent's census when the
+    # census is on this box.
+    census_path = Path("/root/work/minimax-m31/pack/census_tensors.json")
+    if census_path.is_file():
+        census = json.loads(census_path.read_text())
+        for name, ent in fixture.items():
+            assert census[name] == ent, name
+
+
 # ── DSpark draft quantization: the plugin declines by construction ─────────
 
 
