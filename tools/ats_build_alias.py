@@ -241,24 +241,38 @@ def main() -> int:
     # pack has it at 8 mod 16 and the ATS view rejects that).
     embed_key = None
     if a.embed:
-        if "embed.weight" not in weight_map:
-            print("--embed: embed.weight not in the index", file=sys.stderr)
+        from vllm_exl3.ats_alias import MINIMAX_EMBED_KEY
+
+        if "embed.weight" in weight_map:
+            embed_key = "embed.weight"
+        elif MINIMAX_EMBED_KEY in weight_map:
+            # MiniMax-M3 VL wrapper: the text embedding lives under its
+            # language_model.model.* checkpoint name.
+            embed_key = MINIMAX_EMBED_KEY
+        else:
+            print("--embed: no embedding tensor found in the index", file=sys.stderr)
             return 2
-        embed_key = "embed.weight"
 
     if not prefixes and embed_key is None and sel is None:
         print("nothing selected", file=sys.stderr)
         return 2
 
     if sel is not None:
+        from vllm_exl3.ats_alias import EXPERT_CKPT_PREFIXES
+
         keys = []
         missing = []
         for lay, eids in sel.items():
             for eid in eids:
                 for p in _PROJ:
-                    k = f"{lay}.ffn.experts.{eid}.{p}.trellis"
-                    if k not in weight_map:
-                        missing.append(k)
+                    k = None
+                    for fam in EXPERT_CKPT_PREFIXES:
+                        cand = f"{lay}.{fam}.{eid}.{p}.trellis"
+                        if cand in weight_map:
+                            k = cand
+                            break
+                    if k is None:
+                        missing.append(f"{lay}.ffn.experts.{eid}.{p}.trellis")
                     else:
                         keys.append(k)
         if missing:

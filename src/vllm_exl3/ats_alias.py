@@ -65,6 +65,18 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Checkpoint expert-directory families the alias side file may address.
+# Historical layout is layers.N.ffn.experts; MiniMax-M3 stores its routed
+# experts under layers.N.block_sparse_moe.experts.
+EXPERT_CKPT_PREFIXES = (
+    "ffn.experts",
+    "block_sparse_moe.experts",
+)
+
+# MiniMax-M3's embedding tensor name in the VL wrapper's checkpoint; the
+# historical default stays "embed.weight".
+MINIMAX_EMBED_KEY = "language_model.model.embed_tokens.weight"
+
 _STATS: dict[str, Any] = {
     "aliased_bytes": 0,
     "aliased_tensors": 0,
@@ -233,7 +245,9 @@ def layer_aliases(layer: Any) -> dict[str, dict[int, tuple]] | None:
     out: dict[str, dict[int, tuple]] = {"gate": {}, "up": {}, "down": {}}
     proj_of = {"w1": "gate", "w3": "up", "w2": "down"}
     pat = re.compile(
-        r"(?:^|\.)" + re.escape(key) + r"\.ffn\.experts\.(\d+)\.(w1|w2|w3)\.trellis$"
+        r"(?:^|\.)" + re.escape(key) + r"\.("
+        + "|".join(re.escape(p) for p in EXPERT_CKPT_PREFIXES)
+        + r")\.(\d+)\.(w1|w2|w3)\.trellis$"
     )
     for k, ent in tensors.items():
         m = pat.search(k)
@@ -367,6 +381,12 @@ def alias_embedding(model: Any) -> int:
     idx = _pack_index()
     key = os.environ.get("VLLM_EXL3_ATS_ALIAS_EMBED_KEY", "embed.weight")
     shard = idx.get(key)
+    if shard is None and "VLLM_EXL3_ATS_ALIAS_EMBED_KEY" not in os.environ:
+        # MiniMax-M3 VL wrapper: the text embedding is stored under its
+        # language_model.model.* name, not the historical embed.weight.
+        if idx.get(MINIMAX_EMBED_KEY) is not None:
+            key = MINIMAX_EMBED_KEY
+            shard = idx[key]
     # Prefer the 64-byte-aligned side-file copy when it was built with
     # ``--embed``: v3 puts ``embed.weight`` at an 8-mod-16 offset in its shard and
     # the ATS view needs 16, so the side file is the only usable source there.
