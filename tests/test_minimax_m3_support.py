@@ -192,12 +192,42 @@ def test_minimax_indexer_router_and_embed_families_are_excluded():
 def test_minimax_pack_config_derives_non_routed_coverage():
     # The real pack's quantization_config: no non_routed_exl3 block, no
     # tensor_storage ledger. MiniMax detection must come from the model type,
-    # not from the quantization dict.
+    # not from the quantization dict: vLLM hands the hf_config to
+    # override_quantization_method at config time (config/model.py:1418) and
+    # resolves from_config only later at model-load time
+    # (model_loader/weight_utils.py:236), so the architecture marker always
+    # precedes from_config in the same process.
+    hf_config = SimpleNamespace(
+        model_type="minimax_m3_vl",
+        architectures=["MiniMaxM3SparseForConditionalGeneration"],
+    )
+    try:
+        assert (
+            exl3.Exl3Config.override_quantization_method(
+                {"quant_method": "exl3", "version": "0.0.2"}, None, hf_config
+            )
+            == "exl3"
+        )
+        cfg = exl3.Exl3Config.from_config(
+            {"quant_method": "exl3", "version": "0.0.2"},
+        )
+        assert exl3.minimax_pack_detected(cfg) is True
+        assert cfg.non_routed_exl3, "MiniMax coverage must be derived"
+        covered = set(cfg.non_routed_exl3.get("modules", []))
+        assert covered == set(exl3.MINIMAX_NON_ROUTED_FAMILIES)
+    finally:
+        exl3._MINIMAX_M3_PACK_REQUESTED = False
+
+
+def test_non_minimax_ledgerless_pack_is_not_detected():
+    # Without the architecture marker the same ledger-less quantization card
+    # must NOT derive MiniMax coverage (other packs keep their own handling).
+    exl3._MINIMAX_M3_PACK_REQUESTED = False
     cfg = exl3.Exl3Config.from_config(
         {"quant_method": "exl3", "version": "0.0.2"},
     )
-    assert exl3.minimax_pack_detected(cfg) is True
-    assert cfg.non_routed_exl3, "MiniMax coverage must be derived"
+    assert exl3.minimax_pack_detected(cfg) is False
+    assert not cfg.non_routed_exl3
 
 
 # ---------------------------------------------------------------------------
