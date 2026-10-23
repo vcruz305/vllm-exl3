@@ -17,6 +17,7 @@ def _clean_env(monkeypatch):
         "VLLM_EXL3_MEM_PROBE",
         "VLLM_EXL3_DRAFT_VOCAB_META",
         "VLLM_EXL3_TRIM_BEFORE_KV",
+        "VLLM_EXL3_PERIODIC_TRIM_S",
     ):
         monkeypatch.delenv(k, raising=False)
     for k in uma.STATS:
@@ -275,7 +276,7 @@ def test_worker_hooks_trim_before_kv_and_warmup(monkeypatch):
     monkeypatch.setenv("VLLM_EXL3_TRIM_BEFORE_KV", "1")
     w.initialize_from_config("cfg")
     assert w.compile_or_warm_up_model() == "times"
-    assert calls == ["trim", ("kv", "cfg"), "trim", ("warmup",)]
+    assert calls == ["trim", ("kv", "cfg"), "trim", ("warmup",), "trim"]
     assert uma.STATS["trim_kv"] >= 1 and uma.STATS["trim_warmup"] >= 1
 
 
@@ -307,3 +308,30 @@ def test_target_load_installs_worker_hooks_lazily(monkeypatch):
 def test_process_table_reads_proc():
     line = uma.process_table(top=3)
     assert line.startswith("PROCS total_anon=")
+
+
+def test_periodic_trim_runs_and_is_single(monkeypatch):
+    import time
+
+    hits = []
+    monkeypatch.setattr(uma, "malloc_trim", lambda: hits.append(1))
+    monkeypatch.setattr(uma, "_PERIODIC", {})
+    assert uma.start_periodic_trim() is False  # unset -> off
+    monkeypatch.setenv("VLLM_EXL3_PERIODIC_TRIM_S", "0.02")
+    assert uma.start_periodic_trim() is True
+    assert uma.start_periodic_trim() is False  # one thread per process
+    time.sleep(0.15)
+    uma._PERIODIC["stop"].set()
+    assert len(hits) >= 2
+
+
+def test_moe_temp_rows_env(monkeypatch):
+    exl3 = pytest.importorskip("vllm_exl3.exl3")
+    monkeypatch.delenv("VLLM_EXL3_MOE_TEMP_ROWS", raising=False)
+    assert exl3._temp_rows_fused() == 2048
+    monkeypatch.setenv("VLLM_EXL3_MOE_TEMP_ROWS", "1024")
+    assert exl3._temp_rows_fused() == 1024
+    monkeypatch.setenv("VLLM_EXL3_MOE_TEMP_ROWS", "1000")
+    assert exl3._temp_rows_fused() == 1008
+    monkeypatch.setenv("VLLM_EXL3_MOE_TEMP_ROWS", "8")
+    assert exl3._temp_rows_fused() == 256

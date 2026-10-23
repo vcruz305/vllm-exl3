@@ -116,7 +116,24 @@ MUL1_MULTIPLIER = 0x83DCD12D
 MUL1_MARKER_SIGNED_INT32 = -2082680531
 EXL3_SUFFIXES = ("trellis", "suh", "svh", "mcg", "mul1")
 SWIGLU_LIMIT_DEFAULT = 10.0
-TEMP_ROWS_FUSED = 2048
+def _temp_rows_fused() -> int:
+    """Row capacity of the shared fused-MoE temp buffers.
+
+    The buffers are [concurrency, rows, hidden|intermediate] fp16 x4 (432 MiB
+    at concurrency 6, rows 2048, hidden 6144, intermediate 3072). One expert
+    never sees more rows than tokens in a step, so rows = max_num_batched_tokens
+    loses nothing; smaller values are still exact (the caller slices any step
+    whose busiest expert exceeds the capacity).
+    """
+    raw = os.environ.get("VLLM_EXL3_MOE_TEMP_ROWS", "")
+    try:
+        rows = int(raw) if raw else 2048
+    except ValueError:
+        rows = 2048
+    return max(256, ((rows + 15) // 16) * 16)
+
+
+TEMP_ROWS_FUSED = _temp_rows_fused()
 _COOP = os.environ.get("VLLM_EXL3_COOP", "1") == "1"
 _COOP_SLOTS_MAX = 256
 _COOP_ROWS_MAX = 32

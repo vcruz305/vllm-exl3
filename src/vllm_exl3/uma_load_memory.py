@@ -291,6 +291,47 @@ def process_table(top: int = 6) -> str:
     return f"PROCS total_anon={_gib(sum(r[0] for r in rows)):.2f}GiB {body}"
 
 
+_PERIODIC: dict[str, Any] = {}
+
+
+def malloc_trim() -> None:
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def start_periodic_trim() -> bool:
+    """VLLM_EXL3_PERIODIC_TRIM_S=N: glibc malloc_trim every N s while serving.
+
+    Host-heap only (no gc, no CUDA cache release), so it never touches the
+    torch allocator or a captured graph; returns freed heap pages to the pool
+    the GPU allocations share on a UMA host.
+    """
+    try:
+        period = float(os.environ.get("VLLM_EXL3_PERIODIC_TRIM_S", "0") or 0)
+    except ValueError:
+        period = 0.0
+    if period <= 0 or _PERIODIC.get("thread") is not None:
+        return False
+    import threading
+
+    stop = threading.Event()
+
+    def loop():
+        while not stop.wait(period):
+            malloc_trim()
+            _PERIODIC["count"] = _PERIODIC.get("count", 0) + 1
+
+    t = threading.Thread(target=loop, name="exl3-malloc-trim", daemon=True)
+    _PERIODIC.update(thread=t, stop=stop, period=period)
+    t.start()
+    logger.info("EXL3 periodic malloc_trim every %.0f s", period)
+    return True
+
+
 def _staged(fn: Any, tag: str) -> Any:
     @wraps(fn)
     def run(self, *args, **kwargs):
@@ -307,6 +348,11 @@ def _staged(fn: Any, tag: str) -> Any:
                 logger.info("%s tag=PRE_%s", tensor_census(top=10), tag)
                 logger.info("%s tag=PRE_%s", tensor_census(top=24, device="cuda"), tag)
         out = fn(self, *args, **kwargs)
+        if trim_before_kv_enabled() and tag == "WARMUP":
+            if probe_enabled():
+                logger.info("%s", mem_line(f"POST_{tag}_UNTRIMMED"))
+            trim()
+            start_periodic_trim()
         if probe_enabled():
             logger.info("%s", mem_line(f"POST_{tag}"))
             if census:
