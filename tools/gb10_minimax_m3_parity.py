@@ -1340,29 +1340,60 @@ def _case_f(device: torch.device, token_file: str | None) -> dict[str, Any]:
         del g, u, act
     torch.cuda.empty_cache()
 
-    per_m = {}
-    for m in F_MS:
-        slices = {}
-        paths = []
-        for e, eid in enumerate(F_EXPERTS):
-            # Router-free DIRECT expert evaluation: every row of this apply
-            # is forced onto one expert, so each slice is one expert's own
-            # output against its own reference.
-            ids = torch.full((m, 1), e, dtype=torch.long, device=device)
-            w_sel = torch.ones(m, 1, device=device)
-            out = method.apply(layer, x[:m], w_sel, ids, None, None)
-            torch.cuda.synchronize()
-            paths.append(getattr(layer, "_exl3_last_apply", "unknown"))
-            slices[f"expert_{eid}"] = round(_cos(out, refs[e][:m]), 6)
-        per_m[m] = {"paths": paths, "slices": slices}
+    per_mode: dict[str, Any] = {}
+    # The verdict is decided by the mode the serve will use; the other mode is
+    # recorded as A/B evidence and does not gate the verdict.
+    serve_mode = "default"
+    mode_paths = {"default": "mixedk_unified", "grouped": "mixedk_grouped"}
+    for mode in ("default", "grouped"):
+        if mode == "grouped":
+            os.environ["VLLM_EXL3_MIXEDK_MODE"] = "grouped"
+        else:
+            os.environ.pop("VLLM_EXL3_MIXEDK_MODE", None)
+        per_m = {}
+        for m in F_MS:
+            slices: dict[str, Any] = {}
+            paths = []
+            for e, eid in enumerate(F_EXPERTS):
+                # Router-free DIRECT expert evaluation: every row of this apply
+                # is forced onto one expert, so each slice is one expert's own
+                # output against its own reference.
+                ids = torch.full((m, 1), e, dtype=torch.long, device=device)
+                w_sel = torch.ones(m, 1, device=device)
+                out = method.apply(layer, x[:m], w_sel, ids, None, None)
+                torch.cuda.synchronize()
+                paths.append(getattr(layer, "_exl3_last_apply", "unknown"))
+                slices[f"expert_{eid}"] = round(_cos(out, refs[e][:m]), 6)
+            if m == max(F_MS):
+                # Router-included weighting probe (still direct: no synthetic
+                # other experts, no top-4 shape). A NON-UNIFORM per-row
+                # topk weight rides on each real expert in turn; the reference
+                # is w * that expert's own reference, so the slice passes only
+                # if the dispatch applies the per-expert weight EXACTLY ONCE
+                # (a dropped or doubled weighting departs a non-uniform w).
+                for e, eid in enumerate(F_EXPERTS):
+                    w = torch.rand(m, 1, device=device) + 0.25
+                    ids = torch.full((m, 1), e, dtype=torch.long, device=device)
+                    out = method.apply(layer, x[:m], w, ids, None, None)
+                    torch.cuda.synchronize()
+                    paths.append(getattr(layer, "_exl3_last_apply", "unknown"))
+                    slices[f"weight_once_expert_{eid}"] = round(
+                        _cos(out, w * refs[e][:m]), 6
+                    )
+            per_m[m] = {"paths": paths, "slices": slices}
+        per_mode[mode] = {"per_m": {str(m): v for m, v in per_m.items()}}
+    os.environ.pop("VLLM_EXL3_MIXEDK_MODE", None)
+    serve = per_mode[serve_mode]["per_m"]
     return {
         "ks": [list(t) for t in ks],
+        "ks_order": "K_gate,K_up,K_down = w1,w3,w2 (loader proj_of order)",
         "markers": "mul1",
-        "per_m": {str(m): v for m, v in per_m.items()},
+        "serve_mode": f"{serve_mode} ({mode_paths[serve_mode]})",
+        "per_mode": per_mode,
         "pass": all(
-            set(v["paths"]) == {"mixedk_unified"}
+            set(v["paths"]) == {mode_paths[serve_mode]}
             and all(c >= COS_MIN for c in v["slices"].values())
-            for v in per_m.values()
+            for v in serve.values()
         ),
     }
 
@@ -1681,9 +1712,29 @@ def _selftest() -> int:
     ok_f = ok_f and fks == [(2, 2, 2), (2, 2, 3), (3, 3, 3)]
     _check("case F fixture is the 3-expert per-K-tuple digest", bool(ok_f))
     f_seg = src.split("def _case_f", 1)[1]
-    _check("case F bars the mixedk unified path at both m",
-           'set(v["paths"]) == {"mixedk_unified"}' in f_seg
+    _check("case F probes BOTH mixedk modes and gates on the serve mode",
+           'for mode in ("default", "grouped")' in f_seg
+           and 'set(v["paths"]) == {mode_paths[serve_mode]}' in f_seg
+           and '"serve_mode": f"{serve_mode}' in f_seg
            and F_MS == (1, 96))
+    _check("case F confirms per-expert weighting is applied exactly once",
+           "weight_once_expert_" in f_seg
+           and "w * refs[e][:m]" in f_seg)
+
+    # Run 5's blocker: the unified mixedk launch scored cosine ~0 while the
+    # grouped launch was exact. Root cause: build_exl3_fused_state built the
+    # per-expert K arrays with trellis.shape[-1] // 8 = 2*K (commit 3275819's
+    # "half-bit units"), but the kernel consumes them as the true bit width
+    # (the same moe_gemm_tile bits switch the grouped launch's true-K scalar
+    # feeds), so every expert dequantized under a doubled K. The arrays must
+    # carry // 16, and the two spellings of the same fact (arrays vs group
+    # tuples) must be cross-validated at load.
+    _check("mixedk K arrays carry the true bit width (// 16, never // 8)",
+           'pack["gate"].trellis.shape[-1]) // 16' in esrc
+           and 'pack["gate"].trellis.shape[-1]) // 8' not in esrc
+           and 'pack["down"].trellis.shape[-1]) // 8' not in esrc)
+    _check("load cross-validates the K arrays against the K-group tuples",
+           "K arrays disagree with the per-K-group tuples" in esrc)
 
     print("GB10_MINIMAX_M3_PARITY SELFTEST " + ("PASS" if ok else "FAIL")
           + " (no hardware parity claim)")

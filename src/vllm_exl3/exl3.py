@@ -2139,6 +2139,33 @@ def apply_exl3_python_loop(
     return out
 
 
+def _assert_mixedk_karrays_match_groups(k_gate, k_up, k_down, k_groups, n_exp, device):
+    """Fail closed: the unified kernel's per-expert K arrays and the grouped
+    launches' scalar K tuples are two spellings of the same load-time fact, so
+    they must agree per expert. The 3275819 units regression (arrays at 2*K)
+    sailed through every existing check because nothing cross-validated the
+    two spellings; this guard makes any future divergence a load-time error
+    instead of a silent wrong-bits launch."""
+    _kgrp = torch.zeros((n_exp, 3), dtype=torch.int32, device=device)
+    for _kt, _ids in k_groups:
+        _kgrp[torch.as_tensor(_ids, dtype=torch.long, device=device)] = (
+            torch.tensor(_kt, dtype=torch.int32, device=device)
+        )
+    if (
+        n_exp
+        and not (
+            bool(torch.equal(_kgrp[:, 0].long(), k_gate.long()))
+            and bool(torch.equal(_kgrp[:, 1].long(), k_up.long()))
+            and bool(torch.equal(_kgrp[:, 2].long(), k_down.long()))
+        )
+    ):
+        raise ValueError(
+            "EXL3 mixed-K K arrays disagree with the per-K-group tuples; "
+            "the unified kernel would launch with the wrong per-expert bit "
+            "width. Refusing to build the fused state."
+        )
+
+
 def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]]) -> None:
     """Pointer tables + fused temps, once after load. No per-token alloc."""
     mixed_k = getattr(layer, "_exl3_mixed_k", False)
@@ -2231,29 +2258,43 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
     layer._exl3_fused_temps = temps
     layer._exl3_fused_concurrency = concurrency
     if mixed_k:
-        # Per-expert K arrays for exl3_moe_mixedk use half-bit units K2 = 2 * K (shape[-1] // 8).
+        # Per-expert K arrays for exl3_moe_mixedk carry the TRUE bit-width K =
+        # trellis.shape[-1] // 16, exactly like the scalar K tuple the grouped
+        # launch passes (below) and the fork engine's own caller
+        # (exllamav3/modules/block_sparse_mlp.py builds them from
+        # LinearEXL3.inner.K). The kernel consumes them as bits: it reads
+        # K_gate_arr[expert_idx] straight into moe_gemm_tile's runtime switch,
+        # whose cases 1..8 are the bits instances -- the same switch the
+        # uniform kernel's true-K scalar feeds
+        # (exllamav3_ext/quant/exl3_moe_kernel.cuh). Commit 3275819 briefly
+        # shipped shape[-1] // 8 = 2*K here ("half-bit units"); the doubled K
+        # selected the wrong bits instance and read past each trellis, which
+        # is the mixedk_unified cosine ~0 of GPU_JOB-2 run 5. (The older
+        # sm_121 illegal-memory-access reports predate this line and had a
+        # different, already-closed cause: the 3f3ed81-era tree already used
+        # // 16 here.)
         layer._exl3_k = None
         layer._exl3_mixedk_unified = True
         k_gate = (
             torch.tensor(
-                [int(pack["up"].trellis.shape[-1]) // 8 for pack in inners],
+                [int(pack["up"].trellis.shape[-1]) // 16 for pack in inners],
                 dtype=torch.int32,
                 device=device,
             )
             if gateless
             else torch.tensor(
-                [int(pack["gate"].trellis.shape[-1]) // 8 for pack in inners],
+                [int(pack["gate"].trellis.shape[-1]) // 16 for pack in inners],
                 dtype=torch.int32,
                 device=device,
             )
         )
         k_up = torch.tensor(
-            [int(pack["up"].trellis.shape[-1]) // 8 for pack in inners],
+            [int(pack["up"].trellis.shape[-1]) // 16 for pack in inners],
             dtype=torch.int32,
             device=device,
         )
         k_down = torch.tensor(
-            [int(pack["down"].trellis.shape[-1]) // 8 for pack in inners],
+            [int(pack["down"].trellis.shape[-1]) // 16 for pack in inners],
             dtype=torch.int32,
             device=device,
         )
@@ -2289,10 +2330,11 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
         layer._exl3_krank[layer._exl3_kdesc.long()] = torch.arange(
             layer._exl3_kdesc.numel(), dtype=torch.int32, device=device
         )
-        # Per-K-group dispatch (the GB10-qualified path): experts bucketed by
+        # Per-K-group dispatch (the A/B and fallback path): experts bucketed by
         # their integer (K_gate, K_up, K_down) tuple; each bucket runs one uniform-K
-        # exl3_moe launch. The unified mixedk kernel is known to fault on
-        # sm_121 (GB10) at layer 23; grouped dispatch avoids it entirely.
+        # exl3_moe launch. The unified mixedk launch is the default (see
+        # _exl3_mixedk_grouped_default); grouped stays selectable with
+        # VLLM_EXL3_MIXEDK_MODE=grouped.
         groups: dict[tuple[int, int, int], list[int]] = {}
         for e, pack in enumerate(inners):
             kg = int(pack["up"].trellis.shape[-1] if gateless else pack["gate"].trellis.shape[-1]) // 16
@@ -2302,6 +2344,11 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
         layer._exl3_k_groups = [
             (k_tuple, ids) for k_tuple, ids in sorted(groups.items())
         ]
+        # Fail closed (see _assert_mixedk_karrays_match_groups): the unified
+        # K arrays and the grouped scalar tuples must agree per expert.
+        _assert_mixedk_karrays_match_groups(
+            k_gate, k_up, k_down, layer._exl3_k_groups, n_exp, device
+        )
         if len(layer._exl3_k_groups) == 1:
             _kt = layer._exl3_k_groups[0][0]
             layer._exl3_k_tuple = _kt
@@ -3023,6 +3070,17 @@ def apply_exl3_fused_moe(
         grouped_default = _exl3_mixedk_grouped_default()
         use_grouped = (k_groups is not None) and (mode != "unified") and (
             mode == "grouped" or grouped_default
+        )
+        # Name the mixed-K dispatch mode once: the serve's receipts and logs
+        # must show which kernel family carries production traffic. (Under a
+        # real vLLM install the logger carries info_once; the stdlib fallback
+        # in dev/test environments has only info.)
+        getattr(logger, "info_once", logger.info)(
+            "EXL3 mixed-K MoE dispatch mode: %s (%s)"
+            % (
+                "grouped" if use_grouped else "unified",
+                "VLLM_EXL3_MIXEDK_MODE=" + repr(mode) if mode else "env unset -> default",
+            )
         )
         if use_grouped:
             # Per-K-group dispatch (GB10-qualified): one uniform-K exl3_moe

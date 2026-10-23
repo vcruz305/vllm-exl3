@@ -349,12 +349,52 @@ def test_case_f_fixture_is_the_per_k_tuple_digest():
 def test_case_f_bars_the_mixedk_unified_path_at_both_m():
     # The serve's default mixed-K path is the unified exl3_moe_mixedk
     # launch (VLLM_EXL3_MIXEDK_MODE unset); Case F must run each real
-    # expert router-free at m in {1, 96} and require that exact path.
+    # expert router-free at m in {1, 96} and gate the verdict on that
+    # exact serve path.
     tool = _tool()
     src = (REPO / "tools/gb10_minimax_m3_parity.py").read_text()
     assert tool.F_MS == (1, 96)
     seg = src.split("def _case_f(", 1)[1].split("# ── CPU self-test", 1)[0]
-    assert 'set(v["paths"]) == {"mixedk_unified"}' in seg
+    assert 'serve_mode = "default"' in seg
+    assert '"default": "mixedk_unified"' in seg
+
+
+def test_case_f_probes_both_modes_and_gates_on_the_serve_mode():
+    # Run 5's follow-up: the unified launch scored cosine ~0 while grouped was
+    # exact (plugin K-array units regression, fixed). Case F must now run BOTH
+    # modes, record path + cosine per mode, and gate the verdict ONLY on the
+    # mode the serve will use -- the other mode is recorded as A/B evidence.
+    tool = _tool()
+    src = (REPO / "tools/gb10_minimax_m3_parity.py").read_text()
+    seg = src.split("def _case_f(", 1)[1].split("# ── CPU self-test", 1)[0]
+    assert 'for mode in ("default", "grouped")' in seg
+    assert 'set(v["paths"]) == {mode_paths[serve_mode]}' in seg
+    assert 'mode_paths = {"default": "mixedk_unified", "grouped": "mixedk_grouped"}' in seg
+    assert '"serve_mode": f"{serve_mode}' in seg
+
+
+def test_case_f_probes_the_router_weight_applied_exactly_once():
+    # The router-included probe stays direct (no synthetic other experts): a
+    # NON-UNIFORM per-row topk weight rides on each real expert and the
+    # reference is w * that expert's own reference, so the slice passes only
+    # if the per-expert weighting is applied exactly once.
+    src = (REPO / "tools/gb10_minimax_m3_parity.py").read_text()
+    seg = src.split("def _case_f(", 1)[1].split("# ── CPU self-test", 1)[0]
+    assert "weight_once_expert_" in seg
+    assert "w * refs[e][:m]" in seg
+
+
+def test_plugin_karrays_carry_the_true_bit_width():
+    # Run 5's root cause: build_exl3_fused_state built the unified kernel's
+    # per-expert K arrays as trellis.shape[-1] // 8 = 2*K, but the kernel
+    # consumes them as the true bit width (the same moe_gemm_tile bits switch
+    # the grouped launch's true-K scalar feeds). The arrays must carry // 16
+    # and the load must cross-validate them against the K-group tuples.
+    esrc = (REPO / "src/vllm_exl3/exl3.py").read_text()
+    assert 'pack["gate"].trellis.shape[-1]) // 8' not in esrc
+    assert 'pack["down"].trellis.shape[-1]) // 8' not in esrc
+    assert 'pack["gate"].trellis.shape[-1]) // 16' in esrc
+    assert "K arrays disagree with the per-K-group tuples" in esrc
 
 
 # ── DSpark draft quantization: the plugin declines by construction ─────────

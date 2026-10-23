@@ -20,6 +20,7 @@ path must stamp its own dispatch label.
 import os
 import sys
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -237,6 +238,127 @@ def test_mixedk_grouped_launches_one_per_k_tuple_with_act3(
         assert call[9] == exl3.MOE_ACT_SWIGLU_OAI
         assert call[22:28] == (False, True) * 3
         assert call[10:13] == kt
+
+
+def _fake_proj(k: int) -> SimpleNamespace:
+    """A projection exactly as the loader leaves it: the stored 3-D trellis
+    whose width is 16*K (K = true bit width), plus its suh/svh scales."""
+    return SimpleNamespace(
+        trellis=torch.empty(4, 4, 16 * k, dtype=torch.int16),
+        suh=torch.empty(4, 16 * k, dtype=torch.float16),
+        svh=torch.empty(4, 16 * k, dtype=torch.float16),
+    )
+
+
+def _real_builder_layer() -> tuple[SimpleNamespace, list[dict[str, Any]]]:
+    """Layer + inners exactly as the loader leaves a mixed-K pack: two experts
+    per distinct (K_gate, K_up, K_down) tuple of the pack's census."""
+    tuples = ((2, 2, 2), (2, 2, 2), (2, 2, 3), (2, 2, 3), (3, 3, 3), (3, 3, 3))
+    inners = [
+        {
+            "gate": _fake_proj(t[0]),
+            "up": _fake_proj(t[1]),
+            "down": _fake_proj(t[2]),
+        }
+        for t in tuples
+    ]
+    layer = SimpleNamespace(
+        moe_config=SimpleNamespace(
+            activation=SimpleNamespace(value="swigluoai_uninterleave")
+        ),
+        swiglu_alpha=exl3.MINIMAX_SWIGLU_ALPHA_DEFAULT,
+        swiglu_beta=1.0,
+        swiglu_limit=exl3.MINIMAX_SWIGLU_LIMIT_DEFAULT,
+        w13_suh=torch.zeros(1, dtype=torch.float16),
+        _exl3_inners=inners,
+        _exl3_hidden_size=HIDDEN,
+        _exl3_intermediate_local=INTER,
+        _exl3_mixed_k=True,
+    )
+    return layer, inners
+
+
+def test_real_builder_karrays_are_true_bits_and_match_the_grouped_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GPU_JOB-2 run 5's root cause, pinned: the REAL build_exl3_fused_state
+    must build the unified kernel's per-expert K arrays with the TRUE bit
+    width (trellis.shape[-1] // 16), and the unified launch's arrays must
+    equal the grouped launches' scalar K for every expert -- two spellings of
+    the same load-time fact. Commit 3275819 shipped // 8 = 2*K here, the
+    kernel consumed the doubled value as bits (moe_gemm_tile's runtime switch
+    has cases 1..8 only), and the mixedk_unified path scored cosine ~0 on
+    real and synthetic packs while the grouped path was exact."""
+    monkeypatch.delenv("VLLM_EXL3_MIXEDK_MODE", raising=False)
+    monkeypatch.delenv("VLLM_EXL3_MIXEDK_PACKED", raising=False)
+    ext = _mock_ext(monkeypatch)
+    layer, inners = _real_builder_layer()
+    exl3.build_exl3_fused_state(layer, inners)
+
+    # The grouped spelling: the true (K_gate, K_up, K_down) per expert.
+    grouped_k: dict[int, tuple[int, ...]] = {}
+    for kt, ids in layer._exl3_k_groups:
+        for e in ids:
+            grouped_k[e] = kt
+    assert sorted(grouped_k) == list(range(N_EXP))
+    assert layer._exl3_k_max_launch == max(max(t) for t in grouped_k.values())
+
+    # The unified arrays carry the SAME true bit width per expert (run 5's
+    # bug doubled every entry: [4, 4, 4, 4, 6, 6] instead of [2, 2, 2, 2, 3, 3]).
+    for arr, j in (
+        (layer._exl3_K_gate_arr, 0),
+        (layer._exl3_K_up_arr, 1),
+        (layer._exl3_K_down_arr, 2),
+    ):
+        assert arr.tolist() == [grouped_k[e][j] for e in range(N_EXP)]
+
+    # Mock-record BOTH dispatches and diff them per expert: the unified
+    # launch's per-expert K must equal the grouped launch's scalar K.
+    layer._exl3_codebook_flags = (False, True) * 3
+    _apply(ext, layer, 64, 2)
+    assert layer._exl3_last_apply == "mixedk_unified"
+    unified = ext.exl3_moe_mixedk.calls[0]
+    assert unified[9] == exl3.MOE_ACT_SWIGLU_OAI
+    monkeypatch.setenv("VLLM_EXL3_MIXEDK_MODE", "grouped")
+    _apply(ext, layer, 64, 2)
+    assert layer._exl3_last_apply == "mixedk_grouped"
+    assert len(ext.exl3_moe.calls) == len(layer._exl3_k_groups)
+    for call, (kt, ids) in zip(ext.exl3_moe.calls, layer._exl3_k_groups):
+        assert call[10:13] == kt
+        for e in ids:
+            got = tuple(int(unified[10 + j][e]) for j in range(3))
+            assert got == kt, (
+                f"expert {e}: unified K arrays say {got}, grouped launch says "
+                f"{kt} -- the unified kernel would run the wrong bits instance"
+            )
+
+
+def test_load_guard_rejects_karray_group_divergence() -> None:
+    """The fail-closed load guard: any divergence between the unified K arrays
+    and the grouped tuples is a load-time ValueError, never a silent
+    wrong-bits launch (this is what let the 3275819 regression through)."""
+    device = torch.device("cpu")
+    groups = [((2, 2, 2), [0, 1]), ((2, 2, 3), [2, 3]), ((3, 3, 3), [4, 5])]
+    good = [
+        torch.tensor(v, dtype=torch.int32, device=device)
+        for v in ([2, 2, 2, 2, 3, 3], [2, 2, 2, 2, 3, 3], [2, 2, 3, 3, 3, 3])
+    ]
+    exl3._assert_mixedk_karrays_match_groups(
+        good[0], good[1], good[2], groups, N_EXP, device
+    )
+    # The 3275819 spelling (2*K): must raise.
+    doubled = [2 * t for t in good]
+    with pytest.raises(ValueError, match="disagree with the per-K-group"):
+        exl3._assert_mixedk_karrays_match_groups(
+            doubled[0], doubled[1], doubled[2], groups, N_EXP, device
+        )
+    # A single tampered entry: must raise.
+    tampered = [t.clone() for t in good]
+    tampered[2][4] = 2
+    with pytest.raises(ValueError, match="disagree with the per-K-group"):
+        exl3._assert_mixedk_karrays_match_groups(
+            tampered[0], tampered[1], tampered[2], groups, N_EXP, device
+        )
 
 
 def _fork_candidates() -> list[str]:
