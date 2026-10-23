@@ -108,13 +108,15 @@ class TensorMixedKStore(torch.nn.Module):
             else (self.hidden, self.intermediate)
         )
         if suffix == "trellis":
-            valid = (
-                source.dtype == torch.int16
-                and source.ndim == 3
-                and tuple(source.shape[:2]) == (in_dim // 16, out_dim // 16)
-                and source.shape[-1] % 16 == 0
-                and 2 <= source.shape[-1] // 16 <= 8
-            )
+            from .exl3 import assert_exl3_trellis_3d
+
+            try:
+                k_bits = assert_exl3_trellis_3d(source, in_dim, out_dim)
+            except ValueError as exc:
+                raise ValueError(
+                    f"EXL3 mixed-K invalid {key}: {exc}"
+                ) from exc
+            valid = source.dtype == torch.int16 and 2 <= k_bits <= 8
         elif suffix in ("suh", "svh"):
             valid = source.dtype == torch.float16 and tuple(source.shape) == (
                 in_dim if suffix == "suh" else out_dim,

@@ -17,8 +17,13 @@ worktree bind-mounted at /plugin and PYTHONPATH=/plugin/src:
   Case C  the rejection contract (CPU-side): wrong alpha/beta/activation
           raise, TP>1 indexer shards raise; no kernel launches;
   Case D  native-vLLM MXFP8 linear (the DSpark draft's format) at
-          6144->12288 with block-32 E8M0 scales vs a dequant reference,
-          recording the backend the sm_121 selector picks.
+          6144->12288 with block-32 E8M0 scales: EVERY selector candidate
+          that claims support on this device runs through the exact
+          method path the draft's ModelOpt method drives (staging ->
+          process_weights_after_loading -> apply), against a per-family
+          dequant reference plus an all-ones-scales/small-weights sanity
+          payload; the receipt names the backend(s) that are correct and
+          the auto selection.
   Case E  REAL pack bytes: layer 0's fused qkv+indexer tensors (q K4,
           k/v K5 EXL3 trellis + mul1 markers; index_q/index_k MXFP8)
           range-read from the Hub by authenticated HTTP with a token from
@@ -60,6 +65,11 @@ TOPK = 2
 # Case A shapes (GPU_JOB-2): 8 synthetic experts, hidden 4096, inter 1024,
 # K in {2, 3} (the pack's per-expert K census), 64 tokens, topk 2.
 A_HIDDEN, A_INTER, A_NEXP, A_TOKENS = 4096, 1024, 8, 64
+# Prefill-family probe: tokens*topk = 384 > the coop kernel's 256-slot
+# cap, so the dispatch takes the expert-batched exl3_moe path the serve
+# takes at prefill sizes (real prefill slices into <=2048-row chunks of
+# the same path). Below the fat threshold so no fat-GEMM route appears.
+A_PREFILL_TOKENS = 192
 
 # Case B shapes: the branch's fused layer at TP1 (hidden 6144; q 8192,
 # k 512, v 512, index_q 512, index_k 128). Synthetic packs ~30 MB total.
@@ -243,6 +253,49 @@ def _case_a_layer(k: int, device: torch.device, *, real_inners: bool):
     return layer, inners
 
 
+def _case_a_probe(
+    layer: Any,
+    method: Any,
+    raw: list[dict[str, Any]],
+    k: int,
+    tokens: int,
+    device: torch.device,
+) -> tuple[str, float, float]:
+    """One apply at `tokens` rows: returns the dispatch label and the
+    cosines against the act-3 and silu references. The dispatch label is
+    stamped by the inner path itself (coop / fused / loop / native /
+    mixed_k_reference); 'unknown' means no path stamped it."""
+    x = torch.randn(tokens, A_HIDDEN, dtype=torch.float16, device=device) * 0.1
+    weights = torch.softmax(
+        torch.randn(tokens, A_NEXP, dtype=torch.float16, device=device), dim=-1
+    )
+    ids = weights.topk(TOPK, dim=-1).indices
+    w_sel = weights.gather(1, ids)
+
+    out = method.apply(layer, x, w_sel, ids, None, None)
+    torch.cuda.synchronize()
+    path = getattr(layer, "_exl3_last_apply", "unknown")
+
+    limit = exl3.MINIMAX_SWIGLU_LIMIT_DEFAULT
+    acc = torch.zeros(tokens, A_HIDDEN, dtype=torch.float32, device=device)
+    acc_silu = torch.zeros_like(acc)
+    xh = x.half()
+    for e in range(A_NEXP):
+        rw = ((ids == e).to(w_sel.dtype) * w_sel).sum(dim=1, keepdim=True)
+        if rw.abs().max() == 0:
+            continue
+        g = _gemv_ref(xh, raw[e]["gate"], k).float()
+        u = _gemv_ref(xh, raw[e]["up"], k).float()
+        act = _oai(g, u, limit).half()
+        act_silu = (torch.nn.functional.silu(g.clamp(max=limit))
+                    * u.clamp(min=-limit, max=limit)).half()
+        d = _gemv_ref(act, raw[e]["down"], k).float()
+        d_silu = _gemv_ref(act_silu, raw[e]["down"], k).float()
+        acc += rw.float() * d
+        acc_silu += rw.float() * d_silu
+    return path, _cos(out, acc), _cos(out, acc_silu)
+
+
 def _case_a_run(k: int, device: torch.device) -> dict[str, Any]:
     layer, inners = _case_a_layer(k, device, real_inners=True)
     # The pack's codebook contract: every projection resolved to the mul1
@@ -270,43 +323,31 @@ def _case_a_run(k: int, device: torch.device) -> dict[str, Any]:
     cfg = exl3.Exl3Config.__new__(exl3.Exl3Config)
     method = exl3.Exl3MoEMethod(SimpleNamespace(), cfg, bits=k)
 
-    x = torch.randn(A_TOKENS, A_HIDDEN, dtype=torch.float16, device=device) * 0.1
-    weights = torch.softmax(
-        torch.randn(A_TOKENS, A_NEXP, dtype=torch.float16, device=device), dim=-1
+    # Decode shape: 64 tokens x topk 2 = 128 slots <= the coop kernel's
+    # 256-slot cap -> the exl3_moe_coop act-3 fast path the serve takes at
+    # decode (m=1 topk 4 = 4 slots, same kernel).
+    path, cos, cos_silu = _case_a_probe(layer, method, raw, k, A_TOKENS, device)
+    # Prefill shape: 192 tokens x topk 2 = 384 slots > the 256-slot cap ->
+    # the expert-batched exl3_moe path the serve takes at prefill sizes
+    # (real prefill chunk-slices into <=2048-row slices of the same path).
+    prefill_path, prefill_cos, _ = _case_a_probe(
+        layer, method, raw, k, A_PREFILL_TOKENS, device
     )
-    ids = weights.topk(TOPK, dim=-1).indices
-    w_sel = weights.gather(1, ids)
 
-    out = method.apply(layer, x, w_sel, ids, None, None)
-    torch.cuda.synchronize()
-    path = getattr(layer, "_exl3_last_apply", "coop")
-
-    limit = exl3.MINIMAX_SWIGLU_LIMIT_DEFAULT
-    acc = torch.zeros(A_TOKENS, A_HIDDEN, dtype=torch.float32, device=device)
-    acc_silu = torch.zeros_like(acc)
-    xh = x.half()
-    for e in range(A_NEXP):
-        rw = ((ids == e).to(w_sel.dtype) * w_sel).sum(dim=1, keepdim=True)
-        if rw.abs().max() == 0:
-            continue
-        g = _gemv_ref(xh, raw[e]["gate"], k).float()
-        u = _gemv_ref(xh, raw[e]["up"], k).float()
-        act = _oai(g, u, limit).half()
-        act_silu = (torch.nn.functional.silu(g.clamp(max=limit))
-                    * u.clamp(min=-limit, max=limit)).half()
-        d = _gemv_ref(act, raw[e]["down"], k).float()
-        d_silu = _gemv_ref(act_silu, raw[e]["down"], k).float()
-        acc += rw.float() * d
-        acc_silu += rw.float() * d_silu
-    cos = _cos(out, acc)
-    cos_silu = _cos(out, acc_silu)
     return {
         "k": k,
         "path": path,
+        "prefill_path": prefill_path,
         "codebook": "mul1",
         "cosine": round(cos, 6),
         "cosine_silu_reference": round(cos_silu, 6),
-        "pass": bool(cos >= COS_MIN and cos_silu < COS_MIN and path == "coop"),
+        "prefill_cosine": round(prefill_cos, 6),
+        "pass": bool(
+            cos >= COS_MIN
+            and cos_silu < COS_MIN
+            and path == "coop"
+            and prefill_cos >= COS_MIN
+        ),
     }
 
 
@@ -539,63 +580,211 @@ def _case_c(vllm_available: bool) -> dict[str, Any]:
 # ── Case D: native-vLLM MXFP8 linear (DSpark draft format) on sm_121 ───────
 
 
+# The selector's CUDA candidate list, pinned == vllm's own
+# _POSSIBLE_MXFP8_KERNELS[PlatformEnum.CUDA] (kernels/linear/__init__.py).
+# The selection loop consults is_supported() then can_implement() in this
+# order and returns the first that admits the device (init_mxfp8_linear_kernel);
+# run 3 recorded the pick on the GB10 as FlashInferCutlassMxfp8LinearKernel
+# with a NaN output. Case D now runs EVERY candidate that claims support on
+# (12,1) so the receipt names the backend(s) that are actually correct.
+D_CANDIDATES = (
+    "FlashInferCutedslMxfp8LinearKernel",
+    "FlashInferCutlassMxfp8LinearKernel",
+    "MarlinMxfp8LinearKernel",
+    "B12xMxfp8LinearKernel",
+    "EmulationMxfp8LinearKernel",
+    "HummingMxfp8LinearKernel",
+    "FlashInferTrtllmMxfp8LinearKernel",
+    "TorchMxFp8LinearKernel",
+)
+
+# Candidates whose apply() quantizes the ACTIVATION to MXFP8 inside the
+# kernel (flashinfer.py mxfp8_e4m3_quantize / flashinfer_mxfp8_quantize_8x4,
+# pytorch.py mxfp8_e4m3_quantize, b12x's internal requant, humming's
+# kMxfp8Dynamic input schema): the reference must run the same
+# quantize->dequant activation. Every other candidate consumes the raw
+# activation -- Marlin is W8A16 (marlin.py apply_mxfp8_marlin_linear) and
+# Emulation dequantizes the weight to BF16 at load (emulation.py:38-50,
+# VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD default on) -- so their reference
+# uses the raw BF16 activation against the dequantized weight.
+D_ACT_QUANTIZING = frozenset({
+    "FlashInferCutedslMxfp8LinearKernel",
+    "FlashInferCutlassMxfp8LinearKernel",
+    "FlashInferTrtllmMxfp8LinearKernel",
+    "TorchMxFp8LinearKernel",
+    "HummingMxfp8LinearKernel",
+    "B12xMxfp8LinearKernel",
+})
+
+
+def _case_d_metrics(y: torch.Tensor, ref: torch.Tensor) -> dict[str, Any]:
+    nan = int(torch.isnan(y).sum().item())
+    return {
+        "cosine": round(_cos(y, ref), 6) if nan == 0 else None,
+        "max_abs": round(float(y.abs().max().item()), 6)
+        if y.numel() and torch.isfinite(y).all()
+        else None,
+        "nan": nan,
+    }
+
+
 def _case_d(device: torch.device) -> dict[str, Any]:
     import vllm  # noqa: F401  (the dev image's own vLLM)
 
-    from vllm.model_executor.kernels.linear import init_mxfp8_linear_kernel
+    from vllm.model_executor.kernels.linear import (
+        Mxfp8LinearLayerConfig,
+        _POSSIBLE_MXFP8_KERNELS,
+        init_mxfp8_linear_kernel,
+    )
     from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
         mxfp8_e4m3_quantize,
     )
+    from vllm.platforms import PlatformEnum
 
-    w_bf16 = (torch.randn(D_N, D_K, dtype=torch.float32, device=device) * 0.05)
-    x_bf16 = (torch.randn(D_TOKENS, D_K, dtype=torch.float32, device=device) * 0.1)
+    # The selector's own CUDA list is the source of truth; the pinned
+    # D_CANDIDATES tuple must cover it exactly so an upstream reshuffle
+    # cannot silently drop a candidate from the sweep.
+    vllm_candidates = [
+        k.__name__
+        for k in _POSSIBLE_MXFP8_KERNELS[PlatformEnum.CUDA]
+    ]
+    if sorted(vllm_candidates) != sorted(D_CANDIDATES):
+        return {
+            "error": (
+                "vllm's CUDA MXFP8 candidate list changed: "
+                f"{sorted(vllm_candidates)} != {sorted(D_CANDIDATES)}"
+            ),
+            "pass": False,
+        }
 
-    # MXFP8 quantize (block-32 E8M0 scales along K), the checkpoint format.
+    cfg = Mxfp8LinearLayerConfig(weight_shape=(D_N, D_K))
+
+    # Random payload: the checkpoint format (block-32 E8M0 scales along K).
+    # NOTE the staging dtype contract: the quantizer's payload IS
+    # float8_e4m3fn and the kernel takes it as-is; converting the payload
+    # to uint8 (a VALUE cast, not a bitcast) destroys the E4M3 bit
+    # pattern (1.0 -> byte 1 -> 2**-9), which is what run-3's Case D did
+    # -- the kernel was handed garbage bits (many of them the 0x7F/0xFF
+    # NaN encodings) and the NaN was a TOOL artifact, not evidence about
+    # sm_121. Bit-level access for the reference decode goes through
+    # view(uint8), which is the bitcast the loader itself uses.
+    w_bf16 = torch.randn(D_N, D_K, dtype=torch.float32, device=device) * 0.05
+    x_bf16 = torch.randn(D_TOKENS, D_K, dtype=torch.float32, device=device) * 0.1
     w_payload, w_scale = mxfp8_e4m3_quantize(w_bf16, is_sf_swizzled_layout=False)
     x_payload, x_scale = mxfp8_e4m3_quantize(x_bf16, is_sf_swizzled_layout=False)
-
-    # Reference: hand-decode the same payload/scale bytes to BF16 and matmul
-    # (the kernel quantizes the activation itself, so the reference uses the
-    # same quantize-dequant activation; the compared quantity is the GEMM).
-    w_ref = _mxfp8_dequant(w_payload.view(-1, D_K), w_scale.view(D_N, -1))
-    x_ref = _mxfp8_dequant(x_payload.view(-1, D_K), x_scale.view(D_TOKENS, -1))
-    y_ref = (x_ref @ w_ref.t()).float()
-
-    try:
-        kernel = init_mxfp8_linear_kernel(weight_shape=(D_N, D_K))
-        backend = type(kernel).__name__
-    except Exception as exc:  # noqa: BLE001
-        return {
-            "backend": None,
-            "selection_error": str(exc)[:500],
-            "pass": False,
-        }
-
-    layer = SimpleNamespace()
-    layer.weight = torch.nn.Parameter(
-        w_payload.view(-1, D_K).to(torch.uint8).view(torch.float8_e4m3fn),
-        requires_grad=False,
+    assert w_payload.dtype == torch.float8_e4m3fn and w_payload.ndim == 2
+    w_ref = _mxfp8_dequant(
+        w_payload.view(torch.uint8), w_scale.view(D_N, -1)
     )
-    layer.weight_scale = torch.nn.Parameter(
-        w_scale.view(D_N, -1).to(torch.uint8), requires_grad=False
+    x_ref = _mxfp8_dequant(
+        x_payload.view(torch.uint8), x_scale.view(D_TOKENS, -1)
     )
-    layer.params_dtype = torch.bfloat16
-    kernel.process_weights_after_loading(layer)
+
+    # Sanity payload: every weight byte decodes to 1.0 (E4M3 0x38) with an
+    # all-127 E8M0 scale (descale 2**0), so the reference is exactly the row
+    # sums of the activation. A backend that NaNs here fails on the most
+    # degenerate legal input, which separates a real sm_121 kernel failure
+    # from scale-swizzle/synthetic-data mishandling (a backend that passes
+    # sanity but fails random has a layout bug, not a compute bug).
+    one_byte = int(
+        torch.ones((), dtype=torch.float32)
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8)
+        .item()
+    )
+    s_payload = torch.full((D_N, D_K), one_byte, dtype=torch.uint8, device=device)
+    s_scale = torch.full((D_N, D_K // 32), 127, dtype=torch.uint8, device=device)
+    s_ref = torch.ones(D_N, D_K, dtype=torch.bfloat16, device=device)
+
+    x_raw = x_bf16.to(torch.bfloat16)
+
+    def refs(backend: str) -> dict[str, torch.Tensor]:
+        quantizing = backend in D_ACT_QUANTIZING
+        return {
+            "random": (x_ref @ w_ref.t()).float()
+            if quantizing
+            else (x_raw.float() @ w_ref.t().float()),
+            "sanity": (x_ref @ s_ref.t()).float()
+            if quantizing
+            else (x_raw.float() @ s_ref.t().float()),
+        }
+
+    kernels = {
+        k.__name__: k for k in _POSSIBLE_MXFP8_KERNELS[PlatformEnum.CUDA]
+    }
+    results = []
+    usable = []
+    for name in D_CANDIDATES:
+        cls = kernels[name]
+        entry: dict[str, Any] = {"backend": name}
+        sup, reason = cls.is_supported()
+        if not sup:
+            entry["supported"] = False
+            entry["reason"] = (reason or "")[:200]
+            results.append(entry)
+            continue
+        imp, reason = cls.can_implement(cfg)
+        if not imp:
+            entry["supported"] = False
+            entry["reason"] = f"can_implement: {(reason or '')[:180]}"
+            results.append(entry)
+            continue
+        entry["supported"] = True
+        # The exact method path the draft's ModelOptMxFp8Config drives:
+        # create_weights registers weight [N,K] E4M3 + weight_scale
+        # [N,K/32] E8M0 (KMxfp8Static.create_weights), the loader fills
+        # them, wkey.process asserts ndim/dtype, then
+        # kernel.process_weights_after_loading, then apply ->
+        # kernel.apply_weights. The staging below IS that state.
+        reference = refs(name)
+        for tag, payload, scale in (
+            ("random", w_payload, w_scale.view(D_N, -1)),
+            ("sanity", s_payload.view(torch.float8_e4m3fn), s_scale),
+        ):
+            layer = SimpleNamespace()
+            layer.weight = torch.nn.Parameter(
+                payload.contiguous(), requires_grad=False
+            )
+            layer.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
+            layer.params_dtype = torch.bfloat16
+            layer.input_size_per_partition = D_K
+            layer.output_size_per_partition = D_N
+            try:
+                kernel = cls(cfg)
+                kernel.process_weights_after_loading(layer)
+                y = kernel.apply_weights(layer, x_raw)
+                torch.cuda.synchronize()
+                entry[tag] = _case_d_metrics(y, reference[tag])
+            except Exception as exc:  # noqa: BLE001
+                entry[tag] = {"error": str(exc)[:300]}
+            finally:
+                del layer
+                torch.cuda.empty_cache()
+        rand = entry.get("random") or {}
+        if (
+            rand.get("cosine") is not None
+            and rand["cosine"] >= COS_MIN
+            and rand.get("nan") == 0
+        ):
+            usable.append(name)
+        results.append(entry)
+
+    # What the serve picks today: the auto selector on this device.
     try:
-        y = kernel.apply_weights(layer, x_bf16.to(torch.bfloat16))
-        torch.cuda.synchronize()
-        cos = _cos(y, y_ref)
-        return {
-            "backend": backend,
-            "cosine": round(cos, 6),
-            "pass": bool(cos >= COS_MIN),
-        }
+        auto = type(init_mxfp8_linear_kernel(weight_shape=(D_N, D_K))).__name__
     except Exception as exc:  # noqa: BLE001
-        return {
-            "backend": backend,
-            "apply_error": str(exc)[:500],
-            "pass": False,
-        }
+        auto = f"selection error: {str(exc)[:200]}"
+
+    return {
+        "auto_backend": auto,
+        "candidates": results,
+        "usable": usable,
+        # The verdict is now "at least one candidate is correct on this
+        # GB10 and is named in the receipt" -- the auto backend's NaN is a
+        # finding the CHECKIN maps to the serve's backend-selection flag,
+        # not a silent pass of the broken default.
+        "pass": bool(usable),
+    }
 
 
 # ── Case E: real pack bytes, layer 0 fused qkv + indexer ────────────────────
@@ -675,13 +864,16 @@ def _shard_header(token: str) -> tuple[int, dict[str, Any]]:
     return 8 + hlen, header
 
 
-_NP_DTYPES = {
-    # census dtype -> numpy load dtype (the F8_E4M3 payload is raw bytes)
-    "I16": "int16",
-    "I32": "int32",
-    "F16": "float16",
-    "U8": "uint8",
-    "F8_E4M3": "uint8",
+_TORCH_DTYPES = {
+    # census dtype -> the checkpoint tensor's torch dtype. Tensors are
+    # rebuilt from flat bytes through the plugin loader's
+    # coerce_checkpoint_region (the reinterpret ats_alias._ats_view
+    # performs), which refuses non-itemsize-aligned regions.
+    "I16": torch.int16,
+    "I32": torch.int32,
+    "F16": torch.float16,
+    "U8": torch.uint8,
+    "F8_E4M3": torch.float8_e4m3fn,
 }
 
 
@@ -769,10 +961,20 @@ def _case_e(device: torch.device, token_file: str | None) -> dict[str, Any]:
                 f"{name}: header span {e - b} != census {ent['bytes']} bytes"
             )
         raw = _hf_range(token, data_base + b, e - b)
-        import numpy as np
-
-        arr = np.frombuffer(raw, dtype=_NP_DTYPES[ent["dtype"]])
-        return torch.from_numpy(arr.copy()).to(device)
+        u8 = torch.frombuffer(bytearray(raw), dtype=torch.uint8).to(device)
+        # The loader's own region-coercion helper rebuilds the checkpoint
+        # tensor from flat bytes (the reinterpret ats_alias._ats_view
+        # performs); a hand-rolled flat reshape is what run-3 died on --
+        # LinearEXL3 asserts the 3-D tile layout the checkpoint stores.
+        t = exl3.coerce_checkpoint_region(
+            u8, _TORCH_DTYPES[ent["dtype"]], ent["shape"]
+        )
+        if t.dtype == torch.float8_e4m3fn:
+            # The F8_E4M3 payload arrives as float8 (the safetensors dtype)
+            # and the loader views it to uint8 before the dequant, exactly
+            # as its indexer staging does at load end.
+            t = t.view(torch.uint8)
+        return t
 
     # EXL3 shards with their real mul1 markers and mixed K (q K4, k/v K5).
     linears = []
@@ -786,7 +988,11 @@ def _case_e(device: torch.device, token_file: str | None) -> dict[str, Any]:
             raise RuntimeError(
                 f"{p}_proj.mul1 marker is not the loader's mul1 int32"
             )
-        k = int(trellis.shape[-1]) // 16
+        # The loader's own trellis gate -- the exact geometry every loader
+        # slot adopts -- runs BEFORE any LinearEXL3 construction, so a
+        # mis-shaped fetch can never reach a kernel call.
+        out_f = B_OUTS[("q", "k", "v").index(p)]
+        k = exl3.assert_exl3_trellis_3d(trellis, B_IN, out_f)
         ks.append(k)
         linears.append(
             exl3.make_linear_exl3(trellis, suh, svh, None, marker.reshape(1))
@@ -988,6 +1194,98 @@ def _selftest() -> int:
            E_REPO == "vcruz305/MiniMax-M3.1-Flash-EXL3-SAGE-2.15bpw"
            and E_REVISION == "687cbff2c210b7514d18c5f6a4d1db3417b316c4")
 
+    # Case E tensors from the FIXTURE SHAPES, through the loader's own
+    # helpers, BEFORE any kernel call: the fetched region must become the
+    # 3-D [in/16, out/16, 16*K] trellis the loader adopts (run-3 died
+    # inside LinearEXL3 because the tool kept the region flat), and the
+    # loader's gate must reject the flat region and every wrong geometry.
+    ok_e3d = True
+    for p in ("q", "k", "v"):
+        ent = entries[f"language_model.model.layers.0.self_attn.{p}_proj.trellis"]
+        flat = torch.zeros(ent["bytes"], dtype=torch.uint8)
+        t = exl3.coerce_checkpoint_region(flat, torch.int16, ent["shape"])
+        out_f = B_OUTS[("q", "k", "v").index(p)]
+        ok_e3d = ok_e3d and exl3.assert_exl3_trellis_3d(t, B_IN, out_f) == (
+            ent["shape"][2] // 16
+        )
+        try:  # the flat region itself must be rejected by the gate
+            exl3.assert_exl3_trellis_3d(flat.view(torch.int16), B_IN, out_f)
+            ok_e3d = False
+        except ValueError:
+            pass
+    _check("case E trellis reshapes to the loader's 3-D layout", ok_e3d)
+
+    # Case D staging contract (the run-3 NaN): a `.to(torch.uint8)`
+    # roundtrip of an E4M3 payload is a VALUE cast that destroys the bit
+    # pattern (1.0 -> byte 1), while view(torch.uint8) is the bitcast. The
+    # run-3 tool staged weights through the value cast, so every weight
+    # collapsed to byte 0 and the kernel output was the zero vector --
+    # cosine(0, ref) = nan. The fixed tool must stage the payload as-is.
+    val_cast = int(
+        torch.ones((), dtype=torch.float32)
+        .to(torch.float8_e4m3fn).to(torch.uint8).item()
+    )
+    bit_cast = int(
+        torch.ones((), dtype=torch.float32)
+        .to(torch.float8_e4m3fn).view(torch.uint8).item()
+    )
+    _check("e4m3 value cast destroys the bit pattern (1 vs 56)",
+           val_cast == 1 and bit_cast == 56)
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "gb10_minimax_m3_parity.py"), encoding="utf-8").read()
+    # Case D's own function body, so this check's text cannot satisfy it.
+    seg = src.split("def _case_d(", 1)[1].split("# ── Case E", 1)[0]
+    _check("case D stages the fp8 payload as-is (no value cast)",
+           ".to(torch.uint8)" not in seg
+           and "s_payload.view(torch.float8_e4m3fn)" in seg
+           and "w_payload.view(torch.uint8)" in seg)
+
+    # Case D sweep coverage: the pinned candidate list is exactly vllm's
+    # CUDA list with no duplicates, and the per-family activation
+    # classification matches each kernel's apply (Marlin is W8A16,
+    # Emulation dequantizes to BF16 at load; everything else quantizes
+    # the activation in-kernel).
+    _check("case D candidate list is the pinned 8 with no duplicates",
+           sorted(D_CANDIDATES) == sorted(set(D_CANDIDATES)) and len(D_CANDIDATES) == 8
+           and "EmulationMxfp8LinearKernel" in D_CANDIDATES
+           and "MarlinMxfp8LinearKernel" in D_CANDIDATES
+           and "TorchMxFp8LinearKernel" in D_CANDIDATES)
+    _check("case D activation classification excludes marlin/emulation",
+           D_ACT_QUANTIZING == frozenset(D_CANDIDATES) - {
+               "MarlinMxfp8LinearKernel", "EmulationMxfp8LinearKernel",
+           })
+    # The sanity payload must decode to exactly 1.0 everywhere (E4M3 0x38
+    # under an all-127 E8M0 scale), so the sanity reference is the row
+    # sums of the activation.
+    s_payload = torch.full((2, 64), 56, dtype=torch.uint8)
+    s_scale = torch.full((2, 2), 127, dtype=torch.uint8)
+    _check("case D sanity payload decodes to all ones",
+           bool(((_mxfp8_dequant(s_payload, s_scale) == 1.0).all())))
+
+    # Case A dispatch observability: the coop fast path must stamp its own
+    # label (run 3 printed the generic "fused" entry label because the
+    # coop branch returned early and the wrapper clobbered it, so the
+    # path bar was unsatisfiable and the receipt said nothing about which
+    # inner kernel ran). The wrapper must stamp "fused" only when the
+    # inner call left the label unset, and the tool must read the label
+    # with an "unknown" default and require BOTH the coop decode path and
+    # a correct prefill-family probe.
+    esrc = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "src", "vllm_exl3", "exl3.py"),
+                encoding="utf-8").read()
+    coop_seg = esrc.split("exl3_moe_coop(", 1)[1]
+    _check("coop fast path stamps its own dispatch label",
+           'layer._exl3_last_apply = "coop"' in coop_seg.split("return out", 1)[0])
+    fused_idx = esrc.find('layer._exl3_last_apply = "fused"')
+    _check("wrapper no longer clobbers the inner dispatch label",
+           fused_idx > 0 and "is None:" in esrc[fused_idx - 200:fused_idx])
+    _check("case A bar requires the coop path AND a prefill probe",
+           'path == "coop"' in src and "prefill_cos >= COS_MIN" in src)
+    _check("case A prefill probe is past the coop slot cap",
+           A_PREFILL_TOKENS * TOPK > 256 and A_TOKENS * TOPK <= 256)
+    _check("case A reads the label with an unknown default",
+           'getattr(layer, "_exl3_last_apply", "unknown")' in src)
+
     print("GB10_MINIMAX_M3_PARITY SELFTEST " + ("PASS" if ok else "FAIL")
           + " (no hardware parity claim)")
     return 0 if ok else 1
@@ -1026,7 +1324,9 @@ def main() -> int:
     receipt["case_a"] = [_case_a_run(k, device) for k in (2, 3)]
     for ent in receipt["case_a"]:
         print(f"case A K={ent['k']}: path={ent['path']} cosine={ent['cosine']} "
-              f"cosine_silu={ent['cosine_silu_reference']}")
+              f"cosine_silu={ent['cosine_silu_reference']} "
+              f"prefill_path={ent['prefill_path']} "
+              f"prefill_cosine={ent['prefill_cosine']}")
         verdict = verdict and ent["pass"]
 
     receipt["case_b"] = _case_b(device)
@@ -1046,8 +1346,11 @@ def main() -> int:
     )
 
     receipt["case_d"] = _case_d(device)
-    print(f"case D: {receipt['case_d']}")
-    verdict = verdict and receipt["case_d"]["pass"]
+    d = receipt["case_d"]
+    print(f"case D auto_backend={d.get('auto_backend')} usable={d.get('usable')}")
+    for ent in d.get("candidates", []):
+        print(f"  case D candidate: {ent}")
+    verdict = verdict and d["pass"]
 
     receipt["case_e"] = _case_e(device, args.hf_token_file)
     if "skip" in receipt["case_e"]:

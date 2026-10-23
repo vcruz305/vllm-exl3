@@ -1476,6 +1476,70 @@ def shard_exl3_row(
     return loaded.contiguous()
 
 
+def coerce_checkpoint_region(
+    raw: torch.Tensor, dtype: torch.dtype, shape: Any
+) -> torch.Tensor:
+    """Reinterpret a flat checkpoint byte region as the checkpoint tensor.
+
+    The loader never reshapes EXL3 payloads: safetensors hands it the stored
+    tensor with its checkpoint shape, and every slot adopts that exact shape.
+    The one in-tree place that rebuilds a checkpoint-shaped tensor from flat
+    bytes is the ATS aliasing path (``ats_alias._ats_view``), which
+    reinterprets an element-aligned byte slice into the checkpoint dtype and
+    shape. This is that reinterpretation factored out, so tooling that reads
+    raw checkpoint regions builds tensors through the loader's own helper
+    instead of re-implementing the layout (a hand-rolled reshape produced
+    the run-3 Case E failure: a flat 1-D trellis can never reach
+    LinearEXL3, which asserts the 3-D tile layout).
+    """
+    if torch is None:
+        raise RuntimeError("torch required for checkpoint region coercion")
+    if raw.dtype != torch.uint8:
+        raise ValueError("coerce_checkpoint_region takes a flat uint8 region")
+    itemsize = torch.tensor([], dtype=dtype).element_size()
+    if int(raw.numel()) % itemsize:
+        raise ValueError(
+            f"checkpoint region of {int(raw.numel())} bytes is not "
+            f"{itemsize}-byte aligned for dtype {dtype}"
+        )
+    return raw.view(dtype).view(tuple(int(x) for x in shape))
+
+
+def assert_exl3_trellis_3d(
+    trellis: torch.Tensor, in_features: int, out_features: int
+) -> int:
+    """Assert the loader's trellis geometry and return K.
+
+    Every loader slot that adopts an EXL3 trellis holds the checkpoint's
+    exact 3-D ``[in/16, out/16, 16*K]`` int16 tensor: the mixed-K expert
+    store rejects any other geometry at load (``tensor_mixed_k.load``), and
+    the fused linear's per-shard slots adopt only the exact-shape payload
+    (``_make_weight_loader``). Centralizing the assertion here keeps
+    tooling from building a layout the loader would refuse -- and gives
+    the parity tool the same check the loader performs, before any kernel
+    call.
+    """
+    if torch is None:
+        raise RuntimeError("torch required for the trellis geometry check")
+    if getattr(trellis, "ndim", 0) != 3 or trellis.dtype != torch.int16:
+        raise ValueError(
+            "EXL3 trellis must be the 3-D int16 [in/16, out/16, 16*K] "
+            f"checkpoint layout, got ndim={getattr(trellis, 'ndim', 0)} "
+            f"dtype={getattr(trellis, 'dtype', None)}"
+        )
+    in_tiles, out_tiles, words = (int(x) for x in trellis.shape)
+    if (in_tiles, out_tiles) != (in_features // 16, out_features // 16):
+        raise ValueError(
+            f"EXL3 trellis tile shape {(in_tiles, out_tiles, words)} does "
+            f"not cover {in_features}x{out_features} (16-wide tiles)"
+        )
+    if words % 16 or not 2 <= words // 16 <= 8:
+        raise ValueError(
+            f"EXL3 trellis width {words} is not 16*K with K in 2..8"
+        )
+    return words // 16
+
+
 def _install_exllamav3_namespace() -> None:
     """Validate that the native ExLlamaV3 package and extension are importable."""
     import exllamav3_ext  # noqa: F401  — compiled extension must exist
@@ -2884,6 +2948,7 @@ def apply_exl3_fused_moe(
                 had_g, had_u, gu_g, gu_u, act_out, d_out, ctr, out,
                 None, None,
             )
+            layer._exl3_last_apply = "coop"
             return out
 
     flat_token = torch.arange(tokens, device=x2d.device, dtype=torch.long).repeat_interleave(topk)
@@ -3223,6 +3288,11 @@ def apply_exl3_experts(
     if not inners:
         raise RuntimeError("EXL3 experts were not built after weight load")
     tokens, hidden = x.shape[-2], x.shape[-1]
+    # Per-call dispatch label for diagnostics (the parity tool reads it).
+    # Inner paths stamp the truth: coop/native/loop/mixed_k_reference;
+    # the wrapper below only stamps the generic "fused" entry label when
+    # the inner call left it unset.
+    layer._exl3_last_apply = None
     x2d = x.reshape(tokens, hidden)
     ids = topk_ids.reshape(tokens, -1).to(torch.long)
     weights = topk_weights.reshape(tokens, -1)
@@ -3262,8 +3332,14 @@ def apply_exl3_experts(
         except Exception:
             use_fused = False
     if use_fused:
-        out = apply_exl3_fused_moe(x2d, ids, weights, layer, inners, expert_map, limit)
-        layer._exl3_last_apply = "fused"
+        try:
+            out = apply_exl3_fused_moe(x2d, ids, weights, layer, inners, expert_map, limit)
+        finally:
+            # The coop fast path and the native fallback inside the fused
+            # entry point stamp the real dispatch label; only stamp the
+            # generic entry label when they did not.
+            if getattr(layer, "_exl3_last_apply", None) is None:
+                layer._exl3_last_apply = "fused"
     else:
         _moe_act = getattr(layer, "_exl3_moe_act", None)
         if _moe_act is None:

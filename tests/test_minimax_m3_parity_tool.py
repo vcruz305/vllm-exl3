@@ -177,6 +177,112 @@ def test_case_e_constants_and_fixture_are_pinned():
             assert census[name] == ent, name
 
 
+def test_case_e_trellis_needs_the_loader_3d_layout():
+    # Run-3's Case E died inside LinearEXL3 ("trellis must have dim = 3")
+    # because the tool kept the fetched region flat. The fix routes the
+    # region through the plugin loader's own helpers: the checkpoint's
+    # stored shape IS the 3-D [in/16, out/16, 16*K] layout every loader
+    # slot adopts, and the loader's gate runs BEFORE any kernel call.
+    tool = _tool()
+    entries = tool._fixture_entries()
+    for p, out_f in zip(("q", "k", "v"), tool.B_OUTS[:3]):
+        name = f"language_model.model.layers.0.self_attn.{p}_proj.trellis"
+        ent = entries[name]
+        flat = torch.zeros(ent["bytes"], dtype=torch.uint8)
+        t = exl3.coerce_checkpoint_region(flat, torch.int16, ent["shape"])
+        # 3-D trellis resolved from the fixture shapes, K as censused.
+        assert exl3.assert_exl3_trellis_3d(t, tool.B_IN, out_f) == (
+            ent["shape"][2] // 16
+        )
+        # The flat region and every wrong geometry are rejected.
+        with pytest.raises(ValueError):
+            exl3.assert_exl3_trellis_3d(flat.view(torch.int16), tool.B_IN, out_f)
+        with pytest.raises(ValueError):
+            exl3.assert_exl3_trellis_3d(t[:, : t.shape[1] // 2, :], tool.B_IN, out_f)
+        with pytest.raises(ValueError):
+            exl3.coerce_checkpoint_region(flat[:-1], torch.int16, ent["shape"])
+    # The tool's Case E fetch goes through the loader helpers, not a
+    # hand-rolled reshape.
+    src = (REPO / "tools/gb10_minimax_m3_parity.py").read_text()
+    assert "exl3.coerce_checkpoint_region(" in src
+    assert "exl3.assert_exl3_trellis_3d(trellis, B_IN, out_f)" in src
+
+
+def test_case_d_run3_nan_was_a_tool_value_cast():
+    # torch's .to(uint8) on an E4M3 payload is a VALUE cast (1.0 -> byte
+    # 1), not a bitcast (byte 0x38 = 56). Run-3's Case D staged the
+    # draft's weights through that value cast, so every weight collapsed
+    # to byte 0, the kernel emitted the zero vector, and
+    # cosine(zeros, reference) printed nan. The sm_121 verdict on
+    # FlashInferCutlass was never actually tested.
+    one = torch.ones((), dtype=torch.float32).to(torch.float8_e4m3fn)
+    assert int(one.view(torch.uint8).item()) == 56  # the bit pattern
+    assert int(one.to(torch.uint8).item()) == 1  # the value-cast trap
+    # The fixed tool must stage the fp8 payload as-is: no .to(torch.uint8)
+    # anywhere in Case D (bit-level access for the reference decode goes
+    # through view, the bitcast).
+    src = (REPO / "tools/gb10_minimax_m3_parity.py").read_text()
+    seg = src.split("def _case_d(", 1)[1].split("# ── Case E", 1)[0]
+    assert ".to(torch.uint8)" not in seg
+
+
+def test_case_d_sweeps_every_cuda_candidate():
+    tool = _tool()
+    # Pinned == vllm's _POSSIBLE_MXFP8_KERNELS[PlatformEnum.CUDA]
+    # (kernels/linear/__init__.py); the sweep cross-checks the live list
+    # at runtime and refuses to run on a reshuffled candidate set.
+    assert sorted(tool.D_CANDIDATES) == sorted({
+        "FlashInferCutedslMxfp8LinearKernel",
+        "FlashInferCutlassMxfp8LinearKernel",
+        "MarlinMxfp8LinearKernel",
+        "B12xMxfp8LinearKernel",
+        "EmulationMxfp8LinearKernel",
+        "HummingMxfp8LinearKernel",
+        "FlashInferTrtllmMxfp8LinearKernel",
+        "TorchMxFp8LinearKernel",
+    })
+    # The activation classification matches each kernel's apply: Marlin
+    # is W8A16 and Emulation dequantizes to BF16 at load, so their
+    # references use the raw activation; every other candidate quantizes
+    # the activation in-kernel.
+    assert "MarlinMxfp8LinearKernel" not in tool.D_ACT_QUANTIZING
+    assert "EmulationMxfp8LinearKernel" not in tool.D_ACT_QUANTIZING
+    assert tool.D_ACT_QUANTIZING <= set(tool.D_CANDIDATES)
+    # The sanity payload (E4M3 0x38 under all-127 E8M0 scales) decodes to
+    # exactly 1.0, so the sanity reference is the activation row sums.
+    s = tool._mxfp8_dequant(
+        torch.full((2, 64), 56, dtype=torch.uint8),
+        torch.full((2, 2), 127, dtype=torch.uint8),
+    )
+    assert (s == 1.0).all()
+
+
+def test_case_a_receipt_must_name_the_inner_dispatch_path():
+    # Run 3's Case A printed path=fused: the coop act-3 fast path returns
+    # early from inside the fused entry point, and the wrapper then
+    # clobbered the diagnostic label with the generic entry name, so the
+    # tool's path bar could never be satisfied and the receipt could not
+    # say which kernel actually ran. The inner path must stamp the truth,
+    # the wrapper must not clobber it, and the tool must require BOTH
+    # the coop decode path and a correct prefill-family probe.
+    esrc = (REPO / "src/vllm_exl3/exl3.py").read_text()
+    coop_seg = esrc.split("exl3_moe_coop(", 1)[1].split("return out", 1)[0]
+    assert 'layer._exl3_last_apply = "coop"' in coop_seg
+    fused_idx = esrc.find('layer._exl3_last_apply = "fused"')
+    assert fused_idx > 0
+    assert "is None:" in esrc[fused_idx - 200:fused_idx]
+    tool = _tool()
+    src = (REPO / "tools/gb10_minimax_m3_parity.py").read_text()
+    assert 'getattr(layer, "_exl3_last_apply", "unknown")' in src
+    seg = src.split("def _case_a_run(", 1)[1].split("# ── Case B", 1)[0]
+    assert 'path == "coop"' in seg
+    assert "prefill_cos >= COS_MIN" in seg
+    # The decode probe is inside the coop slot cap; the prefill probe is
+    # past it (the expert-batched exl3_moe path prefill takes).
+    assert tool.A_TOKENS * tool.TOPK <= 256
+    assert tool.A_PREFILL_TOKENS * tool.TOPK > 256
+
+
 # ── DSpark draft quantization: the plugin declines by construction ─────────
 
 

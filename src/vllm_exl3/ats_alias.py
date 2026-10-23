@@ -162,13 +162,17 @@ def _ats_view(path: str, offset: int, nbytes: int, shape, dtype, device):
     if offset % 16:
         raise RuntimeError(f"ATS alias offset {offset} not 16-byte aligned: {path}")
     _mm, base = _map_file(path)
-    # element-aligned slice, then reinterpret
+    # element-aligned slice, then reinterpret through the loader's own
+    # region-coercion helper (the same reinterpret every checkpoint-shaped
+    # tensor goes through).
+    from .exl3 import coerce_checkpoint_region, load_exllamav3_ext
+
     itemsize = int(torch.tensor([], dtype=dtype).element_size())
     if offset % itemsize:
         raise RuntimeError(f"ATS alias offset {offset} not {itemsize}-byte aligned: {path}")
-    t = base[offset : offset + nbytes].view(dtype).view(tuple(int(x) for x in shape))
-    from .exl3 import load_exllamav3_ext
-
+    t = coerce_checkpoint_region(
+        base[offset : offset + nbytes], dtype, shape
+    )
     ext = load_exllamav3_ext()
     dev = torch.device(device)
     idx = dev.index if dev.index is not None else torch.cuda.current_device()
