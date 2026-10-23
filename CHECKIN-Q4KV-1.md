@@ -167,3 +167,85 @@ Cases (all must pass, non-zero exit otherwise):
   still on its own fp8 pool, quality gates vs the fp8 baseline.
 - CUDA-graph capture of the full decode step (not just R2 in
   isolation).
+
+## Post-val1 fix: fp8 pointers at the kernel boundary (this commit)
+
+The first real GB10 run (receipts/val1/q4kv.log, image vLLM
+0.1.dev23341+g8744dd2fb) died in case 1 with
+`CompilationError: cannot cast uint8[constexpr[128]] to fp8e4nv`:
+`_q4_w1_kernel` stores raw e4m3 *bytes* into the fp8 e4m3 index
+buffers (`index_q_out`, `index_cache`), and Triton's frontend refuses
+to cast the stored uint8 values to the pointer's fp8 element type.
+
+**Convention adopted (all q4 KV kernels, not just the failing line):**
+fp8 e4m3 buffers NEVER cross the kernel boundary as fp8 pointers. The
+kernels are pure byte math, so the host wrapper hands each of them a
+`uint8` byte view of the same storage (`_fp8_bytes` =
+`tensor.view(torch.uint8)`, applied to `index_q_out` and
+`index_cache` in `q4_w1_insert`). R2 takes no fp8 tensors at all (the
+pool is uint8 by design); its wrapper is pinned to hand the pool over
+as-is. `validate_w1_call` still validates the ORIGINAL fp8 tensors
+before the view is taken, so fail-closed semantics are unchanged.
+
+**Kernel audit (frontend type errors, both kernels, every pointer):**
+- W1: qkv/q_out loads+stores bf16-to-bf16; pool data/scale stores
+  uint8-to-uint8; norm/cos_sin loads are value-cast to fp32 (legal for
+  fp32 or bf16 host weights); positions/slot-map loads stay integer
+  with the page offset computed in int64 (`page.to(tl.int64) *
+  pool_page_stride`); index-byte stores now uint8-to-uint8. No other
+  fp8 pointer exists in the signature.
+- R2: topk loads are normalized `.to(tl.int32)` and block-table page
+  indices `.to(tl.int64)` (required for the pool offset); the split-K
+  loop bounds are now pinned to int32 (`seq_lens` load normalized
+  `.to(tl.int32)`) so `tl.range` sees uniform bound types whether the
+  host tensor is int32 (vLLM serving) or int64 (the parity harness);
+  sequence lengths fit int32 by construction, so this is
+  value-preserving. o/lse stores match their bf16/fp32 buffers.
+- `_expand16`/`_nibbles_to_bytes`/`_dequant_side` reshapes all match
+  element counts (join-based repeat-16 and nibble pairing verified
+  against the reference layout).
+
+**Frontend check without a GPU:** `tools/q4kv_triton_frontend_check.py`
+compiles the REAL W1/R2 kernel objects via
+`triton.compile(ASTSource(...), target=GPUTarget("cuda", 121, 32))`
+for a matrix of host dtype variants (parity-harness int64 index
+tensors, vLLM int32 serving tensors, fp32 and bf16 norm/cos_sin
+weights, PROCESS_INDEX on/off) and refuses any signature containing
+an fp8 pointer type. `tools/gb10_q4kv_parity.py` now runs it as step
+0, before case 1, so this failure class dies fast with a clear
+message. NOTE: no Python on this VPS has triton (checked: system
+python, the red venv, every other local venv, pip caches), so the
+check tool has NEVER been executed here; its first execution must be
+the GB10 run below. The tool also depends on the Triton version's
+ASTSource API shape (constants vs constexprs kwarg) and adapts by
+introspection; if the image's Triton renames the API again, the tool
+fails loudly instead of skipping.
+
+**Tests (red venv):** 4 new CPU tests in `tests/test_minimax_q4kv.py`
+(25/25 green): the real `q4_w1_insert` wrapper hands the fp8 index
+buffers to the kernel as uint8 views of the same storage (data_ptr
+equality) and nothing fp8-typed crosses the boundary; the None
+fallbacks pass the documented placeholders un-viewed; the real
+`q4_sparse_decode` wrapper hands the uint8 pool over as-is and
+produces bf16/fp32 split-K partials consumed by the unchanged vLLM
+merge kernel; and the GB10 harness source is pinned to run the
+frontend check before case 1. Full suite: 596 passed, 39 skipped,
+the same 8 pre-existing failures
+(test_compact_safetensors_attestation.py,
+test_compact_source_verification_window.py) — failure set identical
+to the baseline.
+
+**Exact GB10 command for the re-run (parent executes; the worktree is
+mounted read-only, the toolchain lives in the image):**
+
+```
+docker run <minimax-m3.1-flash vllm image, vLLM 0.1.dev23341+g8744dd2fb> \
+  -v <this worktree>:/plugin:ro -w /plugin \
+  -e PYTHONPATH=/plugin/src \
+  python3 tools/gb10_q4kv_parity.py
+```
+
+Unverified on this VPS (no GPU, no triton): the actual sm_121
+compilation of W1/R2, the fix's effect on the val1 failure, and all
+GB10 parity numerics. The frontend check + case 1 re-run on GB10 is
+the acceptance gate for this fix.

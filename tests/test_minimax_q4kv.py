@@ -9,7 +9,11 @@ Covers:
 - fail-closed dispatch (validate_w1_call + overlay wrappers);
 - pool detection (fp8/bf16/indexer/draft pools never match);
 - staging dequant == per-slot oracle; prefill remap correctness;
-- default-off: register() installs the overlay only under VLLM_EXL3_Q4KV=1.
+- default-off: register() installs the overlay only under VLLM_EXL3_Q4KV=1;
+- kernel boundary convention: fp8 e4m3 index buffers are handed to the
+  Triton kernels as uint8 byte views (the GB10 val1 compile fix), the
+  uint8 pool is passed as-is, and the GB10 harness frontend-checks the
+  kernels before any GPU case.
 
 Triton is not importable on this VPS and there is no GPU: the Triton W1/R2
 kernels are validated on GB10 by tools/gb10_q4kv_parity.py, not here.
@@ -19,6 +23,7 @@ from __future__ import annotations
 
 import math
 import sys
+from pathlib import Path
 from types import ModuleType
 
 import pytest
@@ -701,3 +706,190 @@ def test_kernels_module_needs_triton_at_call_time() -> None:
     if not HAS_TRITON:
         with pytest.raises(ImportError):
             q4kernels._kernels()
+
+
+# ---------------------------------------------------------------------------
+# Kernel boundary convention: fp8 buffers cross as uint8 byte views
+# ---------------------------------------------------------------------------
+
+
+class _RecordingKernel:
+    """Stands in for a @triton.jit kernel and records every launch."""
+
+    def __init__(self, calls: list, tag: str) -> None:
+        self._calls = calls
+        self._tag = tag
+
+    def __getitem__(self, grid):
+        def launch(*args, **kwargs):
+            self._calls.append((self._tag, grid, args, kwargs))
+
+        return launch
+
+
+def _install_kernel_recorders(monkeypatch, calls) -> None:
+    """Patch the built-kernel cache so the real wrappers launch recorders."""
+    monkeypatch.setattr(
+        q4kernels,
+        "_W1_KERNEL",
+        _RecordingKernel(calls, "w1"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        q4kernels,
+        "_DECODE_KERNEL",
+        _RecordingKernel(calls, "decode"),
+        raising=False,
+    )
+
+
+def _real_w1_inputs():
+    """A validate-clean CPU W1 call set (mirrors the GB10 harness case 1)."""
+    num_tokens = 3
+    width = (NQ + 2 * NKV + NIQ + 1) * 128
+    qkv = torch.zeros(num_tokens, width, dtype=torch.bfloat16)
+    q_out = torch.zeros(num_tokens, NQ, 128, dtype=torch.bfloat16)
+    index_q_out = torch.zeros(num_tokens, NIQ, 128,
+                              dtype=torch.float8_e4m3fn)
+    index_cache = torch.zeros(4, 128, 128, dtype=torch.float8_e4m3fn)
+    pool = _make_pool(4)
+    norm_w = torch.zeros(128)
+    cos_sin = torch.zeros(256, ROTARY)
+    positions = torch.tensor([1000, 1001, 1002])
+    slot_mapping = torch.tensor([128, 129, -1])
+    index_slot_mapping = torch.tensor([0, 1, -1])
+    return dict(
+        qkv=qkv, q_out=q_out, index_q_out=index_q_out,
+        index_cache=index_cache, pool=pool, norm_w=norm_w, cos_sin=cos_sin,
+        positions=positions, slot_mapping=slot_mapping,
+        index_slot_mapping=index_slot_mapping,
+    )
+
+
+def test_w1_insert_hands_fp8_buffers_as_uint8_views(monkeypatch) -> None:
+    """GB10 val1 fix: the fp8 index buffers must reach the kernel as uint8
+    byte views of the same storage; a raw fp8 pointer makes Triton's
+    frontend try to cast the stored bytes to fp8e4nv and fail to compile.
+    """
+    calls: list = []
+    _install_kernel_recorders(monkeypatch, calls)
+    inp = _real_w1_inputs()
+    q4kernels.q4_w1_insert(
+        inp["qkv"], inp["norm_w"], inp["norm_w"], inp["cos_sin"],
+        inp["positions"], NQ, NKV, ROTARY, EPS,
+        inp["norm_w"], inp["norm_w"], NIQ,
+        inp["slot_mapping"], inp["index_slot_mapping"], inp["pool"],
+        inp["index_cache"], 128, inp["q_out"], inp["index_q_out"],
+    )
+    assert len(calls) == 1
+    tag, grid, args, kwargs = calls[0]
+    assert tag == "w1"
+    assert grid == (3 * (NQ + 2 * NKV + NIQ + 1),)
+    assert kwargs["PROCESS_INDEX"] is True
+    # launch order: ..., 2=index_q_out view, 11=pool, 12=index_cache view.
+    assert args[0] is inp["qkv"]
+    assert args[1] is inp["q_out"]
+    assert args[11] is inp["pool"]
+    assert args[8] is inp["positions"]
+    for view, fp8 in ((args[2], inp["index_q_out"]),
+                     (args[12], inp["index_cache"])):
+        assert view.dtype == torch.uint8
+        assert view.data_ptr() == fp8.data_ptr()
+        assert view is not fp8
+    # No fp8-typed tensor crosses the boundary at all.
+    for a in args:
+        if isinstance(a, torch.Tensor):
+            assert a.dtype != torch.float8_e4m3fn
+
+
+def test_w1_insert_none_fallbacks_are_not_viewed(monkeypatch) -> None:
+    """Without index buffers the wrapper passes the documented in-place
+    placeholders (qkv / pool); the placeholder is never dtype-viewed.
+    """
+    calls: list = []
+    _install_kernel_recorders(monkeypatch, calls)
+    inp = _real_w1_inputs()
+    q4kernels.q4_w1_insert(
+        inp["qkv"], inp["norm_w"], inp["norm_w"], inp["cos_sin"],
+        inp["positions"], NQ, NKV, ROTARY, EPS,
+        None, None, NIQ,
+        inp["slot_mapping"], inp["index_slot_mapping"], inp["pool"],
+        None, 128, inp["q_out"], None,
+    )
+    assert len(calls) == 1
+    args = calls[0][2]
+    assert args[2] is inp["qkv"]
+    assert args[12] is inp["pool"]
+
+
+def test_decode_wrapper_boundary_convention(monkeypatch) -> None:
+    """R2 takes no fp8 tensors: the uint8 pool must be handed over
+    as-is (no view, no copy) and the split-K partials must be bf16/fp32.
+    The unchanged vLLM merge kernel is reached through a stub module.
+    """
+    calls: list = []
+    _install_kernel_recorders(monkeypatch, calls)
+    merge_calls: list = []
+
+    class _MergeKernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                merge_calls.append((grid, args, kwargs))
+
+            return launch
+
+    leaf_name = "vllm.models.minimax_m3.common.ops.sparse_attn"
+    parents = ["vllm", "vllm.models", "vllm.models.minimax_m3",
+               "vllm.models.minimax_m3.common",
+               "vllm.models.minimax_m3.common.ops"]
+    for name in parents:
+        monkeypatch.setitem(sys.modules, name, ModuleType(name))
+    leaf = ModuleType(leaf_name)
+    setattr(leaf, "_merge_topk_attn_out_kernel", _MergeKernel())
+    monkeypatch.setitem(sys.modules, leaf_name, leaf)
+
+    q = torch.zeros(4, NQ, 128, dtype=torch.bfloat16)
+    pool = _make_pool(4)
+    topk = torch.zeros(NKV, 4, 8, dtype=torch.int32)
+    block_table = torch.zeros(4, 8, dtype=torch.int32)
+    seq_lens = torch.full((4,), 8 * 128, dtype=torch.int32)
+    out = torch.zeros_like(q)
+    q4kernels.q4_sparse_decode(
+        q, pool, topk, block_table, seq_lens, NKV, 0.08, out, 1
+    )
+    assert [c[0] for c in calls] == ["decode"]
+    _, grid, args, kwargs = calls[0]
+    assert args[0] is q
+    assert args[1] is pool  # uint8 pool, unchanged identity
+    assert args[1].dtype == torch.uint8
+    o_partial, lse_partial = args[3], args[4]
+    assert o_partial.dtype == torch.bfloat16
+    assert o_partial.shape == (kwargs["NUM_TOPK_CHUNKS"], 4, NQ, 128)
+    assert lse_partial.dtype == torch.float32
+    assert lse_partial.shape == (kwargs["NUM_TOPK_CHUNKS"], 4, NQ)
+    for a in args:
+        if isinstance(a, torch.Tensor):
+            assert a.dtype != torch.float8_e4m3fn
+    # The unchanged vLLM merge kernel consumes exactly those partials.
+    assert len(merge_calls) == 1
+    m_args, m_kwargs = merge_calls[0][1], merge_calls[0][2]
+    assert m_args[0] is o_partial and m_args[1] is lse_partial
+    assert m_args[2] is out
+    assert m_kwargs["NUM_TOPK_CHUNKS"] == kwargs["NUM_TOPK_CHUNKS"]
+
+
+def test_gb10_harness_frontend_checks_before_any_gpu_case() -> None:
+    """The GB10 harness must run the sm_121 frontend compile check before
+    case 1 (fail fast with a clear message), and the check tool must
+    pin the sm_121 target and the uint8-view convention.
+    """
+    root = Path(__file__).resolve().parents[1]
+    harness = (root / "tools" / "gb10_q4kv_parity.py").read_text()
+    check = (root / "tools" / "q4kv_triton_frontend_check.py").read_text()
+    main_body = harness[harness.index("def main()") :]
+    gate = main_body.index("q4kv_triton_frontend_check.main()")
+    case1 = main_body.index("case1_w1_byte_exact()")
+    assert gate < case1, "frontend check must run before case 1"
+    assert 'GPUTarget("cuda", 121, 32)' in check
+    assert '"index_q_out_ptr": "*u8"' in check
+    assert '"index_cache_ptr": "*u8"' in check

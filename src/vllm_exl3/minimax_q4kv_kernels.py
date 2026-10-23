@@ -2,7 +2,11 @@
 
 W1: fused Gemma QK-norm + partial NeoX RoPE + e2m1/e4m3 q4 pack +
 scatter-insert into the main pool. The index_q/index_k outputs keep their
-fp8 e4m3 semantics (the indexer cache stays fp8 in milestone 1).
+fp8 e4m3 semantics (the indexer cache stays fp8 in milestone 1), but the
+fp8 buffers are handed to the kernels as uint8 byte views of the same
+storage (see _fp8_bytes): every load/store in these kernels is raw byte
+math, and a raw fp8 pointer would make Triton's frontend try to cast the
+bytes to fp8e4nv and fail to compile (GB10 val1).
 
 R2: q4-dequant split-K sparse decode producing partials compatible with
 vLLM's existing merge kernel (reused unchanged).
@@ -287,7 +291,8 @@ def _build_kernels():
                     xn, r, row_ptr, iq_norm_w_ptr, cos_sin_ptr, pos,
                     rotary_dim,
                 )
-                # index_q: e4m3(bf16(v)) satfinite bytes.
+                # index_q: e4m3(bf16(v)) satfinite bytes. The host passes
+                # this buffer as a uint8 byte view of the fp8 e4m3 tensor.
                 v_bf = xn.to(tl.bfloat16).to(tl.float32)
                 code = _e4m3_mag_code(v_bf)
                 sign = (
@@ -309,7 +314,8 @@ def _build_kernels():
                 # In-place rewrite of the processed index_k row, as the
                 # vendor op does.
                 tl.store(row_ptr + d, xn.to(tl.bfloat16))
-                # index_k: e4m3(clamp(v, +-448)) into the fp8 index cache.
+                # index_k: e4m3(clamp(v, +-448)) into the fp8 index cache,
+                # handed in as a uint8 byte view of the fp8 e4m3 tensor.
                 v = tl.minimum(tl.maximum(xn, -448.0), 448.0)
                 code = _e4m3_mag_code(v)
                 sign = (tl.cast(v, tl.int32, bitcast=True) < 0).to(tl.int64)
@@ -396,7 +402,11 @@ def _build_kernels():
         pid_h = pid_kh * gqa_group_size
         chunk = (max_topk + NUM_TOPK_CHUNKS - 1) // NUM_TOPK_CHUNKS
         chunk_start = pid_c * chunk
-        seq_len = tl.load(seq_lens + req_id)
+        # Loop-bound arithmetic is pinned to int32: sequence lengths fit
+        # int32 by construction, and a uniform type keeps the tl.range
+        # bounds consistent whether the host tensor is int32 (vLLM) or
+        # int64 (the parity harness). Page indices stay int64.
+        seq_len = tl.load(seq_lens + req_id).to(tl.int32)
         query_pos = seq_len - decode_query_len + q_offset
         kv_len = tl.maximum(query_pos + 1, 0)
         n_blocks = (kv_len + 127) // 128
@@ -492,6 +502,22 @@ def _dtype_name(t: torch.Tensor) -> str:
     return str(t.dtype).replace("torch.", "")
 
 
+def _fp8_bytes(t: torch.Tensor | None) -> torch.Tensor | None:
+    """Byte view of an fp8 e4m3 buffer (None passes through).
+
+    Convention for every q4 KV Triton kernel: fp8 e4m3 buffers never cross
+    the kernel boundary as fp8 pointers. The kernels are pure byte math,
+    so the host hands them a uint8 view of the same storage instead; a
+    raw fp8 pointer would make Triton's frontend try to cast the stored
+    uint8 bytes to fp8e4nv and die at compile time (the GB10 val1
+    failure). Validation always runs on the original fp8 tensors before
+    the view is taken, so the fail-closed semantics are unchanged.
+    """
+    if t is None:
+        return None
+    return t.view(torch.uint8)
+
+
 # ---------------------------------------------------------------------------
 # W1 wrapper
 # ---------------------------------------------------------------------------
@@ -557,7 +583,9 @@ def q4_w1_insert(
     w1[grid](
         qkv,
         q_out,
-        index_q_out if index_q_out is not None else qkv,
+        # fp8 e4m3 buffers cross the boundary as uint8 byte views
+        # (_fp8_bytes); the kernel writes raw e4m3 bytes, never fp8 values.
+        _fp8_bytes(index_q_out) if index_q_out is not None else qkv,
         q_norm_w,
         k_norm_w,
         index_q_norm_w if index_q_norm_w is not None else q_norm_w,
@@ -567,7 +595,7 @@ def q4_w1_insert(
         slot_mapping if slot_mapping is not None else positions,
         index_slot_mapping if index_slot_mapping is not None else positions,
         pool,
-        index_cache if index_cache is not None else pool,
+        _fp8_bytes(index_cache) if index_cache is not None else pool,
         eps,
         rotary_dim,
         qkv.shape[0],

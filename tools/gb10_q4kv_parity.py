@@ -8,6 +8,11 @@ Exact command (from the plugin worktree root):
 
     python tools/gb10_q4kv_parity.py
 
+Step 0 (run first, in-main): tools/q4kv_triton_frontend_check.py
+frontend-compiles W1 and R2 for sm_121 without a GPU; any Triton
+frontend type error (e.g. an fp8 pointer handed to a raw-byte kernel)
+aborts here with a clear message instead of inside case 1.
+
 Cases (all must pass; any failure exits non-zero):
   1. W1 byte-exact: the Triton fused write kernel's pool bytes, q_out and
      index bytes are byte-identical to the pure-torch reference packer
@@ -237,6 +242,12 @@ def main() -> None:
     cap = torch.cuda.get_device_capability()
     print(f"device: {torch.cuda.get_device_name()} sm_{cap[0]}{cap[1]}")
     dev = "cuda"
+    # Frontend-compile W1/R2 for sm_121 FIRST (no GPU math involved):
+    # a kernel that cannot compile must fail here with a clear message,
+    # not inside case 1 (the GB10 val1 failure class).
+    import q4kv_triton_frontend_check
+
+    q4kv_triton_frontend_check.main()
     case1_w1_byte_exact()
     eager_out = case2_r2_accuracy(dev)
     case3_pool_bytes()
