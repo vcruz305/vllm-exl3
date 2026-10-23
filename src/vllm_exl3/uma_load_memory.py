@@ -106,7 +106,7 @@ def mem_line(tag: str) -> str:
     )
 
 
-def tensor_census(top: int = 6) -> str:
+def tensor_census(top: int = 6, device: str = "cpu") -> str:
     """Live CPU tensors by unique storage (VLLM_EXL3_MEM_PROBE_TENSORS=1 only).
 
     Counts every CPU torch tensor the garbage collector can see, once per
@@ -126,7 +126,7 @@ def tensor_census(top: int = 6) -> str:
     n_key: collections.Counter = collections.Counter()
     for obj in gc.get_objects():
         try:
-            if not isinstance(obj, torch.Tensor) or obj.device.type != "cpu":
+            if not isinstance(obj, torch.Tensor) or obj.device.type != device:
                 continue
             st = obj.untyped_storage()
             ptr = int(st.data_ptr())
@@ -135,7 +135,7 @@ def tensor_census(top: int = 6) -> str:
             seen.add(ptr)
             nbytes = int(st.nbytes())
             total += nbytes
-            if obj.is_pinned():
+            if device == "cpu" and obj.is_pinned():
                 pinned += nbytes
             key = (tuple(int(x) for x in obj.shape[:4]), str(obj.dtype).replace("torch.", ""))
             by_key[key] += nbytes
@@ -163,7 +163,7 @@ def tensor_census(top: int = 6) -> str:
     except Exception:
         pass
     return (
-        f"TENSORS cpu_storages={len(seen)} cpu={total / 2**30:.2f}GiB "
+        f"TENSORS {device}_storages={len(seen)} {device}={total / 2**30:.2f}GiB "
         f"pinned={pinned / 2**30:.2f}GiB{host}{p1}{df} top=[{tops}]"
     )
 
@@ -225,6 +225,12 @@ def install_uma_load_memory(exl3: Any) -> None:
                     logger.info("%s layer=%s", mem_line("PRE_ARENA"), _layer_name(layer))
                     if _flag("VLLM_EXL3_MEM_PROBE_TENSORS") and STATS["layer_trims"] % 8 == 1:
                         logger.info("%s layer=%s", tensor_census(), _layer_name(layer))
+                        if STATS["layer_trims"] == 1:
+                            logger.info(
+                                "%s layer=%s",
+                                tensor_census(top=24, device="cuda"),
+                                _layer_name(layer),
+                            )
             return orig_plan(layer, shapes_by_proj, *args, **kwargs)
 
         prepare_trellis_arena_plan._uma_trim = True
