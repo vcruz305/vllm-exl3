@@ -23,6 +23,11 @@ draft pool stay fp8 and are untouched):
   the milestone-1 staging path -- the selected physical pages are
   dequantized to bf16 and the original prefill kernel runs on the staged
   pool. Correct but slow; a fused q4 prefill reader (R1) is milestone 2.
+  The staged union is memory-bounded: one grow-once bf16 buffer per
+  device, filled in page-capped slices
+  (``VLLM_EXL3_Q4KV_STAGING_MAX_MB``, default 48 MiB), and the sliced
+  result equals the uncapped staging bit-for-bit (pinned by tests and the
+  harness dry run against the fp32 prefill oracle).
 
 All wrappers fail closed: they raise on any unsupported combination rather
 than silently miscomputing.
@@ -416,26 +421,124 @@ def _make_prefill_wrapper(original):
         kv_cache = _q4_pool_bytes(kv_cache)
         _assert_unit_scale("k_scale", k_scale)
         _assert_unit_scale("v_scale", v_scale)
-        # Milestone-1 staging: dequantize the selected physical pages to
-        # bf16 and run the original prefill kernel on the staged pool.
-        staging, fake_block_table = ref.build_prefill_staging(
-            kv_cache, block_table, topk_idx, num_kv_heads
+        # Fail-closed device gate, exactly as the W1/R2 kernel wrappers:
+        # the boot18 crash class is a CPU tensor reaching the serve path
+        # (there it was the dequant scale-offset table; the gate must
+        # name every offender before any staging math runs).
+        from vllm_exl3 import minimax_q4kv_kernels as q4kernels
+
+        q4kernels._device_gate(
+            kv_cache,
+            "kv_cache",
+            (
+                ("q", q),
+                ("topk_idx", topk_idx),
+                ("block_table", block_table),
+                ("cu_seqlens_q", cu_seqlens_q),
+                ("seq_lens", seq_lens),
+                ("prefix_lens", prefix_lens),
+                ("output", output),
+            ),
         )
-        return original(
-            q,
-            staging,
-            topk_idx,
-            fake_block_table,
-            cu_seqlens_q,
-            seq_lens,
-            prefix_lens,
-            max_query_len,
-            num_kv_heads,
-            sm_scale,
-            output,
+        # Memory-bounded staging: one grow-once bf16 buffer per (device,
+        # head count), filled per slice under the page cap; the chunk is
+        # sliced so every call's staged union fits the cap and the result
+        # equals the uncapped staging (see the reference module).
+        max_pages = ref.staging_max_pages(num_kv_heads)
+        slices = ref.plan_prefill_slices(
+            kv_cache, block_table, topk_idx, cu_seqlens_q,
+            num_kv_heads, max_pages,
         )
+        needed = max((s["n"] for s in slices), default=0)
+        buffer = _staging_buffer(
+            kv_cache.device, max(max_pages, needed), num_kv_heads
+        )
+        num_reqs = cu_seqlens_q.shape[0] - 1
+        full_batch = (
+            len(slices) == 1
+            and slices[0]["reqs"] == list(range(num_reqs))
+            and slices[0]["q"] == (0, q.shape[0])
+        )
+        if full_batch:
+            # The whole chunk fits the cap: one call, the milestone-1
+            # behavior with every non-pool argument passed through
+            # unchanged (the staged pool view replaces the pool, the
+            # fake table replaces the block table).
+            n = ref.fill_staging_buffer(
+                buffer, kv_cache, slices[0]["pages"]
+            )
+            fake_bt = ref.slice_fake_block_table(
+                block_table, slices[0]["reqs"], slices[0]["pages"], n,
+                kv_cache.shape[0],
+            )
+            return original(
+                q,
+                buffer[:n + 1],
+                topk_idx,
+                fake_bt,
+                cu_seqlens_q,
+                seq_lens,
+                prefix_lens,
+                max_query_len,
+                num_kv_heads,
+                sm_scale,
+                output,
+            )
+        cu_list = cu_seqlens_q.reshape(-1).to(torch.int64).tolist()
+        prefix_list = prefix_lens.reshape(-1).to(torch.int64).tolist()
+        for s in slices:
+            qs, qe = s["q"]
+            n = ref.fill_staging_buffer(buffer, kv_cache, s["pages"])
+            fake_bt = ref.slice_fake_block_table(
+                block_table, s["reqs"], s["pages"], n, kv_cache.shape[0]
+            )
+            cu_new, prefix_new, max_q = ref.prefill_slice_metadata(
+                s, cu_list, prefix_list, kv_cache.device
+            )
+            original(
+                q[qs:qe],
+                buffer[:n + 1],
+                topk_idx[:, qs:qe, :],
+                fake_bt,
+                cu_new,
+                seq_lens[s["reqs"][0]:s["reqs"][-1] + 1],
+                prefix_new,
+                max_q,
+                num_kv_heads,
+                sm_scale,
+                output[qs:qe],
+            )
+        return None
 
     return minimax_m3_sparse_attn
+
+
+# One preallocated bf16 staging buffer per (device, head count): the
+# grow-once rule -- allocated at the configured capacity on first use,
+# grown only when a hard-floor slice (a single query whose own selection
+# exceeds the cap) needs more, never shrunk and never reallocated per
+# call. The per-call peak is therefore the configured cap plus the
+# bounded dequant transient, independent of the chunk's selected-page
+# union.
+_STAGING_BUFFERS: dict = {}
+
+
+def _staging_buffer(
+    device: torch.device, capacity_pages: int, num_kv_heads: int
+) -> torch.Tensor:
+    key = (device, num_kv_heads)
+    buf = _STAGING_BUFFERS.get(key)
+    if buf is None or buf.shape[0] < capacity_pages + 1:
+        new_cap = capacity_pages + 1
+        if buf is not None:
+            new_cap = max(new_cap, buf.shape[0])
+        buf = torch.zeros(
+            (new_cap, num_kv_heads, _SPARSE_BLOCK_SIZE, 2 * ref.HEAD_DIM),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        _STAGING_BUFFERS[key] = buf
+    return buf
 
 
 # ---------------------------------------------------------------------------

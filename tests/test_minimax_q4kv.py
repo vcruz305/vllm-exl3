@@ -544,6 +544,9 @@ def test_decode_wrapper_dispatch(monkeypatch) -> None:
 
 
 def test_prefill_wrapper_stages_and_remaps(monkeypatch) -> None:
+    # The CPU-only suite simulates the GPU boundary by patching the gate's
+    # device-type constant (the check itself is never weakened).
+    monkeypatch.setattr(q4kernels, "_REQUIRED_DEVICE_TYPE", "cpu")
     calls = []
     orig = lambda *a, **k: calls.append(("orig", a, k))  # noqa: E731
     wrapper = q4kv._make_prefill_wrapper(orig)
@@ -651,6 +654,370 @@ def test_build_prefill_staging_all_selected(monkeypatch) -> None:
     staging2, fake_bt2 = ref.build_prefill_staging(pool, bt, empty_topk, NKV)
     assert staging2.shape == (1, NKV, 128, 256)
     assert torch.equal(fake_bt2, torch.full_like(bt, 0))
+
+
+# ---------------------------------------------------------------------------
+# boot18 follow-up: every serve-path tensor follows the pool's device, and
+# the prefill staging union is memory-bounded without changing the result
+# ---------------------------------------------------------------------------
+
+META = torch.device("meta")
+
+
+def test_staging_luts_follow_the_pool_device() -> None:
+    """The boot18 crash class: the dequant scale-offset LUT was built on
+    the CPU and reached a cuda:0 gather. The LUT cache is per device and
+    dequant follows the pool's device (probed on the meta device, where a
+    CPU-resident table would fail exactly as it did on cuda:0)."""
+    for side in (0, 1):
+        table = ref._scale_offset_table(side, ref.POOL_BLOCK_SIZE, device=META)
+        assert table.device == META
+        cached = ref._scale_offset_table(side, ref.POOL_BLOCK_SIZE, device=META)
+        assert cached is table  # cached per device, not rebuilt per call
+    pool_flat = torch.zeros((2, 2 * NKV, ref.SLOT_REGION), dtype=torch.uint8, device=META)
+    out = ref.dequant_pool_pages(pool_flat)  # must not raise the
+    # cross-device error the boot18 log shows for a CPU index
+    assert out.device == META
+    lut = ref._DEQUANT_LUT_CACHE[(2 * NKV, META)]
+    assert lut.device == META
+    # the CPU reference tables still exist separately (tests) and are
+    # NOT shared with the meta entry
+    assert (2 * NKV, torch.device("cpu")) not in ref._DEQUANT_LUT_CACHE or (
+        ref._DEQUANT_LUT_CACHE[(2 * NKV, torch.device("cpu"))].device
+        == torch.device("cpu")
+    )
+
+
+def test_prefill_wrapper_device_gate_names_offenders(monkeypatch) -> None:
+    """The prefill wrapper fails closed before any staging math, naming
+    every off-device argument (as W1/R2 do)."""
+    calls: list = []
+    orig = lambda *a, **k: calls.append(a)  # noqa: E731
+    wrapper = q4kv._make_prefill_wrapper(orig)
+    flat, bt, topk, _, _ = _staged_fixture()
+    pool = flat.reshape(4, 2 * NKV, 128, 72)
+    spec = _prefill_args(pool, bt=bt, topk=topk)
+    # (a) all-CPU bundle, gate type cuda: refusal names the pool and cuda.
+    try:
+        wrapper(*spec)
+        raise AssertionError("wrapper accepted an all-CPU bundle")
+    except ValueError as exc:
+        assert "'kv_cache'" in str(exc) and "cuda" in str(exc)
+    assert not calls
+    # (b) pool on the (simulated) accelerator, one argument left on the
+    # CPU: the gate names exactly the misplaced ones.
+    monkeypatch.setattr(q4kernels, "_REQUIRED_DEVICE_TYPE", "meta")
+    spec = _prefill_args(
+        pool.to(META), bt=bt.to(META), topk=topk.to(META)
+    )
+    spec = list(spec)
+    spec[0] = spec[0].to(META)  # q
+    # cu_seqlens_q (4), seq_lens (5), prefix_lens (6), output (10) stay CPU
+    try:
+        wrapper(*spec)
+        raise AssertionError("wrapper accepted a mixed-device bundle")
+    except ValueError as exc:
+        msg = str(exc)
+        for name in ("cu_seqlens_q", "seq_lens", "prefix_lens", "output"):
+            assert f"'{name}'" in msg, msg
+        for name in ("q", "kv_cache", "topk_idx", "block_table"):
+            assert f"'{name}'" not in msg, msg
+    assert not calls
+
+
+def test_staging_cap_arithmetic(monkeypatch) -> None:
+    # 4 KV heads: one staged page = 4 * 128 * 256 * 2 B = 256 KiB.
+    assert ref.staging_page_bytes(NKV) == 262144
+    # default 48 MiB -> 192 pages, and the documented peak budget holds:
+    # 48 MiB buffer + <=13 MiB chunked fp32 dequant transient + <1 MiB
+    # bitmap is under the 64 MiB budget.
+    monkeypatch.delenv("VLLM_EXL3_Q4KV_STAGING_MAX_MB", raising=False)
+    assert ref.staging_max_pages(NKV) == 192
+    monkeypatch.setenv("VLLM_EXL3_Q4KV_STAGING_MAX_MB", "8")
+    assert ref.staging_max_pages(NKV) == 32
+    monkeypatch.setenv("VLLM_EXL3_Q4KV_STAGING_MAX_MB", "0.0001")
+    assert ref.staging_max_pages(NKV) == 1  # never below one page
+    for bad in ("abc", "-1", "0", "nan", "inf"):
+        monkeypatch.setenv("VLLM_EXL3_Q4KV_STAGING_MAX_MB", bad)
+        with pytest.raises(ValueError):
+            ref.staging_max_pages(NKV)
+
+
+def _prefill_chunk_fixture(num_pages: int = 8, seed: int = 7):
+    """A realistic multi-sequence prefill chunk over a packed pool.
+
+    3 requests of different lengths; block-table rows share physical
+    pages 0/1 (a common prefix) and own distinct pages afterwards; the
+    top-k selections differ per (kv head, query) and carry sentinels.
+    """
+    flat = torch.zeros((num_pages, 2 * NKV, ref.SLOT_REGION), dtype=torch.uint8)
+    for page in range(num_pages):
+        rows = _rand(2 * NKV * 128, seed=200 + page)
+        for slot in range(2 * NKV):
+            flat[page, slot] = ref.pack_slot_region_side(
+                rows[slot * 128:(slot + 1) * 128], slot % 2
+            )
+    pool = flat.reshape(num_pages, 2 * NKV, 128, 72)
+    values = ref.dequant_pool_pages(flat)  # [P, 2H, 128, 128]
+    k_pages = values[:, 0::2].contiguous()
+    v_pages = values[:, 1::2].contiguous()
+    qlens = [6, 4, 2]
+    total_q = sum(qlens)
+    cu = torch.tensor([0] + list(torch.cumsum(torch.tensor(qlens), 0)), dtype=torch.int32)
+    bt = torch.tensor(
+        [[0, 1, 2, 3], [0, 1, 4, 5], [0, 1, 6, 7]], dtype=torch.int32
+    )
+    g = torch.Generator().manual_seed(seed)
+    topk = torch.randint(0, bt.shape[1], (NKV, total_q, 6), generator=g).to(torch.int32)
+    topk.view(-1)[::7] = -1  # sentinels
+    prefix = torch.tensor([256, 128, 0], dtype=torch.int32)
+    seq = prefix + torch.tensor(qlens, dtype=torch.int32)
+    q = _rand(total_q * NQ, 0.5, seed=seed + 1).view(total_q, NQ, 128)
+    return dict(
+        pool=pool, k_pages=k_pages, v_pages=v_pages, bt=bt, topk=topk,
+        cu=cu, seq=seq, prefix=prefix, q=q, qlens=qlens, total_q=total_q,
+        sm_scale=0.08,
+    )
+
+
+def _selected_pages_per_query(fx) -> list[set[int]]:
+    """Independent oracle of each query's selected physical pages."""
+    cu = fx["cu"].tolist()
+    bt = fx["bt"]
+    out = []
+    for i in range(fx["total_q"]):
+        pages = set()
+        for kvh in range(NKV):
+            for b in fx["topk"][kvh, i].tolist():
+                if 0 <= b < bt.shape[1] and int(bt[_req_of(fx, i), b]) >= 0:
+                    pages.add(int(bt[_req_of(fx, i), b]))
+        out.append(pages)
+    return out
+
+
+def _req_of(fx, i: int) -> int:
+    cu = fx["cu"].tolist()
+    for r in range(len(cu) - 1):
+        if cu[r] <= i < cu[r + 1]:
+            return r
+    raise AssertionError
+
+
+def test_plan_prefill_slices_partitions_and_caps(monkeypatch) -> None:
+    fx = _prefill_chunk_fixture()
+    cap = ref.staging_max_pages(NKV, max_mb=0.001)  # 1 page
+    slices = ref.plan_prefill_slices(
+        fx["pool"], fx["bt"], fx["topk"], fx["cu"], NKV, cap
+    )
+    assert len(slices) > 3  # the cap actually forced slicing
+    # (a) the slices partition the whole chunk query axis contiguously.
+    pos = 0
+    for s in slices:
+        qs, qe = s["q"]
+        assert qs == pos and qe > qs
+        pos = qe
+    assert pos == fx["total_q"]
+    # (b) no slice mixes a partial request with another request, and a
+    # slice's request list is always contiguous.
+    for s in slices:
+        assert s["reqs"] == list(range(s["reqs"][0], s["reqs"][-1] + 1))
+    # (c) every slice's page set is exactly the union of its own
+    # queries' selections (sorted, unique, on the pool device).
+    per_query = _selected_pages_per_query(fx)
+    all_pages: set[int] = set()
+    for s in slices:
+        qs, qe = s["q"]
+        want = set()
+        for i in range(qs, qe):
+            want |= per_query[i]
+        all_pages |= want
+        got = s["pages"].tolist()
+        assert got == sorted(want)
+        assert s["n"] == len(got)
+        assert s["pages"].device == fx["pool"].device
+        # (d) the cap holds unless the slice is a single query (the hard
+        # per-slice floor: one query's own selection).
+        if qe - qs > 1:
+            assert s["n"] <= cap
+    # (e) nothing was dropped: the union over all slices is exactly the
+    # uncapped selected set.
+    staging, fake_bt = ref.build_prefill_staging(
+        fx["pool"], fx["bt"], fx["topk"], NKV
+    )
+    assert staging.shape[0] - 1 == len(all_pages)
+    # (f) the single-slice plan (cap >= union) is exactly the full batch.
+    slices_full = ref.plan_prefill_slices(
+        fx["pool"], fx["bt"], fx["topk"], fx["cu"], NKV, 10 ** 6
+    )
+    assert len(slices_full) == 1
+    assert slices_full[0]["reqs"] == [0, 1, 2]
+    assert slices_full[0]["q"] == (0, fx["total_q"])
+
+
+def test_capped_prefill_equals_uncapped_staging(monkeypatch) -> None:
+    """The capped, sliced execution equals the uncapped staging exactly,
+    proved at the attention level with the fp32 prefill oracle."""
+    fx = _prefill_chunk_fixture()
+    # (1) uncapped: one staging, one oracle call over the whole chunk.
+    staging, fake_bt = ref.build_prefill_staging(
+        fx["pool"], fx["bt"], fx["topk"], NKV
+    )
+    st_k = staging[:, :, :, :128].to(torch.float32)
+    st_v = staging[:, :, :, 128:].to(torch.float32)
+    out_uncapped = ref.reference_prefill_attention(
+        fx["q"].to(torch.float32), st_k, st_v, fake_bt, fx["topk"],
+        fx["cu"], fx["seq"], fx["prefix"], fx["sm_scale"],
+    )
+    # (2) capped: the slice plan + per-slice executor, exactly as the
+    # overlay runs it, outputs concatenated.
+    cap = ref.staging_max_pages(NKV, max_mb=0.001)
+    slices = ref.plan_prefill_slices(
+        fx["pool"], fx["bt"], fx["topk"], fx["cu"], NKV, cap
+    )
+    assert len(slices) > 3
+    buffer = torch.zeros(
+        (max(s["n"] for s in slices) + 1, NKV, 128, 256),
+        dtype=torch.bfloat16,
+    )
+    cu_list = fx["cu"].tolist()
+    prefix_list = fx["prefix"].tolist()
+    seq_list = fx["seq"].tolist()
+    out_capped = torch.zeros_like(out_uncapped)
+    for s in slices:
+        qs, qe = s["q"]
+        n = ref.fill_staging_buffer(buffer, fx["pool"], s["pages"])
+        fake = ref.slice_fake_block_table(
+            fx["bt"], s["reqs"], s["pages"], n, fx["pool"].shape[0]
+        )
+        cu_new, prefix_new, max_q = ref.prefill_slice_metadata(
+            s, cu_list, prefix_list, torch.device("cpu")
+        )
+        part = ref.reference_prefill_attention(
+            fx["q"][qs:qe].to(torch.float32),
+            buffer[:n + 1, :, :, :128].to(torch.float32),
+            buffer[:n + 1, :, :, 128:].to(torch.float32),
+            fake, fx["topk"][:, qs:qe, :], cu_new,
+            torch.tensor(seq_list[s["reqs"][0]:s["reqs"][-1] + 1], dtype=torch.int32),
+            prefix_new, fx["sm_scale"],
+        )
+        out_capped[qs:qe] = part
+    assert torch.equal(out_capped, out_uncapped)
+    # (3) both equal the bf16 rounding of the direct fp32 oracle (the
+    # staged path changes values only by the pool's own quantization).
+    out_direct = ref.reference_prefill_attention(
+        fx["q"].to(torch.float32), fx["k_pages"], fx["v_pages"],
+        fx["bt"], fx["topk"], fx["cu"], fx["seq"], fx["prefix"],
+        fx["sm_scale"],
+    )
+    cos = float(
+        (out_uncapped.reshape(-1) @ out_direct.reshape(-1))
+        / (out_uncapped.norm() * out_direct.norm())
+    )
+    assert cos >= 0.99
+
+
+def test_prefill_wrapper_slices_and_reuses_buffer(monkeypatch) -> None:
+    """The overlay's sliced executor passes the derived per-slice
+    arguments to the original kernel and reuses ONE grow-once buffer."""
+    monkeypatch.setattr(q4kernels, "_REQUIRED_DEVICE_TYPE", "cpu")
+    monkeypatch.setenv("VLLM_EXL3_Q4KV_STAGING_MAX_MB", "0.001")
+    monkeypatch.setattr(q4kv, "_STAGING_BUFFERS", {})
+    fx = _prefill_chunk_fixture()
+    calls: list = []
+    orig = lambda *a, **k: calls.append(a)  # noqa: E731
+    wrapper = q4kv._make_prefill_wrapper(orig)
+    out = torch.zeros(fx["total_q"], NQ, 128, dtype=torch.bfloat16)
+    wrapper(
+        fx["q"], fx["pool"], fx["topk"], fx["bt"], fx["cu"], fx["seq"],
+        fx["prefix"], 6, NKV, fx["sm_scale"], out,
+    )
+    cap = ref.staging_max_pages(NKV)
+    slices = ref.plan_prefill_slices(
+        fx["pool"], fx["bt"], fx["topk"], fx["cu"], NKV, cap
+    )
+    assert len(slices) > 3
+    assert len(calls) == len(slices)
+    buffer = q4kv._STAGING_BUFFERS[(torch.device("cpu"), NKV)]
+    cu_list = fx["cu"].tolist()
+    prefix_list = fx["prefix"].tolist()
+    seq_list = fx["seq"].tolist()
+    for call, s in zip(calls, slices):
+        qs, qe = s["q"]
+        q_s, staged, topk_s, fake, cu_new, seq_s, prefix_new, max_q = call[:8]
+        # query/output/top-k are exact views of the original tensors
+        assert torch.equal(q_s, fx["q"][qs:qe])
+        assert torch.equal(topk_s, fx["topk"][:, qs:qe, :])
+        assert call[10].data_ptr() == out[qs:qe].data_ptr()
+        # the staged pool is a view of the ONE persistent buffer, sized to
+        # the slice; its content is checked on the last slice below (the
+        # buffer is shared, so earlier slices' bytes are overwritten by
+        # later ones -- the per-slice content/mapping equivalence is
+        # proven end-to-end in test_capped_prefill_equals_uncapped_staging)
+        assert staged.data_ptr() == buffer.data_ptr()
+        n = s["n"]
+        assert staged.shape[0] == n + 1
+        # the fake table maps exactly as the uncapped convention does
+        exp = ref.slice_fake_block_table(
+            fx["bt"], s["reqs"], s["pages"], n, fx["pool"].shape[0]
+        )
+        assert torch.equal(fake, exp)
+        # the derived metadata matches the kernel's own semantics
+        exp_cu, exp_prefix, exp_max = ref.prefill_slice_metadata(
+            s, cu_list, prefix_list, torch.device("cpu")
+        )
+        assert torch.equal(cu_new, exp_cu)
+        assert torch.equal(prefix_new, exp_prefix)
+        assert max_q == exp_max
+        assert torch.equal(
+            seq_s,
+            torch.tensor(seq_list[s["reqs"][0]:s["reqs"][-1] + 1], dtype=torch.int32),
+        )
+    # the LAST slice's bytes are still in the buffer: they must be
+    # exactly the dequantized last slice pages plus the zero page.
+    s = slices[-1]
+    call = calls[-1]
+    staged = call[1]
+    n = s["n"]
+    values = ref.dequant_pool_pages(
+        fx["pool"].reshape(-1, 2 * NKV, ref.SLOT_REGION)[s["pages"]]
+    )
+    assert torch.equal(
+        staged[:n, :, :, :128], values[:, 0::2].to(torch.bfloat16)
+    )
+    assert torch.equal(
+        staged[:n, :, :, 128:], values[:, 1::2].to(torch.bfloat16)
+    )
+    assert not staged[n].any()
+    # grow-once: a second call with a LARGER configured cap reuses the
+    # same buffer object (never shrunk, never churned per call).
+    monkeypatch.setenv("VLLM_EXL3_Q4KV_STAGING_MAX_MB", "16")
+    calls2: list = []
+    wrapper(
+        fx["q"], fx["pool"], fx["topk"], fx["bt"], fx["cu"], fx["seq"],
+        fx["prefix"], 6, NKV, fx["sm_scale"], out,
+    )
+    buffer2 = q4kv._STAGING_BUFFERS[(torch.device("cpu"), NKV)]
+    assert buffer2.shape[0] >= buffer.shape[0]  # never shrinks
+
+
+def test_fill_staging_buffer_bounds_and_refuses(monkeypatch) -> None:
+    fx = _prefill_chunk_fixture()
+    pages = torch.tensor([1, 3], dtype=torch.int64)
+    small = torch.zeros((2, NKV, 128, 256), dtype=torch.bfloat16)
+    with pytest.raises(ValueError):
+        ref.fill_staging_buffer(small, fx["pool"], pages)  # needs 3 slots
+    buffer = torch.zeros((3, NKV, 128, 256), dtype=torch.bfloat16)
+    n = ref.fill_staging_buffer(buffer, fx["pool"], pages)
+    assert n == 2
+    values = ref.dequant_pool_pages(
+        fx["pool"].reshape(-1, 2 * NKV, ref.SLOT_REGION)[pages]
+    )
+    assert torch.equal(buffer[0, :, :, :128], values[0, 0::2].to(torch.bfloat16))
+    assert torch.equal(buffer[1, :, :, 128:], values[1, 1::2].to(torch.bfloat16))
+    assert not buffer[2].any()
+    # empty selection -> n == 0, only the zero page
+    n0 = ref.fill_staging_buffer(buffer, fx["pool"], torch.empty(0, dtype=torch.int64))
+    assert n0 == 0
 
 
 # ---------------------------------------------------------------------------

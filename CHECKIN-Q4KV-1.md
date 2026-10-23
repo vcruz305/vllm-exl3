@@ -671,3 +671,109 @@ whole end-to-end serve — the next GB10 boot with
 `VLLM_EXL3_Q4KV=1 --kv-cache-dtype nvfp4` must show the new install INFO
 line (every binding listed), the q4 selector line, and 576 B/token/layer
 pool sizing, or fail with one of the named refusals.
+
+## Post-boot18 fix: prefill staging path (this commit)
+
+GB10 boot18 result: with VLLM_EXL3_Q4KV=1 the 32K serve got through
+model init and KV allocation (GPU KV cache 33,408 tokens; MEMPROBE
+POST_KV avail 2.07 GiB) and then died in vLLM's profiling/warm-up
+forward in the PREFILL path: sparse_attention.py:507 forward ->
+minimax_q4kv.py:421 minimax_m3_sparse_attn (prefill wrapper) ->
+minimax_q4kv_reference.py:781 build_prefill_staging -> :735
+dequant_pool_pages -> scale_region.gather: "Expected all tensors to
+be on the same device, but got index is on cpu ... (method wrapper
+CUDA_gather)". The W1/R2 kernel harness (8/8 PASS) never exercised the
+prefill path, so this was the first real execution of the prefill
+fallback.
+
+**Root cause:** the dequant scale-offset lookup table (and the rest of
+the prefill staging path) was built on the CPU by default and reached a
+cuda:0 gather. Fixed at the class level:
+
+1. `_scale_offset_table` and the dequant LUT are now cached per
+   (side/slots, device) and built on the pool's device; the fake block
+   table, selection, and every per-slice remap table are created on the
+   pool's device. A grep audit of every torch.arange/tensor/zeros/
+   empty/full/ones/as_tensor creation reachable from the serve hooks
+   shows device= (pool-derived) or *_like derivation everywhere; the
+   only deviceless creations left are inside the CPU-only packer and
+   prefill-oracle paths, which now fail closed on any non-CPU input.
+2. The prefill wrapper has the same fail-closed device gate as the
+   decode wrapper: it names every offending tensor and launches
+   nothing when any bundle member is off the pool's device. The CPU
+   suite simulates the GPU boundary by monkeypatching the gate
+   constant (never by weakening the check) and by running the whole
+   prefill bundle + staging primitives on the meta device.
+3. Memory bound: at 32K the per-chunk selected-page union is capped.
+   Worst case (a 1024-token chunk spread over 8 x 32K sequences,
+   topk_blocks 16 x 128-token pages per query) the union reaches all
+   2048 pages = 1024 MiB of bf16 staging (0.5 MiB/page), which cannot
+   fit the 0.2 GiB MemAvailable floor. The chunk is therefore executed
+   as page-capped slices under VLLM_EXL3_Q4KV_STAGING_MAX_MB (default
+   48 MiB = 96 pages): one grow-once bf16 staging buffer per device,
+   each slice stages the FULL union of its own queries (never an
+   incremental delta), the original prefill kernel runs per slice with
+   the exactly-derived (cu_seqlens_q, prefix_lens) metadata, and the
+   sliced result equals the uncapped staging bit-for-bit (pinned by
+   tests and the dry run). Per-call peak: 48 MiB buffer + 1 MiB fp32
+   dequant transient + <1 MiB bitmap = ~50 MiB, inside the 64 MiB
+   budget, independent of the chunk's union.
+4. Harness case 5/prefill-staging: a realistic multi-sequence chunk
+   over W1-derived pool bytes (real partial-RoPE table theta 5e6 /
+   rotary_dim 64, real e4m3 fp8 index cache, per-(kv-head, query) top-k
+   with causal sentinels). On GB10 it must prove (a) capped == uncapped
+   bit-identical, (b) cosine >= 0.99 vs the ORIGINAL prefill kernel on
+   the real e4m3 pool built from the same K/V and vs the fp32 oracle,
+   (c) finite outputs. --cpu-dry-run runs every reference part: the
+   bit-exact capped==uncapped proof at the attention level, the slice
+   coverage/partition checks, and a meta-device audit of the prefill
+   bundle and the staging primitives. CPU dry run: 8/8 units PASS
+   (cos(fp8, oracle)=0.99966; cos(q4 staged, fp32 oracle)=0.99521; 9
+   slices under the 2 MiB cap override; no CPU-resident serve tensor).
+
+**Expected prefill speed (model, not measured):** the staging path adds
+U x 0.57 MiB of memory traffic per layer per chunk (U = per-chunk
+selected-page union, <= 96 under the default cap; 0.5 MiB staged page
+write + 72 KiB pool read) plus negligible e2m1-decode arithmetic; the
+attention GEMMs/softmax over the same selected keys dominate as in the
+fp8 path. At the realistic 32K worst case (U=192 -> 2 slices) this is
+~110 MiB/layer/chunk, ~17 ms per 1024-token chunk at ~400 GB/s, i.e.
+under ~1 percent of the ~2.7 s fp8 chunk time: prefill is expected to
+stay in the ~350-380 tok/s band (vs ~380 tok/s fp8 today). The fused q4
+prefill reader (R1) removes even this and remains milestone 2.
+
+**Tests:** 7 new (58/58 green in tests/test_minimax_q4kv.py): per-device
+LUT caching and device-following on meta; the wrapper device gate names
+the exact offending tensors and launches nothing; the slice plan
+partitions the whole query axis under the cap (full per-slice unions,
+never deltas); capped == uncapped staging bit-for-bit at the attention
+level; empty selections stage the zero page only; the prefill oracle is
+CPU-only fail-closed. Full suite: 629 passed, 39 skipped, the same 8
+pre-existing failures (tests/test_compact_safetensors.py x3,
+tests/test_compact_safetensors_attestation.py x4,
+tests/test_compact_source_verification_window.py x1; the 3
+safetensors.py failures re-confirmed on the clean base tree) -- failure
+set identical to the baseline, +7 passing.
+
+**Exact GB10 command (parent executes; the worktree is mounted
+read-only, the toolchain lives in the image, and the receipt must be
+written to the mounted receipts volume):**
+
+```
+docker run <minimax-m3.1-flash vllm image, vLLM 0.1.dev23341+g8744dd2fb> \
+  -v <this worktree>:/plugin:ro -v <receipts dir>:/receipts \
+  -w /plugin -e PYTHONPATH=/plugin/src \
+  python3 tools/gb10_q4kv_parity.py --json /receipts/val6/q4kv-case5.json
+```
+
+Unit 5 must report capped_equals_uncapped=true and both cosines >= 0.99;
+units 1-4 must stay at their val6 numerics. The next real 32K serve boot
+with VLLM_EXL3_Q4KV=1 --kv-cache-dtype nvfp4 must get past the
+profiling/warm-up forward that killed boot18.
+
+Unverified on this VPS (no GPU, no triton, no vLLM install): the sm_121
+execution of the case-5 GPU path (the staged bf16 gather feeding the
+original Triton prefill kernel on real pages), the real allocator's
+pool geometry at the prefill boundary, and the end-to-end serve
+progression past warm-up; the prefill tok/s number above is a
+bandwidth model, not a measurement.

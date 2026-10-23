@@ -56,6 +56,19 @@ Units:
       replay; the replay must reproduce the eager output bit-identically
       AND must read the CURRENT bytes of the static buffers (verified
       by copying new pool bytes in between replays).
+5.  Prefill staging (the boot18 crash path): a realistic
+      multi-sequence chunk over W1-derived pool bytes (real partial-RoPE
+      table, real e4m3 fp8 index cache, real per-(kv-head, query) top-k
+      with sentinels). The overlay's prefill path on the q4 pool under a
+      2 MiB page cap must be bit-identical to the same path under the
+      default cap (the capped slice plan equals the uncapped staging),
+      and must stay within 0.99 cosine of the ORIGINAL prefill kernel
+      on the real e4m3 fp8 pool built from the same K/V and of the fp32
+      prefill oracle, with finite outputs. --cpu-dry-run runs every
+      reference part of the case (the capped==uncapped equality proof at
+      the attention level, the slice-plan coverage checks, and a
+      meta-device audit of the prefill bundle and the staging
+      primitives).
 
 Every unit builds its inputs from tools/q4kv_harness_inputs.py and runs
 that module's input-consistency validator BEFORE any kernel or reference
@@ -149,6 +162,10 @@ _W1_KERNEL_KEYS = (
     "index_slot_mapping", "pool", "index_cache", "q_out", "index_q_out",
 )
 _R2_KERNEL_KEYS = ("q", "pool", "topk", "block_table", "seq_lens")
+_PREFILL_KERNEL_KEYS = (
+    "q", "pool", "topk", "block_table", "cu_seqlens_q", "seq_lens",
+    "prefix_lens", "fp8_pool",
+)
 
 
 def _kernel_bundle(inp: dict, keys, device) -> dict:
@@ -564,6 +581,108 @@ def unit_4() -> dict:
     else:
         summary = "replay did not read the mutated static-buffer bytes"
     return {"passed": passed, "summary": summary}
+
+
+# ---------------------------------------------------------------------------
+# Case 5: prefill staging (the boot18 crash path)
+# ---------------------------------------------------------------------------
+
+def _prefill_reference_outputs(inp: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    """(fp8-baseline, fp32-oracle) prefill outputs, CPU-only reference."""
+    fp8_vals = inp["fp8_pool"].view(
+        hi.PREFILL_NUM_PAGES, 2 * NKV, hi.BLOCK, 128
+    ).to(torch.float32)
+    k8 = fp8_vals[:, :NKV].contiguous()
+    v8 = fp8_vals[:, NKV:].contiguous()
+    base = ref.reference_prefill_attention(
+        inp["q"].to(torch.float32), k8, v8, inp["block_table"],
+        inp["topk"], inp["cu_seqlens_q"], inp["seq_lens"],
+        inp["prefix_lens"], inp["sm_scale"],
+    )
+    oracle = ref.reference_prefill_attention(
+        inp["q"].to(torch.float32), inp["k_vals"], inp["v_vals"],
+        inp["block_table"], inp["topk"], inp["cu_seqlens_q"],
+        inp["seq_lens"], inp["prefix_lens"], inp["sm_scale"],
+    )
+    return base, oracle
+
+
+def _run_overlay_prefill(inp: dict, original, device) -> torch.Tensor:
+    """The overlay's prefill wrapper on the q4 pool, on ``device``."""
+    from vllm_exl3 import minimax_q4kv as q4ov
+
+    gpu = _kernel_bundle(inp, _PREFILL_KERNEL_KEYS, device)
+    gpu["output"] = torch.zeros_like(gpu["q"])
+    wrapper = q4ov._make_prefill_wrapper(original)
+    wrapper(
+        gpu["q"], gpu["pool"], gpu["topk"], gpu["block_table"],
+        gpu["cu_seqlens_q"], gpu["seq_lens"], gpu["prefix_lens"],
+        inp["max_query_len"], NKV, inp["sm_scale"], gpu["output"],
+    )
+    torch.cuda.synchronize()
+    return gpu["output"].cpu()
+
+
+def unit_5() -> dict:
+    """Prefill staging accuracy + memory bound (the boot18 crash path).
+
+    A realistic multi-sequence chunk over W1-derived pool bytes: the
+    overlay's prefill path on the q4 pool (page-capped slices under a
+    2 MiB cap override, then the default cap) must (a) produce
+    bit-identical outputs capped and uncapped, (b) stay within 0.99
+    cosine of the ORIGINAL prefill kernel on the real e4m3 fp8 pool built
+    from the same K/V and of the fp32 oracle, and (c) be finite.
+    """
+    inp = hi.prefill_inputs()
+    hi.validate_prefill_inputs(inp)
+    base, oracle = _prefill_reference_outputs(inp)
+    assert torch.isfinite(base).all() and torch.isfinite(oracle).all()
+    cos_fixture = _cos(base, oracle)
+    from vllm.models.minimax_m3.common.ops.sparse_attn import (
+        minimax_m3_sparse_attn as original,
+    )
+
+    # The real fp8 baseline: the original kernel on the real e4m3 pool.
+    gpu8 = _kernel_bundle(inp, _PREFILL_KERNEL_KEYS, "cuda")
+    gpu8["output"] = torch.zeros_like(gpu8["q"])
+    original(
+        gpu8["q"], gpu8["fp8_pool"], gpu8["topk"], gpu8["block_table"],
+        gpu8["cu_seqlens_q"], gpu8["seq_lens"], gpu8["prefix_lens"],
+        inp["max_query_len"], NKV, inp["sm_scale"], gpu8["output"],
+    )
+    torch.cuda.synchronize()
+    out_fp8 = gpu8["output"].cpu()
+    del gpu8
+    # (a) capped (2 MiB -> 8 pages) vs uncapped (default 48 MiB): the
+    # sliced execution must equal the single-call staging bit-for-bit.
+    import os
+
+    os.environ["VLLM_EXL3_Q4KV_STAGING_MAX_MB"] = "2"
+    out_capped = _run_overlay_prefill(inp, original, "cuda")
+    os.environ.pop("VLLM_EXL3_Q4KV_STAGING_MAX_MB", None)
+    out_uncapped = _run_overlay_prefill(inp, original, "cuda")
+    bit_equal = bool(torch.equal(out_capped, out_uncapped))
+    out = out_capped
+    cos_fp8 = _cos(out, out_fp8)
+    cos_oracle = _cos(out, oracle)
+    finite = bool(torch.isfinite(out).all())
+    passed = (
+        bit_equal and finite and cos_fp8 >= 0.99 and cos_oracle >= 0.99
+        and cos_fixture >= 0.99
+    )
+    return {
+        "passed": passed,
+        "capped_equals_uncapped": bit_equal,
+        "cos_vs_fp8_original_kernel": cos_fp8,
+        "cos_vs_fp32_oracle": cos_oracle,
+        "cos_fp8_baseline_vs_oracle": cos_fixture,
+        "output_finite": finite,
+        "summary": (
+            f"capped==uncapped bit-identical={bit_equal}; "
+            f"cos(q4 prefill, fp8 original)={cos_fp8:.6f}; "
+            f"cos(q4 prefill, fp32 oracle)={cos_oracle:.6f}; finite={finite}"
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -988,6 +1107,192 @@ def _dry_device_audit() -> dict:
     }
 
 
+def _dry_prefill() -> dict:
+    """Case 5's reference parts on CPU (no GPU, no triton, no vllm):
+    the fixture is valid, the fp8-baseline and fp32-oracle prefill
+    reference paths run to completion, the page-capped sliced execution
+    equals the uncapped staging bit-for-bit, the plan partitions the
+    chunk under the cap without dropping anything, and every
+    serve-reachable tensor follows the pool's device (meta-device audit
+    of the prefill bundle and the staging primitives)."""
+    inp = hi.prefill_inputs()
+    hi.validate_prefill_inputs(inp)
+    problems: list[str] = []
+    base, oracle = _prefill_reference_outputs(inp)
+    if not (torch.isfinite(base).all() and torch.isfinite(oracle).all()):
+        problems.append("fp8 baseline or fp32 oracle produced NaN/inf")
+    cos_fixture = _cos(base, oracle)
+    if cos_fixture < 0.99:
+        problems.append(
+            f"fixture sanity: cos(fp8 baseline, fp32 oracle)={cos_fixture:.6f}"
+        )
+    # (a) capped == uncapped, at the attention level, on this fixture.
+    staging, fake_bt = ref.build_prefill_staging(
+        inp["pool"], inp["block_table"], inp["topk"], NKV
+    )
+    out_uncapped = ref.reference_prefill_attention(
+        inp["q"].to(torch.float32),
+        staging[:, :, :, :128].to(torch.float32),
+        staging[:, :, :, 128:].to(torch.float32),
+        fake_bt, inp["topk"], inp["cu_seqlens_q"], inp["seq_lens"],
+        inp["prefix_lens"], inp["sm_scale"],
+    )
+    cap = ref.staging_max_pages(NKV, max_mb=2.0)
+    slices = ref.plan_prefill_slices(
+        inp["pool"], inp["block_table"], inp["topk"],
+        inp["cu_seqlens_q"], NKV, cap,
+    )
+    if len(slices) < 2:
+        problems.append("the 2 MiB cap did not force slicing")
+    pos = 0
+    cu_list = inp["cu_seqlens_q"].tolist()
+    prefix_list = inp["prefix_lens"].tolist()
+    seq_list = inp["seq_lens"].tolist()
+    out_capped = torch.zeros_like(out_uncapped)
+    for s in slices:
+        qs, qe = s["q"]
+        if qs != pos or qe <= qs:
+            problems.append(f"slice query range [{qs}, {qe}) is not contiguous")
+        pos = qe
+        if s["n"] > cap and qe - qs > 1:
+            problems.append(f"slice of {s['n']} pages exceeds the {cap}-page cap")
+        buffer = torch.zeros(
+            (s["n"] + 1, NKV, 128, 256), dtype=torch.bfloat16
+        )
+        n = ref.fill_staging_buffer(buffer, inp["pool"], s["pages"])
+        fake = ref.slice_fake_block_table(
+            inp["block_table"], s["reqs"], s["pages"], n,
+            inp["pool"].shape[0],
+        )
+        cu_new, prefix_new, _ = ref.prefill_slice_metadata(
+            s, cu_list, prefix_list, torch.device("cpu")
+        )
+        part = ref.reference_prefill_attention(
+            inp["q"][qs:qe].to(torch.float32),
+            buffer[:n + 1, :, :, :128].to(torch.float32),
+            buffer[:n + 1, :, :, 128:].to(torch.float32),
+            fake, inp["topk"][:, qs:qe, :], cu_new,
+            torch.tensor(
+                seq_list[s["reqs"][0]:s["reqs"][-1] + 1], dtype=torch.int32
+            ),
+            prefix_new, inp["sm_scale"],
+        )
+        out_capped[qs:qe] = part
+    if pos != inp["q"].shape[0]:
+        problems.append("slices do not partition the chunk query axis")
+    if not torch.equal(out_capped, out_uncapped):
+        problems.append("capped sliced execution differs from uncapped")
+    cos_q4 = _cos(out_uncapped, oracle)
+    if cos_q4 < 0.99:
+        problems.append(f"cos(q4 staged prefill, fp32 oracle)={cos_q4:.6f}")
+    # (b) meta-device audit of the prefill bundle and the staging
+    # primitives: nothing serve-reachable may stay on (or silently move
+    # back to) the CPU when the pool is on the accelerator.
+    device = torch.device("meta")
+    before = dict(
+        _iter_tensors({k: inp[k] for k in _PREFILL_KERNEL_KEYS})
+    )
+    moved = _kernel_bundle(inp, _PREFILL_KERNEL_KEYS, device)
+    after = dict(_iter_tensors(moved))
+    if set(before) != set(after):
+        problems.append("prefill: mover dropped/duplicated tensors")
+    for path, b in before.items():
+        a = after.get(path)
+        if a is None:
+            continue
+        if a.device != device:
+            problems.append(f"prefill/{path} stayed on {a.device}")
+        if a.shape != b.shape or a.dtype != b.dtype:
+            problems.append(f"prefill/{path} changed shape/dtype")
+    # the output buffer must be allocated on the target
+    out_m = torch.zeros_like(moved["q"])
+    if out_m.device != device:
+        problems.append("prefill: output buffer not allocated on the target")
+    # the staging primitives follow the pool's device on meta (the
+    # boot18 crash class was the CPU-resident dequant LUT)
+    pool_m = moved["pool"]
+    try:
+        for side in (0, 1):
+            t = ref._scale_offset_table(side, ref.POOL_BLOCK_SIZE, device=device)
+            if t.device != device:
+                problems.append(f"scale-offset table {side} on {t.device}")
+        v = ref.dequant_pool_pages(
+            pool_m.reshape(
+                pool_m.shape[0], pool_m.shape[1], ref.SLOT_REGION
+            )
+        )
+        if v.device != device:
+            problems.append(f"dequant output on {v.device}")
+        buf_m = torch.zeros(
+            (3, NKV, 128, 256), dtype=torch.bfloat16, device=device
+        )
+        pages_m = torch.zeros((2,), dtype=torch.int64, device=device)
+        n = ref.fill_staging_buffer(buf_m, pool_m, pages_m)
+        if n != 2 or not buf_m[2].shape == (NKV, 128, 256):
+            problems.append("fill_staging_buffer misbehaved on meta")
+        fake_m = ref.slice_fake_block_table(
+            moved["block_table"], [0], pages_m, n, inp["pool"].shape[0]
+        )
+        if fake_m.device != device:
+            problems.append(f"slice fake table on {fake_m.device}")
+        bm, phys, roq = ref._selected_page_bitmap(
+            pool_m, moved["block_table"], moved["topk"],
+            moved["cu_seqlens_q"],
+        )
+        for name, t in (
+            ("request bitmap", bm), ("phys", phys), ("req_of_q", roq)
+        ):
+            if t.device != device:
+                problems.append(f"bitmap/{name} on {t.device}")
+    except Exception as exc:  # noqa: BLE001
+        problems.append(f"meta staging audit raised: {exc}")
+    # the overlay prefill wrapper refuses an all-CPU bundle BEFORE any
+    # vllm import, naming the pool argument.
+    from vllm_exl3 import minimax_q4kv as q4ov
+
+    calls: list = []
+    wrapper = q4ov._make_prefill_wrapper(lambda *a, **k: calls.append(a))
+    try:
+        wrapper(
+            inp["q"], inp["pool"], inp["topk"], inp["block_table"],
+            inp["cu_seqlens_q"], inp["seq_lens"], inp["prefix_lens"],
+            inp["max_query_len"], NKV, inp["sm_scale"],
+            torch.zeros_like(inp["q"]),
+        )
+        problems.append("prefill wrapper accepted an all-CPU bundle")
+    except ValueError as exc:
+        msg = str(exc)
+        if "'kv_cache'" not in msg or "cuda" not in msg:
+            problems.append(f"prefill refusal does not name the pool: {msg}")
+    # the prefill oracle is CPU-only: a meta tensor must fail closed.
+    try:
+        ref.reference_prefill_attention(
+            inp["q"].to(device), inp["k_vals"], inp["v_vals"],
+            inp["block_table"], inp["topk"], inp["cu_seqlens_q"],
+            inp["seq_lens"], inp["prefix_lens"], inp["sm_scale"],
+        )
+        problems.append("prefill oracle accepted a meta tensor")
+    except ValueError as exc:
+        if "q" not in str(exc):
+            problems.append(f"prefill oracle refusal unnamed: {exc}")
+    return {
+        "passed": not problems,
+        "problems": problems,
+        "cos_fp8_baseline_vs_oracle": cos_fixture,
+        "cos_q4_staged_vs_oracle": cos_q4,
+        "slices_under_2MiB_cap": len(slices),
+        "summary": (
+            f"fixture valid; capped==uncapped bit-identical; "
+            f"cos(fp8, oracle)={cos_fixture:.6f}; "
+            f"cos(q4 staged, oracle)={cos_q4:.6f}; "
+            f"{len(slices)} slices under the 2 MiB cap; the meta device "
+            "audit found no CPU-resident serve tensor"
+            if not problems
+            else "; ".join(problems)
+        ),
+    }
+
+
 def cpu_dry_run() -> int:
     units = [
         ("dry/0-w1-reference-runs", _dry_w1_reference),
@@ -997,6 +1302,7 @@ def cpu_dry_run() -> int:
         ("dry/2-decode-reference-runs", _dry_decode),
         ("dry/3-pool-bytes", unit_3),
         ("dry/4-device-audit", _dry_device_audit),
+        ("dry/5-prefill-staging", _dry_prefill),
     ]
     return run_units(
         units,
@@ -1059,6 +1365,7 @@ def main() -> None:
         ("2/r2-decode-accuracy", unit_2),
         ("3/pool-bytes", unit_3),
         ("4/cuda-graph-replay", unit_4),
+        ("5/prefill-staging", unit_5),
     ]
     sys.exit(
         run_units(

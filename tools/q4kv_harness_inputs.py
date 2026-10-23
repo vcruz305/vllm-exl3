@@ -371,3 +371,299 @@ def validate_decode_inputs(inp: dict) -> None:
             "q4 KV harness decode input data inconsistent (fix the "
             "harness data, not the kernel): " + "; ".join(errors)
         )
+
+
+# ---------------------------------------------------------------------------
+# Case 5 (prefill staging): input builder + validator
+# ---------------------------------------------------------------------------
+
+# Small enough for the CPU fp32 oracle, large enough to force page-capped
+# slicing under the harness cap override (2 MiB = 8 pages): sequence 0's
+# cached prefix makes its causal valid-block count reach deep into its
+# own page span, so its per-query unions exceed the cap and it is
+# query-split; sequences 1 and 2 group under the cap.
+PREFILL_NUM_PAGES = 32
+PREFILL_MAX_BLOCKS = 12  # logical blocks per block-table row
+PREFILL_TOPK = 8
+PREFILL_QLENS = (8, 6, 4)  # three sequences of different lengths
+PREFILL_PREFIX = (1024, 256, 0)  # cached context per sequence
+# The R2 gate convention: the pinned 0.99 cosine floor is calibrated on
+# unit-ish K/V magnitudes (RMS ~0.5). The W1-realistic structure (Gemma
+# norm + partial RoPE) is kept, the post-W1 rows are scaled to the R2
+# magnitude so the prefill gate measures the same quantization-noise
+# regime as the shipped R2 gate (at raw W1 magnitudes, RMS ~2, the
+# softmax is much sharper and the q4-vs-oracle cosine floor is ~0.98 for
+# quantization noise alone -- a property of 4-bit KV, not of staging).
+_W1P_VALUE_SCALE = 0.25  # post-norm RMS ~2 -> ~0.5
+
+_W1P_NORM_W_SEED = 21
+
+
+def prefill_inputs() -> dict:
+    """Every case-5 input, built on CPU (the harness moves them to CUDA).
+
+    Realism per the GB10 boot18 prefill crash: the K/V pool bytes are the
+    W1 reference output over a REAL partial-RoPE table (theta 5e6,
+    rotary_dim 64 of head_dim 128, exactly as build_cos_sin_cache builds
+    for W1), the index cache is the real fp8 e4m3 encoding of the W1
+    index branch, the fp8 baseline pool is the real e4m3 encoding of the
+    SAME post-W1 K/V (what the vendor fp8 KV path would store), and the
+    top-k is per (kv head, query): every entry below the causal
+    valid-block count is a distinct valid logical block, everything above
+    is the -1 sentinel, exactly as the indexer emits. The block-table
+    rows share a physical prefix (pages 0..3) and own distinct pages
+    afterwards, so slices overlap and re-select pages across boundaries.
+    """
+    nkv = NKV
+    pages = PREFILL_NUM_PAGES
+    # --- real partial-RoPE table over every pool-token position ---
+    positions = torch.arange(pages * BLOCK, dtype=torch.int64)
+    cos_sin = build_cos_sin_cache(int(positions.max()) + 1)
+    cs_tok = cos_sin[positions]  # [pages*BLOCK, ROTARY]
+    g = torch.Generator().manual_seed(_W1P_NORM_W_SEED)
+    norm_ws = {
+        name: 1.0 + 0.05 * torch.randn((128,), generator=g)
+        for _, name in enumerate(("q", "k", "iq", "ik"))
+    }
+    x = torch.randn((pages * BLOCK, 2 * nkv, 128), generator=g) * 0.5
+    # K side: the real W1 processing (Gemma norm + partial NeoX RoPE),
+    # scaled to the R2 gate magnitude convention (see _W1P_VALUE_SCALE).
+    k_tok = _W1P_VALUE_SCALE * ref.rope_partial_neox(
+        ref.gemma_rmsnorm(x[:, :nkv], norm_ws["k"], EPS), cs_tok
+    )
+    # V side: V is not normed (W1 writes V through unchanged).
+    v_tok = x[:, nkv:]
+    # Index branch: the real fp8 e4m3 index-K bytes of the W1 output.
+    ik_tok = ref._e4m3_clamped(
+        ref.rope_partial_neox(
+            ref.gemma_rmsnorm(
+                torch.randn((pages * BLOCK, 128), generator=g) * 0.5,
+                norm_ws["ik"],
+                EPS,
+            ),
+            cs_tok,
+        )
+    )
+    index_cache = ik_tok.view(pages * BLOCK, 128).to(torch.float8_e4m3fn)
+    # --- pack the pool (the q4 bytes of the same K/V) ---
+    k_vals = k_tok.view(pages, BLOCK, nkv, 128).permute(0, 2, 1, 3).contiguous()
+    v_vals = v_tok.view(pages, BLOCK, nkv, 128).permute(0, 2, 1, 3).contiguous()
+    flat = torch.zeros((pages, 2 * nkv, ref.SLOT_REGION), dtype=torch.uint8)
+    for page in range(pages):
+        for head in range(nkv):
+            flat[page, 2 * head] = ref.pack_slot_region_side(
+                k_vals[page, head], 0
+            )
+            flat[page, 2 * head + 1] = ref.pack_slot_region_side(
+                v_vals[page, head], 1
+            )
+    pool = flat.reshape(pages, 2 * nkv, BLOCK, 72)
+    fp8_pool = torch.cat((k_vals, v_vals), dim=1).to(torch.float8_e4m3fn)
+    # --- block tables: shared physical prefix + distinct page spans ---
+    shared = [0, 1]
+    rows = []
+    for r in range(len(PREFILL_QLENS)):
+        own = [2 + 10 * r + i for i in range(10)]  # 10 distinct pages each
+        rows.append(shared + own)
+    block_table = torch.tensor(rows, dtype=torch.int32)
+    # --- queries: the real W1 q processing at each query's absolute
+    # position (prefix + offset), as the model computes it ---
+    total_q = sum(PREFILL_QLENS)
+    q_pos = torch.tensor(
+        [
+            PREFILL_PREFIX[_req_index(PREFILL_QLENS, i)] + _offset_in(
+                PREFILL_QLENS, i
+            )
+            for i in range(total_q)
+        ],
+        dtype=torch.int64,
+    )
+    q_cos = build_cos_sin_cache(int(q_pos.max()) + 1)[q_pos]
+    xq = torch.randn((total_q, NQ, 128), generator=g) * 0.5
+    q = (
+        _W1P_VALUE_SCALE
+        * ref.rope_partial_neox(
+            ref.gemma_rmsnorm(xq, norm_ws["q"], EPS), q_cos
+        )
+    ).to(torch.bfloat16)
+    # --- top-k: per (kv head, query), valid entries only below the
+    # causal valid-block count, -1 sentinels above it ---
+    cu = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(PREFILL_QLENS), 0)),
+        dtype=torch.int32,
+    )
+    topk = torch.full((nkv, total_q, PREFILL_TOPK), -1, dtype=torch.int32)
+    tg = torch.Generator().manual_seed(_W1P_NORM_W_SEED + 1)
+    for i in range(total_q):
+        r = _req_index(PREFILL_QLENS, i)
+        q_abs = PREFILL_PREFIX[r] + _offset_in(PREFILL_QLENS, i)
+        valid_blocks = (q_abs + BLOCK) // BLOCK
+        real = min(PREFILL_TOPK, valid_blocks)
+        if real <= 0:
+            continue
+        for kvh in range(nkv):
+            ids = torch.randperm(valid_blocks, generator=tg)[:real]
+            topk[kvh, i, :real] = ids.to(torch.int32)
+    seq_lens = torch.tensor(
+        [p + q for p, q in zip(PREFILL_PREFIX, PREFILL_QLENS)],
+        dtype=torch.int32,
+    )
+    prefix_lens = torch.tensor(PREFILL_PREFIX, dtype=torch.int32)
+    sm_scale = 1.0 / math.sqrt(128.0)
+    return dict(
+        q=q, pool=pool, fp8_pool=fp8_pool, index_cache=index_cache,
+        k_vals=k_vals, v_vals=v_vals, block_table=block_table, topk=topk,
+        cu_seqlens_q=cu, seq_lens=seq_lens, prefix_lens=prefix_lens,
+        sm_scale=sm_scale, max_query_len=max(PREFILL_QLENS),
+    )
+
+
+def _req_index(qLens, i: int) -> int:
+    pos = 0
+    for r, length in enumerate(qLens):
+        if pos <= i < pos + length:
+            return r
+        pos += length
+    raise AssertionError(f"query {i} outside the chunk")
+
+
+def _offset_in(qLens, i: int) -> int:
+    pos = 0
+    for length in qLens:
+        if pos <= i < pos + length:
+            return i - pos
+        pos += length
+    raise AssertionError(f"query {i} outside the chunk")
+
+
+def validate_prefill_inputs(inp: dict) -> None:
+    """Fail closed on any shape/range inconsistency in the case-5 inputs."""
+    errors: list[str] = []
+    total_q = sum(PREFILL_QLENS)
+    q = inp["q"]
+    if q.shape != (total_q, NQ, 128) or q.dtype != torch.bfloat16:
+        errors.append(
+            f"q must be [{total_q}, {NQ}, 128] bfloat16, got "
+            f"{tuple(q.shape)} {q.dtype}"
+        )
+    pool = inp["pool"]
+    if (
+        pool.shape != (PREFILL_NUM_PAGES, 2 * NKV, BLOCK, 72)
+        or pool.dtype != torch.uint8
+    ):
+        errors.append(
+            f"pool must be [{PREFILL_NUM_PAGES}, {2 * NKV}, {BLOCK}, 72] "
+            f"uint8, got {tuple(pool.shape)} {pool.dtype}"
+        )
+    elif (
+        pool.stride(2) != 72 or pool.stride(1) != 9216 or pool.stride(3) != 1
+    ):
+        errors.append("pool slot regions must be contiguous")
+    fp8_pool = inp["fp8_pool"]
+    if fp8_pool.shape != (
+        PREFILL_NUM_PAGES, 2 * NKV, BLOCK, 128
+    ) or fp8_pool.dtype != torch.float8_e4m3fn:
+        errors.append(
+            "fp8 baseline pool must be the real e4m3 encoding of the same "
+            f"K/V: [{PREFILL_NUM_PAGES}, {2 * NKV}, {BLOCK}, 128] "
+            f"float8_e4m3fn, got {tuple(fp8_pool.shape)} {fp8_pool.dtype}"
+        )
+    ic = inp["index_cache"]
+    if ic.shape != (PREFILL_NUM_PAGES * BLOCK, 128) or (
+        ic.dtype != torch.float8_e4m3fn
+    ):
+        errors.append(
+            "index cache must be the real fp8 e4m3 W1 index bytes "
+            f"[{PREFILL_NUM_PAGES * BLOCK}, 128] float8_e4m3fn, got "
+            f"{tuple(ic.shape)} {ic.dtype}"
+        )
+    bt = inp["block_table"]
+    if bt.shape != (len(PREFILL_QLENS), PREFILL_MAX_BLOCKS) or not _integral(bt):
+        errors.append(
+            f"block_table must be [{len(PREFILL_QLENS)}, "
+            f"{PREFILL_MAX_BLOCKS}] integral, got {tuple(bt.shape)} "
+            f"{bt.dtype}"
+        )
+    else:
+        lo, hi = int(bt.min()), int(bt.max())
+        if lo < 0 or hi >= PREFILL_NUM_PAGES:
+            errors.append(
+                f"block_table entries must be physical pool pages in "
+                f"[0, {PREFILL_NUM_PAGES}), got [{lo}, {hi}]"
+            )
+        if not torch.equal(
+            bt[:, :2], bt[:1, :2].expand(bt.shape[0], 2)
+        ):
+            errors.append(
+                "fixture block-table rows must share their physical prefix "
+                "(the cross-slice page overlap the case exists for)"
+            )
+    cu = inp["cu_seqlens_q"]
+    want_cu = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(PREFILL_QLENS), 0)),
+        dtype=torch.int32,
+    )
+    if cu.shape != want_cu.shape or not _integral(cu) or (
+        not torch.equal(cu, want_cu)
+    ):
+        errors.append(
+            "cu_seqlens_q must be exactly the per-sequence query offsets of "
+            f"{PREFILL_QLENS}"
+        )
+    seq = inp["seq_lens"]
+    prefix = inp["prefix_lens"]
+    want_seq = torch.tensor(
+        [p + q for p, q in zip(PREFILL_PREFIX, PREFILL_QLENS)],
+        dtype=torch.int32,
+    )
+    want_prefix = torch.tensor(PREFILL_PREFIX, dtype=torch.int32)
+    if not torch.equal(seq, want_seq):
+        errors.append(
+            "seq_lens must be prefix + current query length per sequence "
+            "(the real prefill invariant)"
+        )
+    if not torch.equal(prefix, want_prefix):
+        errors.append(
+            f"prefix_lens must be {PREFILL_PREFIX} (the real cached-context "
+            "lengths the causal/valid-block math depends on)"
+        )
+    topk = inp["topk"]
+    if topk.shape != (NKV, total_q, PREFILL_TOPK) or not _integral(topk):
+        errors.append(
+            f"topk must be [{NKV}, {total_q}, {PREFILL_TOPK}] integral, "
+            f"got {tuple(topk.shape)} {topk.dtype}"
+        )
+    else:
+        for i in range(total_q):
+            r = _req_index(PREFILL_QLENS, i)
+            q_abs = PREFILL_PREFIX[r] + _offset_in(PREFILL_QLENS, i)
+            valid_blocks = (q_abs + BLOCK) // BLOCK
+            real = min(PREFILL_TOPK, valid_blocks)
+            for kvh in range(NKV):
+                row = topk[kvh, i]
+                below = row[:real]
+                above = row[real:]
+                if above.numel() and int(above.min()) != -1:
+                    errors.append(
+                        f"topk entries beyond the causal valid-block count "
+                        f"of query {i} must be the -1 sentinel"
+                    )
+                    break
+                if real and (
+                    int(below.min()) < 0
+                    or int(below.max()) >= valid_blocks
+                    or int(below.unique().numel()) != real
+                ):
+                    errors.append(
+                        f"topk entries of query {i} must be distinct valid "
+                        f"logical blocks below valid_blocks={valid_blocks}"
+                    )
+                    break
+    sm_scale = inp["sm_scale"]
+    if not (sm_scale > 0 and math.isfinite(sm_scale)):
+        errors.append(f"sm_scale must be positive and finite, got {sm_scale}")
+    if errors:
+        raise ValueError(
+            "q4 KV harness prefill input data inconsistent (fix the harness "
+            "data, not the kernel): " + "; ".join(errors)
+        )

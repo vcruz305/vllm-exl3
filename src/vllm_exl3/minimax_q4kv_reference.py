@@ -38,6 +38,10 @@ against the upstream decision boundaries.
 
 from __future__ import annotations
 
+import itertools
+import math
+import os
+
 import torch
 
 HEAD_DIM = 128
@@ -85,15 +89,35 @@ def scale_block_offset(side: int, token: int, group: int) -> int:
     return swizzled_token * SCALE_BYTES + swizzled_scale
 
 
-def _scale_offset_table(side: int, tokens: int) -> torch.Tensor:
-    """[tokens, NUM_GROUPS] offsets into the 1024-byte scale block."""
-    t = torch.arange(tokens, dtype=torch.int64)
-    g = torch.arange(NUM_GROUPS, dtype=torch.int64)
+def _scale_offset_table(
+    side: int, tokens: int, device: torch.device | None = None
+) -> torch.Tensor:
+    """[tokens, NUM_GROUPS] offsets into the 1024-byte scale block.
+
+    Built on ``device`` and cached per (side, device): this table is a
+    lookup constant of the serve path (dequant_pool_pages), so it must
+    never be rebuilt per call and never live on the CPU when the pool is
+    on an accelerator (the boot18 crash was exactly a CPU-resident table
+    reaching a CUDA gather).
+    """
+    key = (side, device)
+    cached = _SCALE_OFFSET_TABLE_CACHE.get(key)
+    if cached is not None and cached.shape[0] == tokens:
+        return cached
+    dev = device if device is not None else torch.device("cpu")
+    t = torch.arange(tokens, dtype=torch.int64, device=dev)
+    g = torch.arange(NUM_GROUPS, dtype=torch.int64, device=dev)
     if side == 0:
-        return t[:, None] * SCALE_BYTES + g[None, :]
-    swizzled_token = (t[:, None] // 4) * 4 + g[None, :] // 2
-    swizzled_scale = (g[None, :] % 2) * 4 + (t[:, None] % 4)
-    return swizzled_token * SCALE_BYTES + swizzled_scale
+        table = t[:, None] * SCALE_BYTES + g[None, :]
+    else:
+        swizzled_token = (t[:, None] // 4) * 4 + g[None, :] // 2
+        swizzled_scale = (g[None, :] % 2) * 4 + (t[:, None] % 4)
+        table = swizzled_token * SCALE_BYTES + swizzled_scale
+    _SCALE_OFFSET_TABLE_CACHE[key] = table
+    return table
+
+
+_SCALE_OFFSET_TABLE_CACHE: dict = {}
 
 
 def flat_page_to_container(flat: torch.Tensor) -> torch.Tensor:
@@ -716,6 +740,7 @@ def dequant_pool_pages(pool_flat: torch.Tensor) -> torch.Tensor:
     pages, slots, region = pool_flat.shape
     if region != SLOT_REGION:
         raise ValueError("pool flat regions are 9216 bytes")
+    dev = pool_flat.device
     data = pool_flat[:, :, :DATA_REGION].reshape(
         pages * slots, POOL_BLOCK_SIZE, DATA_BYTES
     )
@@ -725,18 +750,32 @@ def dequant_pool_pages(pool_flat: torch.Tensor) -> torch.Tensor:
         pages, slots, POOL_BLOCK_SIZE, HEAD_DIM
     )
     scale_region = pool_flat[:, :, DATA_REGION:]  # [pages, slots, 1024]
-    off = torch.stack(
-        (
-            _scale_offset_table(0, POOL_BLOCK_SIZE).reshape(-1),
-            _scale_offset_table(1, POOL_BLOCK_SIZE).reshape(-1),
-        )
-    )  # [2, 1024]
-    idx = off[torch.arange(slots, dtype=torch.int64) % 2]  # [slots, 1024]
+    # Per-device cached LUT (the boot18 crash was the CPU-resident table
+    # reaching this gather on cuda:0). Slot parity selects K (linear) vs V
+    # (swizzled) scale offsets; the cache is keyed by (slots, device) so
+    # the table is built once per device, never per call.
+    lut_key = (slots, dev)
+    lut = _DEQUANT_LUT_CACHE.get(lut_key)
+    if lut is None:
+        off = torch.stack(
+            (
+                _scale_offset_table(0, POOL_BLOCK_SIZE, device=dev).reshape(-1),
+                _scale_offset_table(1, POOL_BLOCK_SIZE, device=dev).reshape(-1),
+            )
+        )  # [2, 1024]
+        lut = off[torch.arange(slots, dtype=torch.int64, device=dev) % 2]
+        _DEQUANT_LUT_CACHE[lut_key] = lut  # [slots, 1024]
+    idx = lut
     stored = scale_region.gather(
         2, idx.view(1, slots, -1).expand(pages, -1, -1)
     ).reshape(pages, slots, POOL_BLOCK_SIZE, NUM_GROUPS)
-    scales = e4m3_decode(stored).repeat_interleave(GROUP_SIZE, dim=-1)
+    scales = e4m3_decode(stored).repeat_interleave(
+        GROUP_SIZE, dim=-1, output_size=HEAD_DIM
+    )
     return values * scales
+
+
+_DEQUANT_LUT_CACHE: dict = {}
 
 
 def build_prefill_staging(
@@ -767,7 +806,7 @@ def build_prefill_staging(
     flat = pool.reshape(nb, slots, SLOT_REGION)
     blks = topk.reshape(-1).to(torch.int64)
     blks = blks[(blks >= 0) & (blks < block_table.shape[1])]
-    selected = torch.empty(0, dtype=torch.int64)
+    selected = torch.empty(0, dtype=torch.int64, device=pool.device)
     if blks.numel() > 0:
         cand = block_table[:, blks.unique()].reshape(-1).to(torch.int64)
         selected = cand[(cand >= 0) & (cand < nb)].unique()
@@ -789,6 +828,440 @@ def build_prefill_staging(
         block_table.clamp(min=0).reshape(-1).to(torch.int64)
     ].view_as(block_table)
     return staging, fake_block_table.to(block_table.dtype)
+
+
+# ---------------------------------------------------------------------------
+# Memory-bounded prefill staging: page-capped slices over one preallocated
+# buffer (the GB10 32K-serve follow-up). The uncapped union of a prefill
+# chunk's selected pages can reach every page of every sequence in the
+# chunk (at 32K: 256 pages/sequence; a 1024-token chunk spread over 8
+# such sequences unions up to 2048 pages = 512 MiB of bf16 staging plus a
+# ~2x larger fp32 dequant transient), which cannot fit the GB10 memory
+# floor. The chunk is therefore processed in page-bounded slices: the
+# query axis is partitioned so that each slice's selected-page union fits
+# the byte cap, and each slice runs the original prefill kernel on its
+# own staged pages with an adjusted (cu_seqlens_q, prefix_lens) pair.
+# Per-query attention depends only on the query's own row, its top-k
+# entries, its absolute position (prefix + offset) and its sequence
+# length -- none of which changes between the split and unsplit calls --
+# so the sliced result equals the uncapped staging bit-for-bit (pinned on
+# CPU by tests + the harness dry run against the fp32 prefill oracle).
+# ---------------------------------------------------------------------------
+
+# bf16 staged bytes per selected page (K and V halves of every KV head):
+# num_kv_heads * 128 tokens * 2 * 128 dims * 2 bytes = 256 KiB for 4 heads.
+_STAGING_DEQUANT_CHUNK_PAGES = 2
+_DEFAULT_STAGING_MAX_MB = 48.0
+
+
+def staging_page_bytes(num_kv_heads: int) -> int:
+    """bf16 staged bytes per 128-token page (256 KiB for 4 KV heads)."""
+    return num_kv_heads * POOL_BLOCK_SIZE * 2 * HEAD_DIM * 2
+
+
+def staging_max_pages(num_kv_heads: int, max_mb: float | None = None) -> int:
+    """Page cap of the staging buffer, from VLLM_EXL3_Q4KV_STAGING_MAX_MB.
+
+    Default 48 MiB: buffer 48 MiB + the chunked fp32 dequant transient
+    (2 pages, ~13 MiB) + the selection bitmap (<1 MiB at the 32K pool)
+    keeps the per-call peak under the 64 MiB budget while never touching
+    0.2 GiB MemAvailable floor. A single query's selection (at most topk
+    pages) is the hard per-slice floor and may exceed the cap only when
+    the operator explicitly configures a smaller one.
+    """
+    if max_mb is None:
+        raw = os.environ.get("VLLM_EXL3_Q4KV_STAGING_MAX_MB")
+        if raw is None:
+            max_mb = _DEFAULT_STAGING_MAX_MB
+        else:
+            try:
+                max_mb = float(raw)
+            except ValueError as exc:
+                raise ValueError(
+                    "VLLM_EXL3_Q4KV_STAGING_MAX_MB must be a number of "
+                    f"MiB, got {raw!r}"
+                ) from exc
+    if not (math.isfinite(max_mb) and max_mb > 0):
+        raise ValueError(
+            "VLLM_EXL3_Q4KV_STAGING_MAX_MB must be positive and finite, "
+            f"got {max_mb}"
+        )
+    return max(1, int(max_mb * (1 << 20)) // staging_page_bytes(num_kv_heads))
+
+
+def _selected_page_bitmap(
+    pool: torch.Tensor,
+    block_table: torch.Tensor,
+    topk_idx: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-request and per-query maps of the selected physical pages.
+
+    Returns (req_bitmap [num_reqs, nb] bool, phys [nkv, total_q, topk]
+    int64 with -1 for invalid entries, req_of_q [total_q] int64), every
+    tensor on the pool's device.
+    """
+    nb = pool.shape[0]
+    nkv, total_q, topk_dim = topk_idx.shape
+    dev = pool.device
+    cu = cu_seqlens_q.to(torch.int64)
+    num_reqs = cu.shape[0] - 1
+    req_of_q = torch.repeat_interleave(
+        torch.arange(num_reqs, dtype=torch.int64, device=dev),
+        cu[1:] - cu[:-1],
+        # output_size from the host-known query axis: never a device read.
+        # On real devices torch validates the given output_size against the
+        # true repeats sum and errors on a cu/topk mismatch; on meta no data
+        # is readable, so the audit path cannot (and need not) see values.
+        output_size=total_q,
+    )
+    blks = topk_idx.to(torch.int64)
+    valid = (blks >= 0) & (blks < block_table.shape[1])
+    req_idx = req_of_q.view(1, total_q, 1).expand(nkv, total_q, topk_dim)
+    phys = block_table[
+        req_idx.reshape(-1), blks.reshape(-1).clamp(min=0)
+    ].to(torch.int64).view(nkv, total_q, topk_dim)
+    phys = torch.where(valid & (phys >= 0) & (phys < nb), phys, -1)
+    # Dump-column fill: invalid (-1) entries write the throwaway column nb
+    # instead of a boolean-mask advanced index (bool mask indexing is not
+    # shape-computable on meta, the audit surrogate for cuda:0).
+    dump = torch.full_like(phys, nb)
+    req_bitmap_full = torch.zeros(
+        (num_reqs, nb + 1), dtype=torch.bool, device=dev
+    )
+    sel = torch.where(phys >= 0, phys, dump)
+    req_bitmap_full[req_idx.reshape(-1), sel.reshape(-1)] = True
+    req_bitmap = req_bitmap_full[:, :nb]
+    return req_bitmap, phys, req_of_q
+
+
+def _greedy_row_slices(
+    bitmap: torch.Tensor, max_pages: int
+) -> list:
+    """Greedy contiguous row-range partition under a union-size cap.
+
+    ``bitmap`` is [rows, nb] (one row per request, or per query of one
+    request); returns maximal row ranges [ (start, end) ] such that the
+    union of the pages of a range's OWN rows fits ``max_pages``. The
+    union check is exact (a later row may re-select a page of a row
+    outside the range -- the range must still stage it, so incremental
+    deltas against other ranges are wrong); it is evaluated with a
+    grow-doubling chunk scan plus a row bisect on overshoot, which keeps
+    the device round-trips O(log rows) per range instead of one per row.
+    A single row whose own union exceeds the cap is its own range (the
+    hard floor); the caller splits it further.
+    """
+    nrows = bitmap.shape[0]
+    if nrows == 0:
+        return []
+
+    def break_row(u: torch.Tensor, lo: int, hi: int) -> int:
+        """Smallest i in [lo, hi) with |u | union(bitmap[lo..i])| over the
+        cap, or hi."""
+        for i in range(lo, hi):
+            u = u | bitmap[i]
+            if int(u.sum()) > max_pages:
+                return i
+        return hi
+
+    ranges: list = []
+    start = 0
+    while start < nrows:
+        u = bitmap[start].clone()
+        if int(u.sum()) > max_pages:
+            ranges.append((start, start + 1))  # hard floor: one row alone
+            start += 1
+            continue
+        e = start + 1
+        step = 8
+        closed = False
+        while e < nrows:
+            nxt = min(e + step, nrows)
+            probe = u | bitmap[e:nxt].any(0)
+            if int(probe.sum()) <= max_pages:
+                u = probe
+                e = nxt
+                step = min(step * 2, 512)
+                continue
+            i = break_row(u, e, nxt)
+            ranges.append((start, i))
+            start = i
+            closed = True
+            break
+        if not closed:
+            ranges.append((start, nrows))
+            start = nrows
+    return ranges
+
+
+def plan_prefill_slices(
+    pool: torch.Tensor,  # bound uint8 [nb, 2H, 128, 72]
+    block_table: torch.Tensor,  # [num_reqs, max_blocks]
+    topk_idx: torch.Tensor,  # [nkv, total_q, topk] logical block ids
+    cu_seqlens_q: torch.Tensor,  # [num_reqs + 1]
+    num_kv_heads: int,
+    max_pages: int,
+) -> list[dict]:
+    """Partition the prefill chunk into page-capped slices (fail closed).
+
+    Every slice covers a contiguous query range of whole requests (or a
+    query sub-range of ONE request) whose selected-page union fits
+    ``max_pages``, and the slices partition the whole chunk query axis.
+    Slice["pages"] is exactly the FULL union of the pages selected by the
+    slice's own queries (sorted, unique, on the pool's device), so the
+    staged content reachable per query is identical to the uncapped
+    staging. cu_seqlens_q values are returned as Python ints for the
+    per-slice metadata derivation.
+    """
+    nb, slots, tokens, width = pool.shape
+    if (
+        slots != 2 * num_kv_heads
+        or tokens != POOL_BLOCK_SIZE
+        or width != ROW_BYTES
+    ):
+        raise ValueError("pool must be [nb, 2*num_kv_heads, 128, 72] uint8")
+    if max_pages < 1:
+        raise ValueError("max_pages must be >= 1")
+    dev = pool.device
+    req_bitmap, phys, _ = _selected_page_bitmap(
+        pool, block_table, topk_idx, cu_seqlens_q
+    )
+    cu = cu_seqlens_q.to(torch.int64).tolist()
+    total_q = topk_idx.shape[1]
+    if (
+        cu[0] != 0
+        or cu[-1] != total_q
+        or any(b < a for a, b in zip(cu, cu[1:]))
+    ):
+        # Fail closed: _selected_page_bitmap sizes req_of_q from the host
+        # known query axis (a meta-device tensor cannot be read), so the
+        # cu/topk coverage contract is enforced here, where cu IS readable.
+        raise ValueError(
+            "cu_seqlens_q must start at 0, be non-decreasing, and cover "
+            f"the {total_q}-query axis of topk_idx"
+        )
+
+    def row_union(bitmap: torch.Tensor, lo: int, hi: int) -> torch.Tensor:
+        return (
+            bitmap[lo:hi].any(0).nonzero().reshape(-1).to(torch.int64)
+        )
+
+    req_ranges = _greedy_row_slices(req_bitmap, max_pages)
+    slices: list[dict] = []
+    for rs, re_ in req_ranges:
+        pages = row_union(req_bitmap, rs, re_)
+        if re_ - rs == 1 and int(pages.numel()) > max_pages:
+            # One request's own union exceeds the cap: split IT along the
+            # query axis (its queries' unions are re-capped the same way).
+            r = rs
+            lo, hi = cu[r], cu[r + 1]
+            q_bitmap = torch.zeros(
+                (hi - lo, nb), dtype=torch.bool, device=dev
+            )
+            sel = phys[:, lo:hi, :]
+            rows = (
+                torch.arange(hi - lo, dtype=torch.int64, device=dev)
+                .view(1, -1, 1)
+                .expand_as(sel)
+                .reshape(-1)
+            )
+            flat = sel.reshape(-1)
+            m = flat >= 0
+            q_bitmap[rows[m], flat[m]] = True
+            for qs, qe in _greedy_row_slices(q_bitmap, max_pages):
+                slices.append(
+                    {
+                        "reqs": [r],
+                        "q": (lo + qs, lo + qe),
+                        "pages": row_union(q_bitmap, qs, qe),
+                    }
+                )
+        else:
+            slices.append(
+                {
+                    "reqs": list(range(rs, re_)),
+                    "q": (cu[rs], cu[re_]),
+                    "pages": pages,
+                }
+            )
+    for s in slices:
+        s["n"] = int(s["pages"].numel())
+    return slices
+
+
+def fill_staging_buffer(
+    buffer: torch.Tensor,  # bf16 [capacity, H, 128, 2*HEAD_DIM]
+    pool: torch.Tensor,  # bound uint8 [nb, 2H, 128, 72]
+    pages: torch.Tensor,  # sorted unique physical page ids (may be empty)
+) -> int:
+    """Dequant ``pages`` into ``buffer[:n]`` and zero ``buffer[n]``.
+
+    The dequant runs in _STAGING_DEQUANT_CHUNK_PAGES-page chunks so the
+    fp32 transient is bounded (the uncapped path materialized the whole
+    [P, 2H, 128, 128] fp32 tensor at once). Returns n (the number of
+    staged pages); the trailing zero page at index n is the staging target
+    of every unselected logical block.
+    """
+    nb, slots, tokens, width = pool.shape
+    if (
+        slots % 2
+        or tokens != POOL_BLOCK_SIZE
+        or width != ROW_BYTES
+    ):
+        raise ValueError("pool must be [nb, 2*num_kv_heads, 128, 72] uint8")
+    n = int(pages.numel())
+    if n > buffer.shape[0] - 1:
+        raise ValueError(
+            f"staging buffer holds {buffer.shape[0] - 1} pages, need {n}"
+        )
+    flat = pool.reshape(nb, slots, SLOT_REGION)
+    num_kv_heads = slots // 2
+    for lo in range(0, n, _STAGING_DEQUANT_CHUNK_PAGES):
+        hi = min(lo + _STAGING_DEQUANT_CHUNK_PAGES, n)
+        values = dequant_pool_pages(flat[pages[lo:hi]])
+        k, v = values[:, 0::2], values[:, 1::2]  # [C, H, 128, 128]
+        buffer[lo:hi, :, :, :HEAD_DIM].copy_(k.to(torch.bfloat16))
+        buffer[lo:hi, :, :, HEAD_DIM:].copy_(v.to(torch.bfloat16))
+    buffer[n].zero_()
+    return n
+
+
+def slice_fake_block_table(
+    block_table: torch.Tensor,  # [num_reqs, max_blocks]
+    members: list[int],  # the slice's request ids
+    pages: torch.Tensor,  # the slice's staged physical pages
+    n: int,  # number of staged pages (zero page at index n)
+    num_pages: int,  # pool page count (lookup domain)
+) -> torch.Tensor:
+    """The slice's remapped block table: selected pages -> staged rows,
+    everything else -> the zero page. Same convention as
+    build_prefill_staging's fake table, restricted to the slice's rows."""
+    dev = block_table.device
+    lookup = torch.full((num_pages,), n, dtype=torch.int64, device=dev)
+    if n > 0:
+        lookup[pages] = torch.arange(n, dtype=torch.int64, device=dev)
+    rows = block_table[members]
+    fake = lookup[
+        rows.clamp(min=0).reshape(-1).to(torch.int64)
+    ].view_as(rows)
+    return fake.to(block_table.dtype)
+
+
+def prefill_slice_metadata(
+    slice: dict,
+    cu_list: list[int],
+    prefix_list: list[int],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """(cu_seqlens_q, prefix_lens, max_query_len) for one slice's call.
+
+    The original prefill kernel derives each query's absolute sequence
+    position as ``prefix_len + query_offset`` and its causal/valid-block
+    masks from that absolute position, so a slice starting ``o`` queries
+    into request ``m``'s chunk segment must be told ``prefix + o``; with
+    that adjustment every per-query kernel input is bit-identical to the
+    unsplit call. Fail closed if the slice does not cover a whole number
+    of its members' query ranges.
+    """
+    members = slice["reqs"]
+    qs, qe = slice["q"]
+    lens = [
+        min(cu_list[m + 1], qe) - max(cu_list[m], qs) for m in members
+    ]
+    if sum(lens) != qe - qs or any(le <= 0 for le in lens):
+        raise ValueError(
+            f"slice q range [{qs}, {qe}) does not cover exactly its "
+            f"members' query ranges (lens {lens})"
+        )
+    cu_new = torch.tensor(
+        [0] + list(itertools.accumulate(lens))[:-1] + [qe - qs],
+        dtype=torch.int32,
+        device=device,
+    )
+    prefix_new = torch.tensor(
+        [
+            prefix_list[m] + max(cu_list[m], qs) - cu_list[m]
+            for m in members
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    return cu_new, prefix_new, max(lens)
+
+
+def reference_prefill_attention(
+    q: torch.Tensor,  # [total_q, H, 128] fp32
+    k_pages: torch.Tensor,  # [pages, Hkv, 128, 128] fp32
+    v_pages: torch.Tensor,  # [pages, Hkv, 128, 128] fp32
+    block_table: torch.Tensor,  # [num_reqs, max_blocks] -> page index
+    topk_idx: torch.Tensor,  # [nkv, total_q, topk] logical block ids
+    cu_seqlens_q: torch.Tensor,  # [num_reqs + 1]
+    seq_lens: torch.Tensor,  # [num_reqs]
+    prefix_lens: torch.Tensor,  # [num_reqs]
+    sm_scale: float,
+) -> torch.Tensor:
+    """fp32 oracle of the sparse prefill kernel (per-kv-head top-k).
+
+    Mirrors _gqa_sparse_fwd_kernel exactly: each query's absolute
+    position is prefix_len + offset; it attends to the union of its OWN
+    kv head's top-k blocks (real_topk = min(topk, (q_abs + 128) // 128)
+    entries), causally masked to positions <= q_abs and < seq_len, with a
+    per-kv-head softmax. This is the correctness oracle for the prefill
+    staging path, not a performance path. CPU-only by construction (like
+    the fp8 baseline): a device tensor handed in here fails closed.
+    """
+    for name, t in (
+        ("q", q), ("k_pages", k_pages), ("v_pages", v_pages),
+        ("block_table", block_table), ("topk_idx", topk_idx),
+        ("cu_seqlens_q", cu_seqlens_q), ("seq_lens", seq_lens),
+        ("prefix_lens", prefix_lens),
+    ):
+        if t.device.type != "cpu":
+            raise ValueError(
+                "the prefill oracle is a CPU-only reference path: "
+                f"{name} is on {t.device}"
+            )
+    total_q, num_heads, head_dim = q.shape
+    nkv = k_pages.shape[1]
+    group = num_heads // nkv
+    topk_dim = topk_idx.shape[-1]
+    cu = cu_seqlens_q.to(torch.int64).tolist()
+    seq = seq_lens.to(torch.int64).tolist()
+    prefix = prefix_lens.to(torch.int64).tolist()
+    out = torch.zeros((total_q, num_heads, head_dim), dtype=torch.float32)
+    tok = torch.arange(POOL_BLOCK_SIZE)
+    for i in range(total_q):
+        r = next(j for j in range(len(cu) - 1) if cu[j] <= i < cu[j + 1])
+        o = i - cu[r]
+        q_abs = prefix[r] + o
+        valid_blocks = (q_abs + POOL_BLOCK_SIZE) // POOL_BLOCK_SIZE
+        real_topk = min(topk_dim, valid_blocks)
+        if real_topk <= 0:
+            continue
+        for kvh in range(nkv):
+            blocks = [
+                int(b)
+                for b in topk_idx[kvh, i, :real_topk].tolist()
+                if b >= 0
+            ]
+            keys, vals = [], []
+            for b in blocks:
+                page = int(block_table[r, b])
+                if page < 0:
+                    continue
+                base = b * POOL_BLOCK_SIZE
+                m = ((base + tok) <= q_abs) & ((base + tok) < seq[r])
+                keys.append(k_pages[page, kvh][m])
+                vals.append(v_pages[page, kvh][m])
+            if not keys:
+                continue
+            k = torch.cat(keys, 0)  # [T, 128]
+            v = torch.cat(vals, 0)  # [T, 128]
+            qh = q[i, kvh * group:(kvh + 1) * group]  # [group, 128]
+            scores = (qh @ k.mT) * sm_scale
+            probs = torch.softmax(scores, dim=-1)
+            out[i, kvh * group:(kvh + 1) * group] = probs @ v
+    return out
 
 
 # ---------------------------------------------------------------------------
