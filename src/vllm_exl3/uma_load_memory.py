@@ -231,6 +231,11 @@ def install_uma_load_memory(exl3: Any) -> None:
                                 tensor_census(top=24, device="cuda"),
                                 _layer_name(layer),
                             )
+            stop_at = int(os.environ.get("VLLM_EXL3_MEM_PROBE_ABORT_AFTER", "0") or 0)
+            if stop_at and STATS["layer_trims"] >= stop_at:
+                raise RuntimeError(
+                    f"VLLM_EXL3_MEM_PROBE_ABORT_AFTER={stop_at}: diagnostic load stop"
+                )
             return orig_plan(layer, shapes_by_proj, *args, **kwargs)
 
         prepare_trellis_arena_plan._uma_trim = True

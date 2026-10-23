@@ -140,3 +140,16 @@ def test_tensor_census_counts_cpu_storages_once():
     line = uma.tensor_census()
     assert line.startswith("TENSORS cpu_storages=") and "(1024, 1024):int16x1=2MiB" in line
     del a, b
+
+
+def test_diagnostic_abort_after_n_layers(monkeypatch):
+    calls = []
+    monkeypatch.setattr(uma, "trim", lambda: None)
+    ex = _fake_exl3(calls)
+    uma.install_uma_load_memory(ex)
+    monkeypatch.setenv("VLLM_EXL3_TRIM_AFTER_LAYER", "1")
+    monkeypatch.setenv("VLLM_EXL3_MEM_PROBE", "0")
+    monkeypatch.setenv("VLLM_EXL3_MEM_PROBE_ABORT_AFTER", "2")
+    ex.prepare_trellis_arena_plan(object(), {})
+    with pytest.raises(RuntimeError, match="diagnostic load stop"):
+        ex.prepare_trellis_arena_plan(object(), {})
