@@ -438,6 +438,25 @@ def reference_w1_write(
     expected = (num_heads + 2 * num_kv_heads + niq + 1) * HEAD_DIM
     if row != expected:
         raise ValueError(f"qkv rows must be {expected} wide, got {row}")
+    if positions.dim() != 1 or positions.shape[0] != num_tokens:
+        raise ValueError(
+            f"positions must be [{num_tokens}], got {tuple(positions.shape)}"
+        )
+    if cos_sin_cache.dim() != 2 or cos_sin_cache.shape[-1] < rotary_dim:
+        raise ValueError(
+            "cos_sin_cache must be [rows, rotary_dim] with rows covering "
+            f"every position; got {tuple(cos_sin_cache.shape)} for "
+            f"rotary_dim {rotary_dim}"
+        )
+    pos_lo = int(positions.min())
+    pos_hi = int(positions.max())
+    if pos_lo < 0 or pos_hi >= cos_sin_cache.shape[0]:
+        raise ValueError(
+            f"positions [{pos_lo}, {pos_hi}] exceed the cos_sin_cache "
+            f"({cos_sin_cache.shape[0]} rows): the rotary cache must cover "
+            f"max(positions) + 1 rows. This is an input-data bug in the "
+            f"caller (build the cache large enough), not a kernel bug."
+        )
     x = qkv_rows.to(torch.float32).view(num_tokens, -1, HEAD_DIM)
     q_out = torch.empty((num_tokens, num_heads, HEAD_DIM), dtype=torch.bfloat16)
     index_q_bytes = (

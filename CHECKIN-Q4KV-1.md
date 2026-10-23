@@ -249,3 +249,76 @@ Unverified on this VPS (no GPU, no triton): the actual sm_121
 compilation of W1/R2, the fix's effect on the val1 failure, and all
 GB10 parity numerics. The frontend check + case 1 re-run on GB10 is
 the acceptance gate for this fix.
+
+## Post-val2 fix: harness input-data consistency + CPU dry run (this commit)
+
+GB10 val2 result: step 0 passed (W1 + R2 compile for sm_121 in every
+host dtype variant — the val1 fix works), then case 1 crashed in the
+harness's own test data: positions 1000..1031 against a 256-row
+cos_sin cache -> IndexError inside the reference packer. No q4 kernel
+numerics were checked.
+
+**Root causes audited in the harness data (both fixed):**
+
+1. The rotary cache was 256 random rows while positions reached 1031.
+   The case now builds the REAL partial-RoPE table — vLLM's
+   `RotaryEmbedding._compute_cos_sin_cache` formula (NeoX halved
+   `[cos(pos*inv_freq) | sin(pos*inv_freq)]` rows) with the
+   MiniMax-M3 configuration the overlay serves (rope_theta 5e6,
+   rotary_dim 64 = partial_rotary_factor 0.5 of head 128), sized to
+   cover max(positions)+1 rows.
+2. Case 1 passed `index_cache=None`: the wrapper then hands the POOL
+   as the index_k scatter placeholder, so the kernel's index_k writes
+   would corrupt pool page 0 and break the byte-exact comparison. The
+   case now allocates a real fp8 e4m3 index cache (2 pages; the slot
+   mappings deliberately cross a page boundary on both pools) and
+   compares the full scattered index cache byte-for-byte against the
+   reference's index_k bytes — a fourth byte-exact output (pool, q,
+   index_q, index_k scatter).
+
+Cases 2/4 data was audited and is consistent: topk entries are
+logical block-table indices within the table width, block_table
+entries are physical pages within the pool, seq_lens is pinned to
+TOPK*BLOCK so the kernel's n_blocks mask, the fp8 baseline's causal
+mask and the fp32 oracle's query_pos select the same token set (the
+CPU dry run proves the baseline and the oracle agree at cosine
+0.999629 before any kernel runs).
+
+**Fail-closed input validation (never a kernel-looking failure again):**
+`tools/q4kv_harness_inputs.py` (pure torch, red-venv-safe) builds
+every case's inputs and validates them BEFORE any kernel or reference
+call; every index must be in range for its tensor (positions vs cache
+rows, slot mappings vs pool/index pages, topk vs block-table width,
+block_table vs pool pages, seq_lens vs accessible tokens and the
+fixture invariant) and any violation raises a ValueError naming the
+input. The reference `reference_w1_write` now raises a named
+ValueError (not an IndexError) when positions exceed the cache.
+
+**CPU dry run (new):** `python tools/gb10_q4kv_parity.py --cpu-dry-run`
+builds every case's inputs, runs the validators, runs the full
+pure-torch reference paths on CPU (W1 packer incl. scatter-offset
+dequantization round-trip and index_k byte check; fp8 baseline and
+fp32 oracle attention to completion) and the case-3 pool arithmetic —
+no triton, no GPU. PASSED on this VPS (red venv, 3.3 s). The GPU
+cases (Triton W1/R2 byte-exactness and cosine, CUDA-graph capture)
+remain GB10-only.
+
+**Tests (red venv):** 6 new CPU tests (31/31 green in
+`tests/test_minimax_q4kv.py`): the reference's position guard
+(ValueError, never IndexError, in-range batches still pack); the
+shipped builders pass their validators; the rotary cache is the real
+partial-RoPE table (theta 5e6, vLLM row form, sized from positions);
+the exact val2 bug (256-row cache) is caught by the validator; every
+out-of-range mutation (slot mapping, index slot mapping, index_cache
+None, positions, topk, block_table, seq_lens capacity and invariant)
+fails closed with the named message; and every harness case body is
+pinned to validate its inputs before its kernel call, with main()
+routing --cpu-dry-run. Full suite: 602 passed, 39 skipped, the same 8
+pre-existing failures as the unmodified tree (verified by stash/run/pop)
+— failure set identical to the baseline.
+
+Unverified on this VPS (no GPU, no triton): the actual GB10 re-run of
+cases 1, 2 and 4 — W1 byte-exactness against the now-real rotary
+cache and index cache, R2 cosine on real-shaped data, and CUDA-graph
+capture. The exact GB10 command is unchanged except nothing; the
+CPU dry run must precede it.

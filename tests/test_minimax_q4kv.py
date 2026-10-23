@@ -13,7 +13,12 @@ Covers:
 - kernel boundary convention: fp8 e4m3 index buffers are handed to the
   Triton kernels as uint8 byte views (the GB10 val1 compile fix), the
   uint8 pool is passed as-is, and the GB10 harness frontend-checks the
-  kernels before any GPU case.
+  kernels before any GPU case;
+- harness input consistency (the GB10 val2 follow-up): the reference
+  raises a named ValueError (not an IndexError) when positions exceed
+  the rotary cache, the shared case builders build a real partial-RoPE
+  cache (theta 5e6) sized from positions, and the input validators
+  fail closed on every out-of-range index before any kernel runs.
 
 Triton is not importable on this VPS and there is no GPU: the Triton W1/R2
 kernels are validated on GB10 by tools/gb10_q4kv_parity.py, not here.
@@ -893,3 +898,189 @@ def test_gb10_harness_frontend_checks_before_any_gpu_case() -> None:
     assert 'GPUTarget("cuda", 121, 32)' in check
     assert '"index_q_out_ptr": "*u8"' in check
     assert '"index_cache_ptr": "*u8"' in check
+
+
+# ---------------------------------------------------------------------------
+# Harness input consistency (GB10 val2 follow-up): the reference position
+# guard and the shared builders/validators in tools/q4kv_harness_inputs.py
+# ---------------------------------------------------------------------------
+
+_HARNESS_INPUTS = None
+
+
+def _harness_inputs_module():
+    """Load tools/q4kv_harness_inputs.py (pure torch; no triton needed)."""
+    global _HARNESS_INPUTS
+    if _HARNESS_INPUTS is None:
+        import importlib.util
+
+        root = Path(__file__).resolve().parents[1]
+        path = root / "tools" / "q4kv_harness_inputs.py"
+        spec = importlib.util.spec_from_file_location(
+            "q4kv_harness_inputs", path
+        )
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["q4kv_harness_inputs"] = mod
+        spec.loader.exec_module(mod)
+        _HARNESS_INPUTS = mod
+    return _HARNESS_INPUTS
+
+
+def test_reference_w1_write_positions_beyond_cache_fail_closed() -> None:
+    """The GB10 val2 crash class: positions beyond the rotary cache must
+    raise a ValueError that names the input, never an IndexError that
+    looks like a kernel bug. In-range positions must keep working."""
+    (
+        qkv, q_norm_w, k_norm_w, iq_norm_w, ik_norm_w, cos_sin, positions,
+        eps, slot_mapping, index_slot_mapping,
+    ) = _w1_batch()
+    rows = cos_sin.shape[0]
+    for bad in (
+        positions + rows,  # one past the last cache row
+        torch.full_like(positions, rows + 1000),  # the val2 distances
+    ):
+        with pytest.raises(ValueError, match="cos_sin"):
+            ref.reference_w1_write(
+                qkv, q_norm_w, k_norm_w, iq_norm_w, ik_norm_w, cos_sin,
+                bad, eps, ROTARY, NQ, NKV, NIQ, slot_mapping,
+                index_slot_mapping,
+            )
+    with pytest.raises(ValueError, match="positions"):
+        ref.reference_w1_write(
+            qkv, q_norm_w, k_norm_w, iq_norm_w, ik_norm_w, cos_sin,
+            positions - int(positions.max()) - 1, eps, ROTARY, NQ, NKV,
+            NIQ, slot_mapping, index_slot_mapping,
+        )
+    # Regression guard: the in-range batch still packs.
+    out = ref.reference_w1_write(
+        qkv, q_norm_w, k_norm_w, iq_norm_w, ik_norm_w, cos_sin,
+        positions, eps, ROTARY, NQ, NKV, NIQ, slot_mapping,
+        index_slot_mapping,
+    )
+    assert out["q"].shape[0] == positions.shape[0]
+
+
+def test_harness_inputs_are_consistent_and_validators_accept_them() -> None:
+    """The shipped case builders must pass their own validators (the CPU
+    dry run and the GB10 harness consume the very same bytes)."""
+    hi = _harness_inputs_module()
+    hi.validate_w1_inputs(hi.w1_inputs())
+    hi.validate_decode_inputs(hi.decode_inputs())
+
+
+def test_harness_rotary_cache_is_the_real_partial_rope() -> None:
+    """The rotary cache must be the real MiniMax-M3 partial-RoPE table
+    (theta 5e6, rotary 64, vLLM's NeoX halved row form), sized to cover
+    max(positions) + 1 — not the val2 harness's 256 random rows."""
+    import math
+
+    hi = _harness_inputs_module()
+    assert hi.ROPE_THETA == 5_000_000.0
+    assert hi.ROTARY == 64
+    inp = hi.w1_inputs()
+    rows, width = inp["cos_sin"].shape
+    pos_max = int(inp["positions"].max())
+    assert (rows, width) == (pos_max + 1, hi.ROTARY)
+    inv_freq = 1.0 / (
+        hi.ROPE_THETA
+        ** (
+            torch.arange(0, hi.ROTARY, 2, dtype=torch.float32) / hi.ROTARY
+        )
+    )
+    p = torch.tensor([7, 1000, pos_max], dtype=torch.float32)
+    freqs = torch.einsum("i,j->ij", p, inv_freq)
+    want = torch.cat((freqs.cos(), freqs.sin()), dim=-1)
+    assert torch.allclose(inp["cos_sin"][[7, 1000, pos_max]], want)
+    assert torch.allclose(
+        inp["cos_sin"][:64], hi.build_cos_sin_cache(64)
+    )
+    assert abs(float(inp["cos_sin"][1000, 0]) - math.cos(1000.0)) < 1e-5
+
+
+def test_harness_validator_catches_the_val2_position_bug() -> None:
+    """The exact GB10 val2 data bug (positions 1000.. with a 256-row
+    cache) must be caught by the validator before anything runs."""
+    hi = _harness_inputs_module()
+    inp = hi.w1_inputs()
+    inp["cos_sin"] = torch.randn(
+        256, hi.ROTARY, generator=torch.Generator().manual_seed(0)
+    )
+    with pytest.raises(ValueError, match="cos_sin cache"):
+        hi.validate_w1_inputs(inp)
+
+
+def test_harness_validator_catches_index_range_bugs() -> None:
+    """Every index of every generated input must be in range for its
+    tensor; each mutation below is a silent OOB write/read in the
+    kernel and must fail closed in the validator."""
+    hi = _harness_inputs_module()
+    cases = [
+        ("slot_mapping beyond the pool", "slot_mapping",
+         lambda d, k: d[k].__setitem__(-1, hi.NUM_PAGES * hi.BLOCK),
+         "slot_mapping"),
+        ("index_slot_mapping beyond the index cache",
+         "index_slot_mapping",
+         lambda d, k: d[k].__setitem__(-1, 2 * hi.BLOCK),
+         "index_slot_mapping"),
+        ("index_cache None (pool placeholder corruption)", "index_cache",
+         lambda d, k: d.update(index_cache=None), "index_cache"),
+        ("positions beyond the cache", "positions",
+         lambda d, k: d[k].__setitem__(
+             0, int(d["cos_sin"].shape[0]) + 5
+         ), "cos_sin cache"),
+    ]
+    for name, key, mutate, needle in cases:
+        bad = hi.w1_inputs()
+        mutate(bad, key)
+        with pytest.raises(ValueError, match=needle):
+            hi.validate_w1_inputs(bad)
+
+    dec = hi.decode_inputs()
+    dcases = [
+        ("topk beyond the block table width", lambda d: d["topk"].__setitem__(
+            (0, 0, -1), d["block_table"].shape[1]), "topk"),
+        ("block_table beyond the pool pages",
+         lambda d: d["block_table"].__setitem__((0, -1), hi.NUM_PAGES),
+         "block_table"),
+        ("seq_lens beyond the block table capacity",
+         lambda d: d["seq_lens"].fill_(hi.NUM_PAGES * hi.BLOCK + 128),
+         "seq_lens"),
+        ("seq_lens off the fixture invariant",
+         lambda d: d["seq_lens"].fill_(hi.TOPK * hi.BLOCK + 128),
+         "fixture seq_lens"),
+    ]
+    for name, mutate, needle in dcases:
+        bad = hi.decode_inputs()
+        mutate(bad)
+        with pytest.raises(ValueError, match=needle):
+            hi.validate_decode_inputs(bad)
+
+
+def test_gb10_harness_validates_inputs_before_every_case() -> None:
+    """Every harness case must run its input validator before any kernel
+    call, and the CPU dry run must run the same validators (a data bug
+    must never look like a kernel bug)."""
+    root = Path(__file__).resolve().parents[1]
+    harness = (root / "tools" / "gb10_q4kv_parity.py").read_text()
+
+    def body(marker: str) -> str:
+        start = harness.index(marker)
+        nxt = harness.index("\ndef ", start + 1)
+        return harness[start:nxt]
+
+    for case, kernel in (
+        ("def case1_w1_byte_exact", "q4k.q4_w1_insert"),
+        ("def case2_r2_accuracy", "q4k.q4_sparse_decode"),
+        ("def case4_cuda_graph", "q4k.q4_sparse_decode"),
+        ("def _dry_run_case1", "ref.reference_w1_write"),
+        ("def _dry_run_decode", "ref.reference_sparse_attention"),
+    ):
+        b = body(case)
+        gate = b.index("hi.validate_")
+        act = b.index(kernel)
+        assert gate < act, f"{case} must validate inputs before {kernel}"
+    dry = body("def cpu_dry_run")
+    assert "hi.validate_" not in dry  # validation lives in the case bodies
+    main_body = harness[harness.index("def main") :]
+    assert '"--cpu-dry-run"' in main_body and "cpu_dry_run()" in main_body
