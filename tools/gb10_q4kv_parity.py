@@ -58,11 +58,18 @@ Units:
       loudly), no NaN/Inf.
   3.  Pool bytes: the allocated pool is 73728 B/page and 576
       B/token/layer for 4 KV heads (spec arithmetic).
-  4.  CUDA-graph capture of R2 under the static-buffer rules: every
-      input is a preallocated CUDA tensor that is copied into before
-      replay; the replay must reproduce the eager output bit-identically
-      AND must read the CURRENT bytes of the static buffers (verified
-      by copying new pool bytes in between replays).
+  4.  CUDA-graph capture of a FULL decode step through the overlay's
+      PUBLIC wrappers: the W1 wrapper writes the batch's new tokens into
+      the q4 pool and the decode wrapper reads the pool (including those
+      tokens) through R2, with the production unit-scale tensors on the
+      device. Under the static-buffer rules every input is a preallocated
+      CUDA tensor that is restored before each replay; the replay must
+      reproduce the eager pass bit-identically in EVERY buffer the step
+      writes AND must read the CURRENT bytes of both static input buffers
+      (fresh new-token qkv rows and rotated history pages are copied in
+      between replays). Any host sync in either wrapper (the boot20
+      crash: the unit-scale .item()) aborts the capture itself and fails
+      the unit with the CUDA error.
 5.  Prefill staging (the boot18 crash path): a realistic
       multi-sequence chunk over W1-derived pool bytes (real partial-RoPE
       table, real e4m3 fp8 index cache, real per-(kv-head, query) top-k
@@ -485,6 +492,104 @@ def _run_r2_bundle(gpu: dict) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# Case 4: a FULL decode step through the overlay's PUBLIC wrappers (the
+# boot20 crash path). The captured step is W1 (new-token write into the q4
+# pool) followed by R2 (read of the same pool, including those tokens),
+# exactly the layer sequence a captured vLLM decode step executes, with
+# the production unit-scale tensors (pinned to 1.0 by
+# set_default_quant_scales, nvidia/model.py:1078-79) on the device.
+# ---------------------------------------------------------------------------
+
+_W1_STEP_KEYS = (
+    "qkv", "norm_ws", "positions", "cos_sin", "slot_mapping",
+    "index_slot_mapping", "pool", "index_cache", "q_out", "index_q_out",
+    "block_table", "topk", "seq_lens",
+)
+_STEP_WRITE_KEYS = (
+    "output", "pool", "q_out", "index_q_out", "index_cache", "qkv",
+)
+# The output-like buffers zeroed before each run; the pool and qkv are
+# restored INPUTS and are never zeroed.
+_STEP_OUT_KEYS = ("output", "q_out", "index_q_out", "index_cache")
+
+_W1_WRAPPER = None
+_DECODE_WRAPPER = None
+
+
+def _overlay_wrappers():
+    """The overlay's PUBLIC wrappers, built exactly as install() builds
+    them (``_make_hook_wrapper``), from the ORIGINAL callables imported
+    BY VALUE here. Nothing is patched on any module, so the other units'
+    originals stay pristine; the wrapper objects are the overlay's real
+    routing code (pool detection, byte re-view, unit-scale gate, device
+    gates, kernel dispatch). GPU-only (imports vllm)."""
+    global _W1_WRAPPER, _DECODE_WRAPPER
+    if _W1_WRAPPER is None:
+        from vllm import _custom_ops as ops
+        from vllm.models.minimax_m3.common.ops.sparse_attn import (
+            minimax_m3_sparse_attn_decode as original_decode,
+        )
+        from vllm_exl3 import minimax_q4kv as overlay
+
+        _W1_WRAPPER = overlay._make_hook_wrapper(
+            "w1", ops.fused_minimax_m3_qknorm_rope_kv_insert
+        )
+        _DECODE_WRAPPER = overlay._make_hook_wrapper(
+            "decode", original_decode
+        )
+        assert overlay._is_q4kv_wrapper(_W1_WRAPPER) and (
+            _W1_WRAPPER.__q4kv_original__
+            is ops.fused_minimax_m3_qknorm_rope_kv_insert
+        ), "the W1 wrapper must preserve the original as delegation target"
+        assert overlay._is_q4kv_wrapper(_DECODE_WRAPPER) and (
+            _DECODE_WRAPPER.__q4kv_original__ is original_decode
+        ), "the decode wrapper must preserve the original as delegation target"
+    return _W1_WRAPPER, _DECODE_WRAPPER
+
+
+def _decode_step_static_bundle(inp: dict, device) -> dict:
+    """Preallocated static buffers for the full decode step: every input
+    moved to ``device`` by the ONE bundle mover, the output buffer
+    ALLOCATED there (never inherited from the CPU bundle), and the
+    production unit-scale tensors built on the device so the captured
+    step exercises the real scale path."""
+    gpu = _kernel_bundle(inp, _W1_STEP_KEYS, device)
+    gpu["sm_scale"] = inp["sm_scale"]  # non-tensor passthrough
+    gpu["output"] = torch.zeros_like(gpu["q_out"])
+    gpu["unit_scale"] = torch.ones((), device=device)
+    return gpu
+
+
+def _launch_decode_step(gpu: dict) -> None:
+    """The ONLY call site of the overlay's public wrappers: one full
+    decode step -- the W1 wrapper writes the batch's new tokens into the
+    q4 pool, then the decode wrapper reads the pool (including those
+    tokens) through R2. Any host sync in either wrapper aborts the CUDA
+    graph capture with a CUDA error (the boot20 crash class), which fails
+    this unit loudly instead of the serve."""
+    w1, decode = _overlay_wrappers()
+    nw = gpu["norm_ws"]
+    # Positional order: the vendor op's signature (_W1_PARAMS).
+    w1(
+        gpu["qkv"], nw["q"], nw["k"], gpu["cos_sin"], gpu["positions"],
+        NQ, NKV, ROTARY, EPS, nw["iq"], nw["ik"], NIQ,
+        gpu["slot_mapping"], gpu["index_slot_mapping"], gpu["pool"],
+        gpu["index_cache"], BLOCK, gpu["q_out"], gpu["index_q_out"],
+        "nvfp4", False, None, None,
+        gpu["unit_scale"], gpu["unit_scale"], True,
+    )
+    decode(
+        gpu["q_out"], gpu["pool"], gpu["topk"], gpu["block_table"],
+        gpu["seq_lens"], NKV, gpu["sm_scale"], gpu["output"], 1,
+        k_scale=gpu["unit_scale"], v_scale=gpu["unit_scale"],
+    )
+
+
+def _step_snapshot(gpu: dict) -> dict:
+    return {k: gpu[k].clone() for k in _STEP_WRITE_KEYS}
+
+
+# ---------------------------------------------------------------------------
 # ONE vendor-invocation builder (the GB10 val7 lesson)
 # ---------------------------------------------------------------------------
 # val7 measured cos(q4 staged prefill, fp8 ORIGINAL kernel) = 0.0022 while
@@ -716,53 +821,96 @@ def unit_3() -> dict:
 
 
 def unit_4() -> dict:
-    """R2 must be CUDA-graph capturable, and the replay must read the
-    CURRENT bytes of the static input buffers.
+    """A FULL decode step through the overlay's PUBLIC wrappers must be
+    CUDA-graph capturable, and the replay must read the CURRENT bytes of
+    every static input buffer.
 
-    Static-buffer rules: every input is a preallocated CUDA tensor that
-    is copied into before replay. The check is two-stage: (a) replay on
-    the captured fixture bytes must reproduce the eager output
-    bit-identically, and (b) after NEW pool bytes are copied into the
-    static buffer, the replay must reproduce the eager run on THOSE
-    bytes — a stale replay of the captured bytes fails (b) because the
-    outputs differ.
+    The captured step is the real layer sequence: the W1 wrapper writes
+    the batch's new tokens (Gemma QK-norm + partial RoPE + q4 pack) into
+    the q4 pool, then the decode wrapper reads the pool -- including
+    those tokens -- through R2, with the production unit-scale tensors
+    on the device. Static-buffer rules: every input is a preallocated
+    CUDA tensor that is restored before each replay. The check is
+    two-stage: (a) after the pristine bytes are restored, the replay
+    must reproduce the eager pass bit-identically in EVERY buffer the
+    step writes (output, pool, q_out, index bytes, qkv); (b) after NEW
+    bytes are copied into BOTH static input buffers (fresh new-token qkv
+    rows AND rotated history pages), the replay must reproduce the
+    eager pass on THOSE bytes -- a stale replay, or a vacuous mutation,
+    fails loudly. Any host sync in either wrapper (the boot20 crash:
+    the unit-scale ``.item()``) aborts the capture itself and fails this
+    unit with the CUDA error.
     """
-    inp = _decode_fixture()
-    gpu = _r2_static_bundle(inp, "cuda")
-    eager_fixture = _run_r2_bundle(gpu)
+    inp = hi.decode_step_inputs()
+    hi.validate_decode_step_inputs(inp)
+    gpu = _decode_step_static_bundle(inp, "cuda")
+    pristine_qkv = gpu["qkv"].clone()
+    pristine_pool = gpu["pool"].clone()
+
+    def set_state(qkv_src, pool_src) -> None:
+        gpu["qkv"].copy_(qkv_src)
+        gpu["pool"].copy_(pool_src)
+        for key in _STEP_OUT_KEYS:
+            gpu[key].zero_()
+
+    def run_eager() -> dict:
+        # The eager pass IS vLLM's warm-up order: every captured forward
+        # runs eagerly first (cudagraph_utils.py:464-467), so the unit
+        # scales are validated and cached and the kernels compile here,
+        # before anything is captured.
+        _launch_decode_step(gpu)
+        torch.cuda.synchronize()
+        return _step_snapshot(gpu)
+
+    eager_a = run_eager()
+    finite = bool(torch.isfinite(eager_a["output"]).all())
     # Warmup on a side stream (torch requirement for capture).
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         for _ in range(3):
-            _launch_r2(gpu)
+            _launch_decode_step(gpu)
     torch.cuda.current_stream().wait_stream(s)
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        _launch_r2(gpu)
-    # Stage (a): replay on the captured bytes == eager on those bytes.
-    gpu["output"].zero_()
+        _launch_decode_step(gpu)
+    # Stage (a): pristine bytes restored, then the replay must reproduce
+    # the eager pass bit-identically in every written buffer.
+    set_state(pristine_qkv, pristine_pool)
     g.replay()
     torch.cuda.synchronize()
-    replay_fixture = gpu["output"].cpu()
-    stage_a = bool(torch.equal(replay_fixture, eager_fixture))
-    # Stage (b): copy NEW bytes into the static pool buffer, then replay
-    # must match the eager run on the NEW bytes (whole pages rotated, so
-    # every K/V value moves to a different block).
-    gpu["pool"].copy_(torch.roll(gpu["pool"], shifts=3, dims=0))
-    eager_mutated = _run_r2_bundle(gpu)
-    gpu["output"].zero_()
+    replay_a = _step_snapshot(gpu)
+    stage_a = all(
+        bool(torch.equal(replay_a[k], eager_a[k])) for k in _STEP_WRITE_KEYS
+    )
+    # Stage (b): NEW bytes in BOTH static input buffers -- fresh
+    # new-token qkv rows (the W1 leg's input) and rotated history pages
+    # (the R2 leg's input). The eager pass on those bytes is the
+    # reference; the replay after the same restore must reproduce it.
+    b_qkv = torch.randn_like(gpu["qkv"]) * 0.5
+    b_pool = torch.roll(pristine_pool, shifts=3, dims=0)
+    set_state(b_qkv, b_pool)
+    eager_b = run_eager()
+    set_state(b_qkv, b_pool)
     g.replay()
     torch.cuda.synchronize()
-    replay_mutated = gpu["output"].cpu()
-    stage_b = bool(torch.equal(replay_mutated, eager_mutated))
-    mutation_live = not bool(torch.equal(eager_mutated, eager_fixture))
-    passed = stage_a and stage_b and mutation_live
+    replay_b = _step_snapshot(gpu)
+    stage_b = all(
+        bool(torch.equal(replay_b[k], eager_b[k])) for k in _STEP_WRITE_KEYS
+    )
+    mutation_live = not bool(
+        torch.equal(eager_b["output"], eager_a["output"])
+    )
+    passed = stage_a and stage_b and mutation_live and finite
     if passed:
         summary = (
-            "replay reproduces the eager output bit-identically and reads "
-            "the current static-buffer bytes"
+            "the full decode step (W1 write + R2 read) captures cleanly; "
+            "the replay reproduces the eager pass bit-identically in "
+            "every written buffer and reads the current bytes of both "
+            "static input buffers"
         )
+    elif not finite:
+        summary = "the eager decode step produced non-finite output"
     elif not stage_a:
         summary = "replay on the captured bytes differs from eager"
     elif not mutation_live:
@@ -1607,6 +1755,149 @@ def _dry_vendor_args_audit() -> dict:
     }
 
 
+def _dry_decode_step_audit() -> dict:
+    """Structure audit of the case-4 FULL decode step (no GPU on this
+    VPS): the step inputs pass their anti-vacuous validator and every
+    vacuity mutation fails closed; the one bundle mover puts EVERY step
+    tensor on the simulated target with shapes/dtypes preserved; the
+    output buffer and the production unit scales are allocated ON the
+    target; and source pins prove the unit reaches the kernels ONLY
+    through the overlay's public wrappers, restores the static buffers
+    before every replay, compares every written buffer, and that the
+    overlay's unit-scale gate is capture-safe (cached verdict, fail
+    closed under capture)."""
+    device = torch.device("meta")
+    problems: list[str] = []
+    inp = hi.decode_step_inputs()
+    hi.validate_decode_step_inputs(inp)
+
+    # (a) every mutation that would make the replay comparison vacuous
+    #     (or replay an out-of-range index) fails closed, naming the
+    #     problem.
+    mutations = (
+        ("new token on an unread page",
+         lambda b: b.__setitem__("slot_mapping", torch.full_like(
+             b["slot_mapping"], 8 * hi.BLOCK + 1))),
+        ("top-k shifted off the new page",
+         lambda b: b.__setitem__("topk", b["topk"] + 1)),
+        ("positions beyond the rotary cache",
+         lambda b: b.__setitem__(
+             "positions", b["positions"] + hi.BLOCK)),
+        ("index slot beyond the index cache",
+         lambda b: b.__setitem__(
+             "index_slot_mapping", b["index_slot_mapping"] + 8 * hi.BLOCK)),
+        ("seq_lens shortened", lambda b: b.__setitem__(
+            "seq_lens", b["seq_lens"] - hi.BLOCK)),
+    )
+    for label, mutate in mutations:
+        bad = hi.decode_step_inputs()
+        mutate(bad)
+        try:
+            hi.validate_decode_step_inputs(bad)
+            problems.append(f"step validator accepted: {label}")
+        except ValueError:
+            pass
+
+    # (b) mover coverage: nothing in the step's kernel-facing bundle may
+    #     stay on the CPU (or silently change) when the bundle is moved.
+    before = dict(_iter_tensors({k: inp[k] for k in _W1_STEP_KEYS}))
+    moved = _kernel_bundle(inp, _W1_STEP_KEYS, device)
+    after = dict(_iter_tensors(moved))
+    if set(before) != set(after):
+        problems.append("step: mover dropped/duplicated tensors")
+    for path, b in before.items():
+        a = after.get(path)
+        if a is None:
+            continue
+        if a.device != device:
+            problems.append(f"step/{path} stayed on {a.device}")
+        if a.shape != b.shape or a.dtype != b.dtype:
+            problems.append(f"step/{path} changed shape/dtype")
+
+    # (c) the static bundle: the OUTPUT buffer is allocated on the
+    #     target, the production unit scales are built ON the target
+    #     (they are the tensors whose eager validation the capture must
+    #     reuse), and the non-tensor sm_scale passes through unchanged.
+    static = _decode_step_static_bundle(inp, device)
+    if static["output"].device != device or (
+        static["output"].shape != static["q_out"].shape
+    ):
+        problems.append("step: output buffer not allocated on the target")
+    if static["unit_scale"].device != device:
+        problems.append("step: unit scales not on the target device")
+    if static["sm_scale"] != inp["sm_scale"]:
+        problems.append("step: sm_scale passthrough broken")
+    for path, t in _iter_tensors(static):
+        if isinstance(t, torch.Tensor) and t.device != device:
+            problems.append(f"step/{path} not on the target device")
+
+    # (d) source pins: the launch goes through the overlay's PUBLIC
+    #     wrappers only, and the unit restores the static buffers
+    #     before every replay and compares every written buffer.
+    harness_src = Path(__file__).read_text()
+
+    def body(marker: str) -> str:
+        start = harness_src.index(marker)
+        return harness_src[start:harness_src.index("\ndef ", start + 1)]
+
+    launch = body("def _launch_decode_step")
+    if "_overlay_wrappers()" not in launch:
+        problems.append("step launch does not use the overlay wrappers")
+    if "q4k.q4_w1_insert" in launch or "q4k.q4_sparse_decode" in launch:
+        problems.append("step launch bypasses the wrappers into the kernels")
+    wrap = body("def _overlay_wrappers")
+    for pin in ("_make_hook_wrapper", "__q4kv_original__"):
+        if pin not in wrap:
+            problems.append(f"wrapper construction lost the {pin} pin")
+    unit4 = body("def unit_4")
+    for pin in (
+        "hi.validate_decode_step_inputs", "torch.cuda.graph",
+        "set_state(pristine_qkv, pristine_pool)", "g.replay()",
+        "_STEP_WRITE_KEYS", "mutation_live", "torch.roll",
+    ):
+        if pin not in unit4:
+            problems.append(f"unit_4 lost the {pin!r} pin")
+
+    # (e) source pins: the overlay's unit-scale gate is capture-safe
+    #     (cached verdict bound to the exact tensor object, fail closed
+    #     when first seen under capture) and both wrappers gate their
+    #     scalar slots against tensor-coercion host syncs.
+    src_root = Path(__file__).resolve().parents[1]
+    overlay_src = (src_root / "src" / "vllm_exl3" / "minimax_q4kv.py").read_text()
+    for pin in (
+        "_stream_is_capturing", "weakref.ref(scale)",
+        "first seen while a CUDA graph is",
+        "cudagraph_utils.py:464-467",
+    ):
+        if pin not in overlay_src:
+            problems.append(f"unit-scale gate lost the {pin!r} capture pin")
+    w1_wrap = overlay_src[overlay_src.index("def _make_w1_wrapper"):]
+    w1_wrap = w1_wrap[: w1_wrap.index("\ndef ")]
+    import re as _re
+
+    for pin in ("write_qkv", "eps", "skip_index_branch", "num_heads",
+                "block_size"):
+        if not _re.search(rf'_py_scalar\(\s*"{pin}"', w1_wrap):
+            problems.append(f"W1 wrapper lost the {pin!r} scalar gate")
+    dec_wrap = overlay_src[overlay_src.index("def _make_decode_wrapper"):]
+    dec_wrap = dec_wrap[: dec_wrap.index("\ndef ")]
+    for pin in ("sm_scale", "num_kv_heads", "decode_query_len"):
+        if not _re.search(rf'_py_scalar\(\s*"{pin}"', dec_wrap):
+            problems.append(f"decode wrapper lost the {pin!r} scalar gate")
+
+    return {
+        "passed": not problems,
+        "problems": problems,
+        "summary": (
+            "the decode-step bundle moves whole, the output and unit "
+            "scales land on the target, every vacuity mutation fails "
+            "closed, and the wrappers' capture-safety pins are in place"
+            if not problems
+            else "; ".join(problems)
+        ),
+    }
+
+
 def cpu_dry_run() -> int:
     units = [
         ("dry/0-w1-reference-runs", _dry_w1_reference),
@@ -1618,6 +1909,7 @@ def cpu_dry_run() -> int:
         ("dry/4-device-audit", _dry_device_audit),
         ("dry/5-prefill-staging", _dry_prefill),
         ("dry/6-vendor-invocation-structure", _dry_vendor_args_audit),
+        ("dry/7-decode-step-structure", _dry_decode_step_audit),
     ]
     return run_units(
         units,

@@ -1465,16 +1465,36 @@ def test_gb10_harness_validates_inputs_before_every_case() -> None:
         assert "_w1_evidence()" in body(unit), (
             f"{unit} must gate the shared W1 evidence"
         )
-    # The decode fixture validates before any R2 launch (units 2 and 4
-    # reach the kernel only through the static-bundle/launch helpers,
-    # which the fixture precedes).
+    # The decode fixture validates before any R2 launch (unit 2 reaches the
+    # kernel only through the static-bundle/launch helpers, which the
+    # fixture precedes).
     dec = body("def _decode_fixture")
     assert dec.index("hi.validate_decode_inputs") < dec.index("return inp")
-    for unit in ("def unit_2", "def unit_4"):
-        b = body(unit)
-        assert b.index("_decode_fixture()") < b.index("_r2_static_bundle")
-    launch = body("def _launch_r2")
-    assert launch.index("q4k.q4_sparse_decode") > 0
+    unit_2 = body("def unit_2")
+    assert unit_2.index("_decode_fixture()") < unit_2.index(
+        '_r2_static_bundle'
+    )
+    # The case-4 decode step validates its own inputs before the overlay
+    # wrappers, and reaches the kernels only through those wrappers.
+    step = body("def unit_4")
+    assert step.index("hi.decode_step_inputs()") < step.index(
+        "hi.validate_decode_step_inputs"
+    )
+    assert step.index("hi.validate_decode_step_inputs") < step.index(
+        "_decode_step_static_bundle"
+    )
+    launch = body("def _launch_decode_step")
+    assert "_overlay_wrappers()" in launch
+    assert "q4k.q4_w1_insert" not in launch
+    assert "q4k.q4_sparse_decode" not in launch
+    # The step's static bundle uses the one mover and allocates the
+    # output buffer ON the target device.
+    static = body("def _decode_step_static_bundle")
+    assert static.index("_kernel_bundle") < static.index("zeros_like")
+    assert 'torch.ones((), device=device)' in static
+    # The bare R2 launch helper (unit 2) still reaches the wrapper.
+    launch_r2 = body("def _launch_r2")
+    assert launch_r2.index("q4k.q4_sparse_decode") > 0
     # The static bundle moves the kernel-facing inputs with the one
     # bundle mover and allocates the output buffer ON the target device.
     static = body("def _r2_static_bundle")
@@ -1736,6 +1756,9 @@ def test_cpu_dry_run_exercises_the_new_gates() -> None:
         "dry/2-decode-reference-runs",
         "dry/3-pool-bytes",
         "dry/4-device-audit",
+        "dry/5-prefill-staging",
+        "dry/6-vendor-invocation-structure",
+        "dry/7-decode-step-structure",
     ):
         assert f'("{name}"' in harness, f"missing dry-run unit {name}"
     assert "bf16_ulp_step" in harness  # the 1-ulp perturbation is exercised
@@ -1772,12 +1795,21 @@ def test_dry_run_device_audit_is_fail_closed() -> None:
     # And the GPU cases move their bundles with the same mover.
     unit_2 = body("def unit_2")
     unit_4 = body("def unit_4")
-    for unit in (unit_2, unit_4):
-        assert '_r2_static_bundle(inp, "cuda")' in unit
+    assert '_r2_static_bundle(inp, "cuda")' in unit_2
+    assert '_decode_step_static_bundle(inp, "cuda")' in unit_4
+    # Case 4 goes through the overlay's PUBLIC wrappers only.
+    launch = body("def _launch_decode_step")
+    assert "_overlay_wrappers()" in launch
+    assert "q4k.q4_w1_insert" not in launch
+    assert "q4k.q4_sparse_decode" not in launch
+    wrap = body("def _overlay_wrappers")
+    assert "_make_hook_wrapper" in wrap and "__q4kv_original__" in wrap
     # Case 4 obeys the static-buffer rules: replay must read the CURRENT
-    # bytes of the preallocated CUDA buffers, not the captured bytes.
+    # bytes of the preallocated CUDA buffers, not the captured bytes --
+    # on BOTH legs (fresh new-token qkv rows and rotated history pages).
     assert "copy_" in unit_4 and "torch.roll" in unit_4
-    assert "mutation_live" in unit_4
+    assert "set_state(pristine_qkv, pristine_pool)" in unit_4
+    assert "mutation_live" in unit_4 and "_STEP_WRITE_KEYS" in unit_4
 
 
 def test_device_gate_names_every_off_device_argument() -> None:
@@ -2321,3 +2353,312 @@ def test_units_gate_against_the_vendor_kernel_as_ground_truth():
     # The dry run audits the builder's structure as its own unit.
     dry = body("def cpu_dry_run", "\ndef _frontend_check_unit")
     assert '("dry/6-vendor-invocation-structure"' in dry
+
+
+# ---------------------------------------------------------------------------
+# boot20 follow-up: CUDA-graph capture safety of the q4 overlay hooks
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_scale_verdicts():
+    """The unit-scale verdict cache is per-process global state; keep every
+    test independent of the others' validations."""
+    q4kv._VALIDATED_SCALES.clear()
+    _NoSyncTensor.armed = False
+    yield
+    q4kv._VALIDATED_SCALES.clear()
+    _NoSyncTensor.armed = False
+
+
+class _NoSyncTensor(torch.Tensor):
+    """A tensor whose every host-sync accessor raises while ARMED: any
+    .item()/.tolist()/.cpu()/bool()/float()/int() executed on the
+    simulated capture path fails the test with a named error instead of
+    silently syncing. Disarmed, the accessors work, so the very same
+    OBJECT can be validated in the simulated eager warm-up pass and then
+    replayed under capture (production replays the same per-layer scale
+    tensor object; as_subclass would create a distinct object and would
+    not exercise the cache)."""
+
+    armed = False
+
+    def item(self, *a, **k):  # noqa: ARG002
+        if _NoSyncTensor.armed:
+            raise AssertionError("host sync: .item() on the capture path")
+        return torch.Tensor.item(self)
+
+    def tolist(self, *a, **k):  # noqa: ARG002
+        if _NoSyncTensor.armed:
+            raise AssertionError("host sync: .tolist() on the capture path")
+        return torch.Tensor.tolist(self)
+
+    def cpu(self, *a, **k):  # noqa: ARG002
+        if _NoSyncTensor.armed:
+            raise AssertionError("host sync: .cpu() on the capture path")
+        return torch.Tensor.cpu(self)
+
+    def __bool__(self):
+        if _NoSyncTensor.armed:
+            raise AssertionError("host sync: bool() on the capture path")
+        return torch.Tensor.__bool__(self)
+
+    def __float__(self):
+        if _NoSyncTensor.armed:
+            raise AssertionError("host sync: float() on the capture path")
+        return torch.Tensor.__float__(self)
+
+    def __int__(self):
+        if _NoSyncTensor.armed:
+            raise AssertionError("host sync: int() on the capture path")
+        return torch.Tensor.__int__(self)
+
+
+def _nosync(t: torch.Tensor) -> torch.Tensor:
+    return t.as_subclass(_NoSyncTensor)
+
+
+def _set_capturing(monkeypatch, capturing: bool) -> None:
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: capturing
+    )
+
+
+def test_unit_scale_gate_cache_semantics() -> None:
+    """The boot20 fix's cache semantics, pinned directly on the gate: the
+    verdict is bound to the EXACT tensor object (a different object at a
+    reused address is never approved), a dead entry is never an approval,
+    and a non-unit scale is still refused eagerly."""
+    scale = torch.ones(())
+    q4kv._assert_unit_scale("k_scale", scale)
+    assert len(q4kv._VALIDATED_SCALES) == 1
+    # the same live object is approved again with no read: validate the
+    # exact object eagerly (disarmed), then arm the sync trap and replay.
+    ns = _nosync(torch.ones(()))
+    q4kv._assert_unit_scale("k_scale", ns)
+    _NoSyncTensor.armed = True
+    q4kv._assert_unit_scale("k_scale", ns)  # cache hit: no .item()
+    _NoSyncTensor.armed = False
+    # a DIFFERENT object is never approved -- not even at the same address
+    # (the allocator may reuse it once the validated tensor dies).
+    with pytest.raises(ValueError, match="unit global scale"):
+        q4kv._assert_unit_scale("k_scale", torch.tensor(2.0))
+    # plain Python 1.0 passes; anything else is refused by name.
+    q4kv._assert_unit_scale("k_scale", 1.0)
+    q4kv._assert_unit_scale("k_scale", None)
+    for bad in (0.5, 2.0, "1.0", [1.0]):
+        with pytest.raises(ValueError, match="unit global scale"):
+            q4kv._assert_unit_scale("k_scale", bad)
+
+
+def test_w1_wrapper_scale_gate_is_capture_safe(monkeypatch) -> None:
+    """The W1 wrapper under simulated capture: a scale validated in the
+    eager warm-up (vLLM always runs every captured forward eagerly
+    first) is approved inside the captured step with NO read; a scale
+    first seen under capture fails closed and launches nothing."""
+    calls: list = []
+    _stub_kernels(monkeypatch, calls)
+    wrapper = q4kv._make_w1_wrapper(
+        lambda *a, **k: calls.append(("orig", a, k))
+    )
+    base = _w1_call_args(_make_pool(4))
+    scale = _nosync(torch.ones(()))
+    # eager warm-up: the scale object is validated once and cached.
+    _set_capturing(monkeypatch, False)
+    wrapper(*base["args"], **{**base["kwargs"], "kv_k_scale": scale})
+    assert calls[0][0] == "w1"
+    assert len(q4kv._VALIDATED_SCALES) == 1
+    # captured replay of the SAME object: approved with no host sync.
+    _set_capturing(monkeypatch, True)
+    _NoSyncTensor.armed = True
+    calls.clear()
+    wrapper(*base["args"], **{**base["kwargs"], "kv_k_scale": scale})
+    assert calls[0][0] == "w1"
+    _NoSyncTensor.armed = False
+    # a scale FIRST SEEN under capture fails closed, launching nothing.
+    calls.clear()
+    _NoSyncTensor.armed = True
+    with pytest.raises(RuntimeError, match="first seen while a CUDA graph"):
+        wrapper(*base["args"], **{**base["kwargs"], "kv_k_scale": _nosync(torch.ones(()))})
+    _NoSyncTensor.armed = False
+    assert calls == []
+
+
+def test_decode_wrapper_scale_gate_is_capture_safe(monkeypatch) -> None:
+    """The decode wrapper under simulated capture: same semantics as W1."""
+    calls: list = []
+    _stub_kernels(monkeypatch, calls)
+    wrapper = q4kv._make_decode_wrapper(
+        lambda *a, **k: calls.append(("orig", a, k))
+    )
+    pool = _make_pool(4)
+    scale = _nosync(torch.ones(()))
+    # eager warm-up validates the production scale object once.
+    _set_capturing(monkeypatch, False)
+    wrapper(*_decode_args(pool), k_scale=scale, v_scale=scale)
+    assert calls[0][0] == "decode"
+    # the captured step reuses the SAME object: no read, still launches.
+    _set_capturing(monkeypatch, True)
+    _NoSyncTensor.armed = True
+    calls.clear()
+    wrapper(*_decode_args(pool), k_scale=scale, v_scale=scale)
+    assert calls[0][0] == "decode"
+    _NoSyncTensor.armed = False
+    # first-seen-under-capture fails closed and launches nothing.
+    calls.clear()
+    _NoSyncTensor.armed = True
+    with pytest.raises(RuntimeError, match="first seen while a CUDA graph"):
+        wrapper(
+            *_decode_args(pool),
+            k_scale=_nosync(torch.ones(())),
+            v_scale=_nosync(torch.ones(())),
+        )
+    _NoSyncTensor.armed = False
+    assert calls == []
+
+
+def test_capture_simulation_drives_both_wrappers_without_host_sync(
+    monkeypatch,
+) -> None:
+    """Simulated capture of the FULL decode step: with
+    torch.cuda.is_current_stream_capturing -> True and EVERY tensor
+    argument a _NoSyncTensor (any .item()/.tolist()/.cpu()/bool()/
+    float()/int() raises), both wrappers' Python logic must run to the
+    (stubbed) kernel launch with no host sync -- the boot20 crash class
+    dies here as a named AssertionError instead of a CUDA error."""
+    calls: list = []
+    _stub_kernels(monkeypatch, calls)
+    w1 = q4kv._make_w1_wrapper(lambda *a, **k: calls.append(("orig", a, k)))
+    dec = q4kv._make_decode_wrapper(lambda *a, **k: calls.append(("orig", a, k)))
+    scale = _nosync(torch.ones(()))
+    # eager warm-up first (vLLM's order): the scale objects are validated.
+    _set_capturing(monkeypatch, False)
+    q4kv._assert_unit_scale("kv_k_scale", scale)
+    q4kv._assert_unit_scale("k_scale", scale)
+    # simulated capture: every tensor argument traps any host sync.
+    _set_capturing(monkeypatch, True)
+    _NoSyncTensor.armed = True
+
+    width = (NQ + 2 * NKV + NIQ + 1) * 128
+    w1_args = (
+        _nosync(torch.zeros(3, width, dtype=torch.bfloat16)),
+        _nosync(torch.zeros(128)), _nosync(torch.zeros(128)),
+        _nosync(torch.zeros(8, 64)), _nosync(torch.tensor([0, 1, 2])),
+        NQ, NKV, ROTARY, EPS,
+        _nosync(torch.zeros(128)), _nosync(torch.zeros(128)), NIQ,
+        _nosync(torch.tensor([0, 1, -1])), _nosync(torch.tensor([0, 1, 2])),
+        _nosync(_make_pool(4)),
+        _nosync(torch.zeros(4, 128, 128, dtype=torch.uint8)),
+        128,
+        _nosync(torch.zeros(3, NQ * 128, dtype=torch.bfloat16)),
+        _nosync(torch.zeros(3, NIQ * 128, dtype=torch.float8_e4m3fn)),
+        "nvfp4",
+    )
+    w1(
+        *w1_args,
+        q_fp8_out=None, q_fp8_scale=1.0,
+        kv_k_scale=scale, kv_v_scale=scale,
+        write_qkv=True,
+    )
+    assert calls[0][0] == "w1"
+    # the wrapper never coerced a tensor scalar and never read a value.
+    dec_args = (
+        _nosync(torch.zeros(4, NQ, 128, dtype=torch.bfloat16)),
+        _nosync(_make_pool(4)),
+        _nosync(torch.zeros(NKV, 4, 8, dtype=torch.int32)),
+        _nosync(torch.zeros(2, 4, dtype=torch.int32)),
+        _nosync(torch.tensor([16, 16], dtype=torch.int32)),
+        NKV, 0.08,
+        _nosync(torch.zeros(4, NQ, 128, dtype=torch.bfloat16)),
+        2,
+    )
+    dec(*dec_args, k_scale=scale, v_scale=scale)
+    assert calls[1][0] == "decode"
+    _NoSyncTensor.armed = False
+
+
+def test_wrapper_scalar_gates_refuse_tensor_coercions(monkeypatch) -> None:
+    """Every scalar slot a wrapper would coerce with bool()/int()/float()
+    must refuse a tensor (coercion is a host sync, forbidden under
+    capture) and launch nothing."""
+    calls: list = []
+    _stub_kernels(monkeypatch, calls)
+    w1 = q4kv._make_w1_wrapper(lambda *a, **k: calls.append(("orig", a, k)))
+    dec = q4kv._make_decode_wrapper(lambda *a, **k: calls.append(("orig", a, k)))
+    base = _w1_call_args(_make_pool(4))
+    t = torch.zeros(())
+    for kw_over in (
+        {"write_qkv": t},
+        {"skip_index_branch": t},
+    ):
+        with pytest.raises(TypeError, match="host-sync"):
+            w1(*base["args"], **{**base["kwargs"], **kw_over})
+    for pos, value in ((5, t), (8, t)):  # num_heads, eps
+        args = list(base["args"])
+        args[pos] = value
+        with pytest.raises(TypeError, match="host-sync"):
+            w1(*args, **base["kwargs"])
+    dargs = list(_decode_args(_make_pool(4)))
+    for pos in (5, 6, 8):  # num_kv_heads, sm_scale, decode_query_len
+        args = list(dargs)
+        args[pos] = t
+        with pytest.raises(TypeError, match="host-sync"):
+            dec(*args, k_scale=None, v_scale=None)
+    assert calls == []
+
+
+def test_decode_step_fixture_is_validated_and_fail_closed() -> None:
+    """The case-4 fixture: the shipped builder passes its anti-vacuous
+    validator, and every mutation that would make the replay comparison
+    vacuous (or replay an out-of-range index) fails closed with a named
+    error."""
+    hi = _harness_inputs_module()
+    inp = hi.decode_step_inputs()
+    hi.validate_decode_step_inputs(inp)
+    # the new tokens really are inside each request's own causal read.
+    sm = inp["slot_mapping"]
+    seq = inp["seq_lens"]
+    topk = inp["topk"]
+    for r in range(sm.shape[0]):
+        assert int(sm[r]) < int(seq[r])
+        assert int(sm[r]) // hi.BLOCK in {
+            int(v) for v in topk[:, r, :].reshape(-1)
+        }
+    mutations = (
+        ("unread page", lambda b: b.__setitem__(
+            "slot_mapping", torch.full_like(sm, 8 * hi.BLOCK + 1))),
+        ("top-k shifted", lambda b: b.__setitem__("topk", topk + 1)),
+        ("positions past the cache", lambda b: b.__setitem__(
+            "positions", inp["positions"] + hi.BLOCK)),
+        ("index slot past the cache", lambda b: b.__setitem__(
+            "index_slot_mapping",
+            inp["index_slot_mapping"] + 8 * hi.BLOCK)),
+        ("shorter seq_lens", lambda b: b.__setitem__(
+            "seq_lens", seq - hi.BLOCK)),
+    )
+    for label, mutate in mutations:
+        bad = hi.decode_step_inputs()
+        mutate(bad)
+        with pytest.raises(ValueError):
+            hi.validate_decode_step_inputs(bad)
+
+
+def test_overlay_pins_the_vllm_capture_evidence() -> None:
+    """Source pins: the overlay must document (and cite) the vLLM
+    evidence that makes the cache design sound -- decode-only capture
+    under FULL_DECODE_ONLY and the eager warm-up pass that always
+    precedes torch.cuda.graph -- and the prefill .tolist() must be
+    pinned as never captured."""
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "src" / "vllm_exl3" / "minimax_q4kv.py").read_text()
+    for pin in (
+        "FULL_DECODE_ONLY = (FULL, NONE)",
+        "264-266,302-343",  # decode-only descriptor construction
+        "464-467",  # the eager warm-up pass before torch.cuda.graph
+        "torch.cuda.graph",  # the capture start it precedes (:498-503)
+        "first seen while a CUDA graph is",
+        "weakref.ref(scale)",
+    ):
+        assert pin in src, f"overlay lost the capture-evidence pin {pin!r}"
+    # the prefill slice metadata is documented as never captured.
+    assert "never captured" in src

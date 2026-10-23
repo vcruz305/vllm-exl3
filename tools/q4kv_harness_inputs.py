@@ -121,15 +121,10 @@ def w1_inputs() -> dict:
     )
 
 
-def validate_w1_inputs(inp: dict) -> None:
-    """Fail closed on any shape/range inconsistency in the case-1 inputs.
-
-    Raises ValueError with one message per problem, before any kernel or
-    reference runs, so a harness data bug is never misread as a kernel
-    numerics bug.
-    """
-    errors: list[str] = []
-    n = inp["qkv"].shape[0]
+def _validate_w1_surface(inp: dict, errors: list[str], n: int) -> None:
+    """The shared W1-input surface checks (case 1 and the case-4 decode
+    step build the same W1 inputs); ``errors`` accumulates the named
+    problems."""
     width = (NQ + 2 * NKV + NIQ + 1) * 128
     if inp["qkv"].shape != (n, width) or inp["qkv"].dtype != torch.bfloat16:
         errors.append(
@@ -235,6 +230,18 @@ def validate_w1_inputs(inp: dict) -> None:
             f"index_q_out must be [{n}, {NIQ}, 128] float8_e4m3fn, got "
             f"{tuple(iq_out.shape)} {iq_out.dtype}"
         )
+
+
+def validate_w1_inputs(inp: dict) -> None:
+    """Fail closed on any shape/range inconsistency in the case-1 inputs.
+
+    Raises ValueError with one message per problem, before any kernel or
+    reference runs, so a harness data bug is never misread as a kernel
+    numerics bug.
+    """
+    errors: list[str] = []
+    n = inp["qkv"].shape[0]
+    _validate_w1_surface(inp, errors, n)
     if errors:
         raise ValueError(
             "q4 KV harness case-1 input data inconsistent (fix the harness "
@@ -354,29 +361,10 @@ def _validate_vendor_kv_pools(inp: dict, pages: int, errors: list) -> None:
         )
 
 
-def validate_decode_inputs(inp: dict) -> None:
-    """Fail closed on any shape/range inconsistency in the R2 fixture."""
-    errors: list[str] = []
-    q = inp["q"]
-    if q.shape != (NUM_REQS, NQ, 128) or q.dtype != torch.bfloat16:
-        errors.append(
-            f"q must be [{NUM_REQS}, {NQ}, 128] bfloat16, got "
-            f"{tuple(q.shape)} {q.dtype}"
-        )
-    pool = inp["pool"]
-    if (
-        pool.shape != (NUM_PAGES, 2 * NKV, BLOCK, 72)
-        or pool.dtype != torch.uint8
-    ):
-        errors.append(
-            f"pool must be [{NUM_PAGES}, {2 * NKV}, {BLOCK}, 72] uint8, got "
-            f"{tuple(pool.shape)} {pool.dtype}"
-        )
-    elif (
-        pool.stride(2) != 72 or pool.stride(1) != 9216 or pool.stride(3) != 1
-    ):
-        errors.append("pool slot regions must be contiguous")
-    _validate_vendor_kv_pools(inp, NUM_PAGES, errors)
+def _validate_decode_selection(inp: dict, errors: list[str]) -> int:
+    """The shared decode-selection checks (block_table / topk / seq_lens),
+    used by the case-2 validator and the case-4 decode-step validator.
+    Returns the block-table width (0 when malformed)."""
     bt = inp["block_table"]
     max_blocks = bt.shape[1] if bt.dim() == 2 else -1
     if bt.dim() != 2 or bt.shape[0] != NUM_REQS or not _integral(bt):
@@ -424,6 +412,136 @@ def validate_decode_inputs(inp: dict) -> None:
                 f"fixture seq_lens must be exactly TOPK * BLOCK = "
                 f"{TOPK * BLOCK}, got [{int(seq.min())}, {int(seq.max())}]"
             )
+    return max_blocks if max_blocks > 0 else 0
+
+
+# ---------------------------------------------------------------------------
+# Case 4 (full decode step through the overlay's public wrappers): the W1
+# new-token write into the q4 pool plus the R2 read of the same pool, on
+# the case-2 history pages.
+# ---------------------------------------------------------------------------
+
+# The new token of request r lands at pool page r (its own top-k's first
+# entry), token offset BLOCK-1. The R2 leg's causal mask (seq_lens pinned
+# to TOPK*BLOCK) and top-k selection both cover it, so the captured
+# step's output and pool bytes depend on the W1 write -- the anti-vacuous
+# invariant pinned by the validator below.
+_STEP_W1_SEED = 31
+
+
+def decode_step_inputs() -> dict:
+    """Every case-4 input: the case-2 history pool/selection plus the
+    batch's new-token W1 inputs, built on CPU (the harness moves them)."""
+    hist = decode_inputs()
+    n = NUM_REQS
+    width = (NQ + 2 * NKV + NIQ + 1) * 128
+    qkv = _rand((n, width), _STEP_W1_SEED, 0.5, torch.bfloat16)
+    norm_ws = {
+        name: _rand((128,), _STEP_W1_SEED + 1 + i)
+        for i, name in enumerate(("q", "k", "iq", "ik"))
+    }
+    # One new token per request, at that request's own sequence position
+    # (seq_lens is pinned to TOPK*BLOCK, so the position is the last
+    # causally readable token of the selection).
+    positions = torch.full((n,), TOPK * BLOCK - 1, dtype=torch.int64)
+    cos_sin = build_cos_sin_cache(TOPK * BLOCK)
+    slot_mapping = (
+        torch.arange(n, dtype=torch.int64) * BLOCK + (BLOCK - 1)
+    )
+    index_slot_mapping = slot_mapping.clone()
+    q_out = torch.empty((n, NQ, 128), dtype=torch.bfloat16)
+    index_q_out = torch.empty((n, NIQ, 128), dtype=torch.float8_e4m3fn)
+    index_cache = torch.zeros((n, BLOCK, 128), dtype=torch.float8_e4m3fn)
+    return dict(
+        qkv=qkv, norm_ws=norm_ws, positions=positions, cos_sin=cos_sin,
+        slot_mapping=slot_mapping, index_slot_mapping=index_slot_mapping,
+        pool=hist["pool"], index_cache=index_cache, q_out=q_out,
+        index_q_out=index_q_out, block_table=hist["block_table"],
+        topk=hist["topk"], seq_lens=hist["seq_lens"],
+        sm_scale=hist["sm_scale"],
+    )
+
+
+def validate_decode_step_inputs(inp: dict) -> None:
+    """Fail closed on any shape/range inconsistency in the case-4 step
+    inputs, and pin the anti-vacuous invariant: every request's new
+    token must be causally READ by that request's own R2 leg (page within
+    its top-k selection, under the n_blocks mask, at a position the
+    causal mask covers), otherwise the captured step's output would not
+    depend on the W1 write and the replay comparison would be vacuous."""
+    errors: list[str] = []
+    n = inp["qkv"].shape[0]
+    if n != NUM_REQS:
+        errors.append(
+            f"the decode step writes one new token per request: qkv must "
+            f"carry {NUM_REQS} tokens, got {n}"
+        )
+    _validate_w1_surface(inp, errors, n)
+    _validate_decode_selection(inp, errors)
+    sm_scale = inp["sm_scale"]
+    if not (sm_scale > 0 and math.isfinite(sm_scale)):
+        errors.append(f"sm_scale must be positive and finite, got {sm_scale}")
+    # The anti-vacuous coverage invariant (see above).
+    sm = inp["slot_mapping"]
+    topk = inp["topk"]
+    seq = inp["seq_lens"]
+    if (
+        not errors
+        and sm.shape == (n,)
+        and topk.shape == (NKV, n, TOPK)
+        and seq.shape == (n,)
+    ):
+        for r in range(n):
+            page = int(sm[r]) // BLOCK
+            sel = {int(v) for v in topk[:, r, :].reshape(-1)}
+            n_blocks = min(
+                TOPK, -(-int(seq[r]) // BLOCK)
+            )  # the kernel's real_topk mask
+            if (
+                int(sm[r]) < 0
+                or int(sm[r]) >= int(seq[r])
+                or page not in sel
+                or page >= n_blocks
+            ):
+                errors.append(
+                    f"decode step request {r}: its new token (slot "
+                    f"{int(sm[r])}, page {page}) is not causally covered by "
+                    f"its own top-k selection under the kernel's n_blocks "
+                    f"mask ({n_blocks}) -- the replay comparison would be "
+                    f"vacuous"
+                )
+                break
+    if errors:
+        raise ValueError(
+            "q4 KV harness decode-step input data inconsistent (fix the "
+            "harness data, not the kernel): " + "; ".join(errors)
+        )
+
+
+def validate_decode_inputs(inp: dict) -> None:
+    """Fail closed on any shape/range inconsistency in the R2 fixture."""
+    errors: list[str] = []
+    q = inp["q"]
+    if q.shape != (NUM_REQS, NQ, 128) or q.dtype != torch.bfloat16:
+        errors.append(
+            f"q must be [{NUM_REQS}, {NQ}, 128] bfloat16, got "
+            f"{tuple(q.shape)} {q.dtype}"
+        )
+    pool = inp["pool"]
+    if (
+        pool.shape != (NUM_PAGES, 2 * NKV, BLOCK, 72)
+        or pool.dtype != torch.uint8
+    ):
+        errors.append(
+            f"pool must be [{NUM_PAGES}, {2 * NKV}, {BLOCK}, 72] uint8, got "
+            f"{tuple(pool.shape)} {pool.dtype}"
+        )
+    elif (
+        pool.stride(2) != 72 or pool.stride(1) != 9216 or pool.stride(3) != 1
+    ):
+        errors.append("pool slot regions must be contiguous")
+    _validate_vendor_kv_pools(inp, NUM_PAGES, errors)
+    _validate_decode_selection(inp, errors)
     sm_scale = inp["sm_scale"]
     if not (sm_scale > 0 and math.isfinite(sm_scale)):
         errors.append(f"sm_scale must be positive and finite, got {sm_scale}")

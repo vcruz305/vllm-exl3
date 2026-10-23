@@ -905,3 +905,157 @@ staging path (the overlay's staged bf16 invocation is the same code
 path and ran in val7, but the direct bf16-pool leg has never executed),
 the vendor decode kernel's behavior on a bf16 pool (never executed
 anywhere), and the end-to-end serve.
+
+## Post-boot20 fix: capture-safe serve hooks (this commit)
+
+The first real 32K serve with `VLLM_EXL3_Q4KV=1 --kv-cache-dtype
+nvfp4` and `cudagraph_mode=FULL_DECODE_ONLY` (receipts/boot20) got past
+init, KV allocation (33,408 tokens) and the profiling forward, then
+died inside CUDA-graph capture: the W1 wrapper's unit-scale check did
+`float(scale.reshape(-1)[0].item())` — a host sync — under capture.
+
+**The vLLM evidence the fix is built on (file:line, vllm-image):**
+
+- Capture is DECODE-only under this mode: `CUDAGraphMode
+  .FULL_DECODE_ONLY = (FULL, NONE)` with `decode_mode()=FULL` and
+  `mixed_mode()=NONE` (`config/compilation.py:62,65-67,96`), and the
+  capture set is built from decode descriptors only
+  (`v1/worker/gpu/cudagraph_utils.py:264-266,302-343`) — prefill and
+  mixed batches run EAGER (mode NONE).
+- Every captured forward runs EAGERLY first: `create_forward_fn(desc,
+  warmup=True)` then `forward_fn(CUDAGraphMode.NONE)` at
+  `cudagraph_utils.py:464-467`, BEFORE `torch.cuda.graph` at :498-503.
+  The production scale tensors are persistent per-layer attributes, so
+  the warm-up pass always validates them before any capture.
+
+**Fix (src/vllm_exl3/minimax_q4kv.py):**
+
+1. `_assert_unit_scale` no longer reads a scale value on any captured
+   path. The verdict is validated ONCE, eagerly, and cached as
+   `(device, data_ptr, version counter) -> weakref` to the EXACT tensor
+   object; the same object seen inside a captured step is approved with
+   no read. The weakref (not the address) is the approval: the
+   allocator reuses freed addresses, so an address key alone could
+   approve a different tensor; a dead weakref is never an approval. A
+   scale FIRST seen while `torch.cuda.is_current_stream_capturing()` is
+   True fails closed with a RuntimeError that names the warm-up evidence
+   — unreachable in vLLM by construction (see above), so hitting it
+   means an unvalidated scale reached the captured path.
+2. New `_py_scalar` gate: every scalar slot a wrapper would coerce with
+   `bool()`/`int()`/`float()` (W1: write_qkv, skip_index_branch, eps,
+   num_heads, num_kv_heads, rotary_dim, num_index_heads, block_size;
+   decode: num_kv_heads, sm_scale, decode_query_len; prefill: the same)
+   now refuses a torch.Tensor with a named TypeError instead of
+   coercing (coercion is a host sync). Production passes Python scalars,
+   so only the sync class is refused.
+
+**Grep-audit of every remaining host-sync site in serve-reachable code
+(verdict per site):**
+
+- `minimax_q4kv.py:179` `_assert_unit_scale` `.item()` — FIXED: the
+  read executes only on the eager (never-captured) path — a captured
+  step hits the cached verdict first and returns without reading, and a
+  scale first seen under capture raises before reaching it (see above).
+- `minimax_q4kv.py:630-631` prefill wrapper `.tolist()` of
+  cu_seqlens_q / prefix_lens slice metadata — SAFE, never captured: prefill/mixed
+  batches run under the FULL_DECODE_ONLY mixed mode NONE
+  (`config/compilation.py:65-67` with `:62`; decode-only descriptor
+  construction `cudagraph_utils.py:264-266,302-343`). Pinned by
+  docstring citation + tests.
+- `minimax_q4kv_reference.py` `.item()`/`.tolist()`/`nonzero` — NOT on
+  the captured path: the packer read at :526 is in `reference_w1_write`
+  (CPU reference builder, harness-only); :1029/:1046 are in
+  `plan_prefill_slices` (prefill-only — never captured, see above);
+  :1228-1230/:1244 are in `reference_prefill_attention` and :1293 in
+  `reference_sparse_attention` (CPU oracles, harness-only).
+- `minimax_q4kv_kernels.py` wrappers — no value reads at all: the
+  device gates and `_off_device` inspect `.device` only; geometry
+  checks inspect dtype/shape/stride only; `torch.empty` for the split-K
+  partials is an ALLOCATION, not a host sync, and PyTorch's caching
+  allocator explicitly supports allocation inside capture (the graph's
+  private pool — the same mechanism every vLLM kernel workspace uses
+  under FULL mode); the merge-kernel import inside `q4_sparse_decode`
+  is Python module machinery that the eager warm-up pass (above) has
+  already cached in `sys.modules` before any capture.
+- `_is_q4_pool` / `_q4_pool_bytes` — metadata only (dtype/shape/
+  stride/dtype-size); no values. Verified by reading, pinned by the
+  capture-simulation test.
+- `_route_q4` / the selector wrapper — model-init time only; no
+  capture can reach it (selection happens once, at attention-backend
+  construction, long before any forward).
+
+**Harness case 4 rewritten to the FULL decode step (the boot20
+regression gate).** `tools/gb10_q4kv_parity.py` no longer captures the
+bare R2 kernel:
+`unit_4` now captures one complete decode step through the overlay's
+PUBLIC wrappers — the W1 wrapper writes the batch's new tokens into the
+q4 pool, then the decode wrapper reads the pool (including those
+tokens) through R2 — with the production unit-scale tensors on the
+device. The wrappers are built by `_overlay_wrappers()` exactly as
+`install()` builds them (`_make_hook_wrapper`, originals preserved and
+asserted) without patching any module attribute, so the other units'
+originals stay pristine. Static-buffer rules with a two-stage gate:
+(a) after the pristine bytes are restored, the replay must reproduce
+the eager pass bit-identically in EVERY buffer the step writes
+(output, pool, q_out, index_q_out, index_cache, qkv); (b) after NEW
+bytes are copied into BOTH static input buffers (fresh new-token qkv
+rows AND rotated history pages), the replay must reproduce the eager
+pass on those bytes, and the mutation must be live. Any host sync in
+either wrapper aborts the capture itself (the boot20 crash class) and
+fails the unit with the CUDA error. New fixture
+`decode_step_inputs()`/`validate_decode_step_inputs()`
+(tools/q4kv_harness_inputs.py): the case-2 history pool plus the
+batch's new-token W1 inputs, with an anti-vacuous coverage invariant —
+every request's new token must be causally readable by its own R2 leg
+(page inside its top-k, under the n_blocks mask, position under the
+causal mask) or the validator refuses the fixture.
+
+**CPU dry run:** new unit `dry/7-decode-step-structure` (10/10 units
+PASS on this VPS): every vacuity mutation of the step fixture fails
+closed; the one mover puts every step tensor on the simulated target
+with shapes/dtypes preserved; the output buffer and the unit scales
+are allocated ON the target; and source pins prove the launch reaches
+the kernels ONLY through the overlay wrappers, the unit restores the
+static buffers before every replay and compares every written buffer,
+and the overlay's capture-safety pins (cached verdict, fail-closed
+under capture, scalar gates) are in place.
+
+**Tests (red venv):** 7 new (68/68 green in
+`tests/test_minimax_q4kv.py`). The capture simulation (the task's CPU
+proof): `torch.cuda.is_current_stream_capturing` monkeypatched to True
+and a `_NoSyncTensor` subclass whose `.item()/.tolist()/.cpu()/
+__bool__/__float__/__int__` raise while armed; both wrappers' Python
+logic is driven to the (stubbed) kernel launch on the simulated
+captured step with NO host sync — the eager warm-up validates the
+scale object first (disarmed), the captured replay of the SAME object
+is approved with no read, and a scale first seen under capture fails
+closed launching nothing. Also pinned: the cache binds to the exact
+object (a different tensor is never approved), non-unit scales are
+still refused eagerly, every scalar-slot tensor coercion is refused by
+name, the step fixture's coverage invariant holds and every mutation
+fails closed, and the overlay source carries the vLLM capture
+evidence citations. Full suite: **639 passed, 39 skipped, the same 8
+pre-existing failures** (test_compact_safetensors*.py,
+test_compact_source_verification_window.py) — failure set identical to
+the baseline.
+
+**Exact GB10 command (parent executes; unchanged mount):**
+
+```
+docker run <minimax-m3.1-flash vllm image, vLLM 0.1.dev23341+g8744dd2fb> \
+  -v <this worktree>:/plugin:ro -v <receipts dir>:/receipts \
+  -w /plugin -e PYTHONPATH=/plugin/src \
+  python3 tools/gb10_q4kv_parity.py --json /receipts/val9/q4kv.json
+```
+
+Unit 4 must now report that the full decode step (W1 write + R2 read)
+captures cleanly and replays bit-identically on both stages; units
+0/1/2/3/5 must keep their val8 numerics. The next real 32K serve boot
+must get PAST the CUDA-graph capture that killed boot20.
+
+Unverified on this VPS (no GPU, no triton, no vLLM install): the actual
+sm_121 execution of the captured step (the W1/R2 kernels inside a real
+CUDA graph), whether the production scale tensors are the same object
+across warm-up and capture on GB10 (pinned from the vllm-image source:
+per-layer attributes set once by `set_default_quant_scales`, but
+observed only at a real boot), and the end-to-end serve.

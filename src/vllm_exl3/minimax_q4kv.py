@@ -32,6 +32,38 @@ draft pool stay fp8 and are untouched):
 All wrappers fail closed: they raise on any unsupported combination rather
 than silently miscomputing.
 
+CUDA-graph capture safety (the boot20 fix and audit): vLLM serves decode
+under FULL_DECODE_ONLY CUDA graphs, which capture DECODE steps only --
+``CUDAGraphMode.FULL_DECODE_ONLY = (FULL, NONE)`` maps decode batches to
+FULL and every mixed/prefill batch to NONE/eager
+(vllm/config/compilation.py:62,65-67,96), and the capture set is built
+from decode descriptors only (vllm/v1/worker/gpu/cudagraph_utils.py:
+264-266,302-343). Every captured forward is first run EAGERLY as a
+warm-up pass -- ``create_forward_fn(desc, warmup=True)`` then
+``forward_fn(CUDAGraphMode.NONE)`` at cudagraph_utils.py:464-467, before
+``torch.cuda.graph`` at :498-503 -- so anything the captured step touches
+is exercised eagerly first. The q4 hooks are therefore capture-safe by
+construction:
+
+- No hook reads a tensor VALUE on the decode path. Pool detection
+  (``_is_q4_pool``), the byte re-view (``_q4_pool_bytes``), the device
+  gates and every geometry check inspect metadata only
+  (device/dtype/shape/stride); the Triton launches take their grids and
+  scalar arguments from shapes and Python scalars.
+- The unit-scale gate (``_assert_unit_scale``) validates each scale
+  tensor ONCE eagerly and caches the verdict against the exact tensor
+  object; the same object seen inside a captured step is approved with
+  no read, and a scale first seen while capturing fails closed (see the
+  function docstring for the vLLM warm-up evidence).
+- Every scalar argument that a wrapper would coerce with
+  ``bool``/``int``/``float`` is gated by ``_py_scalar``: a tensor in one
+  of those slots is refused (coercion is a host sync) instead of
+  converted.
+- The prefill wrapper's ``.tolist()`` slice metadata
+  (``cu_seqlens_q``/``prefix_lens``) is never captured: prefill batches
+  run under the FULL_DECODE_ONLY mixed mode NONE (eager), per the mode
+  mapping cited above.
+
 Binding audit (why ``install`` patches module ATTRIBUTES on every importer):
 upstream modules import the hooks BY VALUE (``from ... import hook``), so
 patching only the defining module's attribute never reaches an importer that
@@ -47,7 +79,9 @@ binding sites are enumerated in ``_REQUIRED_BINDING_SITES`` /
 from __future__ import annotations
 
 import logging
+import weakref
 from dataclasses import replace
+from typing import Any
 
 import torch
 
@@ -75,21 +109,103 @@ def _is_q4_pool(t: object) -> bool:
     )
 
 
+def _stream_is_capturing() -> bool:
+    """True iff the current CUDA stream is capturing a CUDA graph.
+
+    The probe is inert (False) wherever the CUDA API is unavailable --
+    e.g. the CPU-only test suite, where torch raises on the call: there
+    is no stream to capture there, so nothing is ever "capturing".
+    """
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except Exception:  # noqa: BLE001 - probe only, never a data path
+        return False
+
+
+# Verdicts of the unit-scale gate below: (device, data_ptr, version
+# counter) -> weak reference to the EXACT tensor object whose value was
+# checked. Keying on the address alone would be unsound (the allocator
+# reuses freed addresses); the weakref binds approval to the live object,
+# and a dead weakref is never an approval.
+_VALIDATED_SCALES: dict = {}
+
+
 def _assert_unit_scale(name: str, scale: object) -> None:
+    """Unit-global-scale gate, capture-safe (the boot20 fix).
+
+    Milestone 1 serves the unit global scale only. Reading the scale's
+    VALUE (``.item()``) is a host sync, and CUDA forbids host syncs while
+    a stream is capturing -- the real 32K serve died exactly there
+    (``float(scale.reshape(-1)[0].item())`` inside CUDA-graph capture,
+    minimax_q4kv.py's W1 wrapper -> cudagraph_utils.py:502). The verdict
+    is therefore validated ONCE, eagerly, and cached against the exact
+    tensor object; the same object seen again -- including inside a
+    captured decode step -- is approved without any read. vLLM always
+    runs every captured forward eagerly first (the warm-up pass:
+    vllm/v1/worker/gpu/cudagraph_utils.py:464-467 invokes
+    ``create_forward_fn(desc, warmup=True)`` and runs it under
+    CUDAGraphMode.NONE BEFORE ``torch.cuda.graph`` at :498-503), and the
+    production scale tensors are persistent per-layer attributes, so the
+    eager warm-up always validates them before any capture. A scale
+    FIRST seen while capturing is unreachable in vLLM by construction;
+    hitting it means an unvalidated scale reached the captured path, and
+    the gate fails closed instead of syncing (which would abort the
+    capture) or skipping (which would silently drop the check).
+    """
     if scale is None:
         return
     if isinstance(scale, torch.Tensor):
-        if scale.numel() != 1 or float(scale.reshape(-1)[0].item()) != 1.0:
+        if scale.numel() != 1:
+            raise ValueError(
+                f"q4 KV milestone 1 implements the unit global scale only; "
+                f"{name} must be None or a 1-element unit tensor"
+            )
+        key = (str(scale.device), scale.data_ptr(), scale._version)
+        entry = _VALIDATED_SCALES.get(key)
+        if entry is not None and entry() is scale:
+            return  # this exact object was validated eagerly before
+        if entry is not None and entry() is None:
+            del _VALIDATED_SCALES[key]  # dead entry; never an approval
+        if _stream_is_capturing():
+            raise RuntimeError(
+                f"q4 KV unit-scale gate: {name} was never validated in an "
+                "eager forward and is first seen while a CUDA graph is "
+                "capturing; a host sync here aborts the capture. vLLM "
+                "always warm-up-runs every captured step eagerly first "
+                "(cudagraph_utils.py:464-467), so a cache miss under "
+                "capture means an unvalidated scale reached the captured "
+                "path -- refusing."
+            )
+        if float(scale.reshape(-1)[0].item()) != 1.0:
             raise ValueError(
                 f"q4 KV milestone 1 implements the unit global scale only; "
                 f"{name} must be None or 1.0"
             )
+        _VALIDATED_SCALES[key] = weakref.ref(scale)
         return
-    if scale != 1.0:
+    if not isinstance(scale, (bool, int, float)) or scale != 1.0:
         raise ValueError(
             f"q4 KV milestone 1 implements the unit global scale only; "
-            f"{name} must be None or 1.0, got {scale}"
+            f"{name} must be None or 1.0, got {scale!r}"
         )
+
+
+def _py_scalar(name: str, value: object, *types: type) -> Any:
+    """Fail closed unless a scalar argument is a plain Python number.
+
+    ``bool``/``int``/``float`` on a torch.Tensor is a host sync, which
+    CUDA forbids under graph capture: a tensor in one of these slots must
+    be refused, never coerced. The vendor op's signature carries these as
+    Python scalars, so the check only rejects what would sync.
+    """
+    if isinstance(value, types) and not isinstance(value, torch.Tensor):
+        return value
+    raise TypeError(
+        f"q4 KV refused: {name} must be a plain Python "
+        f"{' or '.join(t.__name__ for t in types)}, got "
+        f"{type(value).__name__} (coercing it would host-sync, which is "
+        "forbidden during CUDA-graph capture)"
+    )
 
 
 def _q4_pool_bytes(pool: torch.Tensor) -> torch.Tensor:
@@ -286,16 +402,26 @@ def _make_w1_wrapper(original):
             )
         if bound.get("q_fp8_out") is not None:
             raise ValueError("the q4 overlay does not serve fp8 queries")
-        if not bound.get("write_qkv", True):
+        if not _py_scalar(
+            "write_qkv", bound.get("write_qkv", True), bool
+        ):
             raise ValueError("the q4 overlay requires write_qkv=True")
         q_out = bound.get("q_out")
         if q_out is None:
             raise ValueError("the q4 overlay requires a bf16 q_out buffer")
         _assert_unit_scale("kv_k_scale", bound.get("kv_k_scale"))
         _assert_unit_scale("kv_v_scale", bound.get("kv_v_scale"))
-        if pool.shape[1] != 2 * int(bound["num_kv_heads"]):
+        num_heads = _py_scalar("num_heads", bound["num_heads"], int)
+        num_kv_heads = _py_scalar(
+            "num_kv_heads", bound["num_kv_heads"], int
+        )
+        rotary_dim = _py_scalar("rotary_dim", bound["rotary_dim"], int)
+        eps = _py_scalar("eps", bound["eps"], int, float)
+        if pool.shape[1] != 2 * num_kv_heads:
             raise ValueError("q4 pool slot count mismatch")
-        skip_index = bool(bound.get("skip_index_branch", False))
+        skip_index = _py_scalar(
+            "skip_index_branch", bound.get("skip_index_branch", False), bool
+        )
         if skip_index and (
             bound.get("index_q_out") is not None
             or bound.get("index_cache") is not None
@@ -303,7 +429,11 @@ def _make_w1_wrapper(original):
             raise ValueError(
                 "skip_index_branch with index outputs is not supported"
             )
-        num_index_heads = 0 if skip_index else int(bound["num_index_heads"])
+        num_index_heads = (
+            0 if skip_index else _py_scalar(
+                "num_index_heads", bound["num_index_heads"], int
+            )
+        )
         index_q_out = None if skip_index else bound.get("index_q_out")
         index_cache = None if skip_index else bound.get("index_cache")
         from vllm_exl3 import minimax_q4kv_kernels as kernels
@@ -314,10 +444,10 @@ def _make_w1_wrapper(original):
             bound["k_norm_weight"],
             bound["cos_sin_cache"],
             bound["positions"],
-            int(bound["num_heads"]),
-            int(bound["num_kv_heads"]),
-            int(bound["rotary_dim"]),
-            float(bound["eps"]),
+            num_heads,
+            num_kv_heads,
+            rotary_dim,
+            float(eps),
             None if skip_index else bound.get("index_q_norm_weight"),
             None if skip_index else bound.get("index_k_norm_weight"),
             num_index_heads,
@@ -325,7 +455,7 @@ def _make_w1_wrapper(original):
             bound.get("index_slot_mapping"),
             pool,
             index_cache,
-            int(bound.get("block_size", 0)),
+            _py_scalar("block_size", bound.get("block_size", 0), int),
             q_out,
             index_q_out,
         )
@@ -369,6 +499,11 @@ def _make_decode_wrapper(original):
         kv_cache = _q4_pool_bytes(kv_cache)
         _assert_unit_scale("k_scale", k_scale)
         _assert_unit_scale("v_scale", v_scale)
+        num_kv_heads = _py_scalar("num_kv_heads", num_kv_heads, int)
+        sm_scale = _py_scalar("sm_scale", sm_scale, int, float)
+        decode_query_len = _py_scalar(
+            "decode_query_len", decode_query_len, int
+        )
         from vllm_exl3 import minimax_q4kv_kernels as kernels
 
         kernels.q4_sparse_decode(
@@ -421,6 +556,14 @@ def _make_prefill_wrapper(original):
         kv_cache = _q4_pool_bytes(kv_cache)
         _assert_unit_scale("k_scale", k_scale)
         _assert_unit_scale("v_scale", v_scale)
+        # The prefill wrapper is never captured under FULL_DECODE_ONLY
+        # (see the module docstring), but the scalar slots get the same
+        # fail-closed gate so a tensor can never reach a coercion.
+        num_kv_heads = _py_scalar("num_kv_heads", num_kv_heads, int)
+        sm_scale = _py_scalar("sm_scale", sm_scale, int, float)
+        max_query_len = _py_scalar(
+            "max_query_len", max_query_len, int
+        )
         # Fail-closed device gate, exactly as the W1/R2 kernel wrappers:
         # the boot18 crash class is a CPU tensor reaching the serve path
         # (there it was the dequant scale-offset table; the gate must
