@@ -22,6 +22,26 @@ import vllm_exl3.exl3 as exl3
 
 REPO = Path(__file__).resolve().parents[1]
 
+# The lab box's pack directory carries the census/dspark fixtures these
+# tests cross-check against. Other hosts (CI) cannot read it -- /root is not
+# even statable there -- so the location is overridable and an unreachable
+# path counts as absent instead of raising PermissionError from stat().
+PACK_DIR = Path(
+    os.environ.get("VLLM_EXL3_MINIMAX_PACK_DIR", "/root/work/minimax-m31/pack")
+)
+
+
+def _pack_file_readable(name):
+    """True when the pack fixture exists and is statable.
+
+    stat() under an unreadable /root raises PermissionError on hosts that
+    cannot see the lab box's tree (CI), which must count as absent.
+    """
+    try:
+        return (PACK_DIR / name).is_file()
+    except OSError:
+        return False
+
 # ── GPU parity tool: the CPU self-test must pass as a subprocess ────────────
 
 
@@ -209,10 +229,9 @@ def test_case_e_constants_and_fixture_are_pinned():
         assert w["dtype"] == "F8_E4M3" and w["shape"] == [out_f, 6144]
         assert s["dtype"] == "U8" and s["shape"] == [out_f, 192]
     # The fixture must be byte-identical to the parent's census when the
-    # census is on this box.
-    census_path = Path("/root/work/minimax-m31/pack/census_tensors.json")
-    if census_path.is_file():
-        census = json.loads(census_path.read_text())
+    # census is readable on this host.
+    if _pack_file_readable("census_tensors.json"):
+        census = json.loads((PACK_DIR / "census_tensors.json").read_text())
         for name, ent in tensors.items():
             assert census[name] == ent, name
 
@@ -579,10 +598,9 @@ def test_plugin_karrays_carry_the_true_bit_width():
 
 def _dspark_quant_card():
     """The exact quantization_config of pack/dspark/config.json."""
-    path = Path("/root/work/minimax-m31/pack/dspark_config.json")
-    if not path.is_file():
-        pytest.skip("pack/dspark_config.json not on this box")
-    with open(path, encoding="utf-8") as fh:
+    if not _pack_file_readable("dspark_config.json"):
+        pytest.skip("pack/dspark_config.json not readable on this host")
+    with open(PACK_DIR / "dspark_config.json", encoding="utf-8") as fh:
         return json.load(fh)["quantization_config"]
 
 
