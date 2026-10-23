@@ -8,6 +8,13 @@ worktree bind-mounted at /plugin and PYTHONPATH=/plugin/src:
           built exactly as the loader leaves it -- resolves the MiniMax-M3
           act-3 (swiglu_oai) COOP kernel and matches a per-expert
           exl3_gemv reference with clamped SwiGLU-OAI, at K in {2, 3};
+          the prefill-family probe (>256 slots) takes the expert-batched
+          exl3_moe path and must match the same reference there;
+  Case A2 the MIXED-K paths the real pack's serve actually runs: the three
+          per-expert (K_gate, K_up, K_down) tuples of the pack's layer-3
+          census, through the default unified exl3_moe_mixedk dispatch and
+          the VLLM_EXL3_MIXEDK_MODE=grouped per-K-group dispatch, at decode
+          and prefill sizes; every inner path must stamp its own label;
   Case B  the fused [q | k | v | index_q | index_k] linear: q/k/v EXL3
           trellis GEMMs plus the two MXFP8 indexer shards dequantized at
           load into BF16 side rows, sliced at the branch offsets, matching
@@ -29,6 +36,13 @@ worktree bind-mounted at /plugin and PYTHONPATH=/plugin/src:
           range-read from the Hub by authenticated HTTP with a token from
           --hf-token-file, run through the same fused layer, each slice
           compared against a definitional per-tensor dequant reference.
+  Case F  REAL pack routed experts: three layer-3 experts -- one per
+          (K_gate, K_up, K_down) tuple of the pack's census -- range-read
+          from the Hub, run router-free (each row forced onto one expert)
+          through the plugin's MoE apply at m in {1, 96}, i.e. exactly the
+          mixed-K batched dispatch the serve takes for this pack at EVERY
+          batch shape, against a definitional mul1-dequant + act-3
+          reference per projection.
 
 ``--cpu-selftest`` runs everything that needs no kernel launch (Case C in
 full, the pack/reference construction of A/B/D, the entry-point act
@@ -90,6 +104,23 @@ E_REVISION = "687cbff2c210b7514d18c5f6a4d1db3417b316c4"
 E_SHARD = "model-00001-of-00016.safetensors"
 E_TOKEN_FILE = "/run/hf_token"
 E_MS = (1, 64)
+
+# Case A2 (mixed-K): the real pack's per-expert (K_gate, K_up, K_down)
+# tuples -- layer 3 of the census, w1->gate / w3->up / w2->down -- with two
+# synthetic experts per tuple, at the decode and prefill batch sizes the
+# serve runs. Mixed-K layers never take the coop kernel (compat is False
+# whenever the K groups are distinct), so both sizes exercise the batched
+# mixed-K dispatch.
+A_MIXED_TUPLES = ((2, 2, 2), (2, 2, 3), (3, 3, 3))
+A_MIXED_MS = (64, 512)
+
+# Case F (real pack routed experts): the layer-3 experts carrying the three
+# distinct K tuples (census ground truth: expert 2 -> (2,2,2), expert 0 ->
+# (2,2,3), expert 1 -> (3,3,3)), evaluated router-free at m in {1, 96}.
+F_LAYER = 3
+F_EXPERTS = (2, 0, 1)
+F_HIDDEN, F_INTER = 6144, 3072
+F_MS = (1, 96)
 
 
 def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -346,7 +377,162 @@ def _case_a_run(k: int, device: torch.device) -> dict[str, Any]:
             cos >= COS_MIN
             and cos_silu < COS_MIN
             and path == "coop"
+            and prefill_path == "batched"
             and prefill_cos >= COS_MIN
+        ),
+    }
+
+
+# ── Case A2: the mixed-K dispatch the real pack's serve takes ───────────────
+
+
+def _proj_k(pack: dict) -> int:
+    """A projection's true EXL3 K, from the trellis width itself (16*K)."""
+    return int(pack["trellis"].shape[-1]) // 16
+
+
+def _case_a_mixedk_layer(device: torch.device):
+    """Six synthetic experts in the real pack's mixed-K layout: two experts
+    per distinct (K_gate, K_up, K_down) tuple, real LinearEXL3 inners with
+    mul1 markers, and the loader's mixed-K fused state."""
+    inners = []
+    raw = []
+    tuples = []
+    for kt in A_MIXED_TUPLES:
+        for _ in range(2):
+            kg, ku, kd = kt
+            packs = {
+                "gate": _pack(A_HIDDEN, A_INTER, kg, device),
+                "up": _pack(A_HIDDEN, A_INTER, ku, device),
+                "down": _pack(A_INTER, A_HIDDEN, kd, device),
+            }
+            inner = {
+                p: exl3.make_linear_exl3(
+                    packs[p]["trellis"], packs[p]["suh"], packs[p]["svh"],
+                    None, _mul1_marker(device),
+                )
+                for p in ("gate", "up", "down")
+            }
+            inners.append(inner)
+            raw.append(packs)
+            tuples.append(kt)
+    # The synthetic packs must carry exactly the intended per-projection K
+    # (the trellis width is 16*K), and the inners must carry the mul1 marker.
+    for e, (kg, ku, kd) in enumerate(tuples):
+        assert _proj_k(raw[e]["gate"]) == kg
+        assert _proj_k(raw[e]["up"]) == ku
+        assert _proj_k(raw[e]["down"]) == kd
+        for p in ("gate", "up", "down"):
+            assert getattr(inners[e][p], "mcg", None) is False
+            assert getattr(inners[e][p], "mul1", None) is True
+    layer = _moe_layer(
+        "swigluoai_uninterleave",
+        swiglu_alpha=exl3.MINIMAX_SWIGLU_ALPHA_DEFAULT,
+        swiglu_beta=1.0,
+        swiglu_limit=exl3.MINIMAX_SWIGLU_LIMIT_DEFAULT,
+        _exl3_inners=inners,
+        _exl3_hidden_size=A_HIDDEN,
+        _exl3_intermediate_local=A_INTER,
+        _exl3_mixed_k=True,
+        w13_suh=torch.zeros(1, dtype=torch.float16, device=device),
+    )
+    layer._exl3_codebook_flags = _loader_codebook_flags(
+        [(False, True)] * 3
+    )
+    exl3.build_exl3_fused_state(layer, inners)
+    # The loader must have bucketed the experts into exactly the pack's
+    # three K groups (two experts each) and disabled coop compatibility.
+    assert [kt for kt, _ in layer._exl3_k_groups] == list(A_MIXED_TUPLES)
+    assert [len(ids) for _, ids in layer._exl3_k_groups] == [2, 2, 2]
+    assert layer._exl3_mixedk_unified is True
+    assert layer._exl3_coop_compat is False
+    return layer, raw, tuples
+
+
+def _case_a_mixedk_probe(
+    layer: Any,
+    method: Any,
+    raw: list[dict[str, Any]],
+    tuples: list[tuple[int, int, int]],
+    tokens: int,
+    device: torch.device,
+) -> tuple[str, float, float]:
+    """One router-free apply at `tokens` rows (round-robin over the six
+    experts so no expert reaches the fat threshold): the dispatch label and
+    the cosines against the per-projection-K act-3 and silu references."""
+    n_exp = len(raw)
+    x = torch.randn(tokens, A_HIDDEN, dtype=torch.float16, device=device) * 0.1
+    ids = (
+        torch.arange(tokens * TOPK, device=device) % n_exp
+    ).reshape(tokens, TOPK).long()
+    w_sel = torch.ones(tokens, TOPK, device=device)
+
+    out = method.apply(layer, x, w_sel, ids, None, None)
+    torch.cuda.synchronize()
+    path = getattr(layer, "_exl3_last_apply", "unknown")
+
+    limit = exl3.MINIMAX_SWIGLU_LIMIT_DEFAULT
+    acc = torch.zeros(tokens, A_HIDDEN, dtype=torch.float32, device=device)
+    acc_silu = torch.zeros_like(acc)
+    xh = x.half()
+    for e in range(n_exp):
+        rw = ((ids == e).to(w_sel.dtype) * w_sel).sum(dim=1, keepdim=True)
+        if rw.abs().max() == 0:
+            continue
+        kg, ku, kd = tuples[e]
+        g = _gemv_ref(xh, raw[e]["gate"], kg).float()
+        u = _gemv_ref(xh, raw[e]["up"], ku).float()
+        act = _oai(g, u, limit).half()
+        act_silu = (torch.nn.functional.silu(g.clamp(max=limit))
+                    * u.clamp(min=-limit, max=limit)).half()
+        d = _gemv_ref(act, raw[e]["down"], kd).float()
+        d_silu = _gemv_ref(act_silu, raw[e]["down"], kd).float()
+        acc += rw.float() * d
+        acc_silu += rw.float() * d_silu
+    return path, _cos(out, acc), _cos(out, acc_silu)
+
+
+def _case_a_mixedk_run(device: torch.device) -> dict[str, Any]:
+    """The mixed-K dispatch table the serve runs for the real pack:
+    default mode (unified exl3_moe_mixedk) and the explicit grouped mode,
+    each at a decode-size and a prefill-size batch."""
+    layer, raw, tuples = _case_a_mixedk_layer(device)
+    cfg = exl3.Exl3Config.__new__(exl3.Exl3Config)
+    method = exl3.Exl3MoEMethod(SimpleNamespace(), cfg, bits=3)
+    probes = []
+    try:
+        for mode in ("default", "grouped"):
+            if mode == "grouped":
+                os.environ["VLLM_EXL3_MIXEDK_MODE"] = "grouped"
+            else:
+                os.environ.pop("VLLM_EXL3_MIXEDK_MODE", None)
+            for tokens in A_MIXED_MS:
+                path, cos, cos_silu = _case_a_mixedk_probe(
+                    layer, method, raw, tuples, tokens, device
+                )
+                probes.append({
+                    "mode": mode,
+                    "tokens": tokens,
+                    "path": path,
+                    "cosine": round(cos, 6),
+                    "cosine_silu_reference": round(cos_silu, 6),
+                })
+    finally:
+        os.environ.pop("VLLM_EXL3_MIXEDK_MODE", None)
+    expected = {
+        ("default", 64): "mixedk_unified",
+        ("default", 512): "mixedk_unified",
+        ("grouped", 64): "mixedk_grouped",
+        ("grouped", 512): "mixedk_grouped",
+    }
+    return {
+        "tuples": [list(t) for t in A_MIXED_TUPLES],
+        "probes": probes,
+        "pass": all(
+            p["path"] == expected[(p["mode"], p["tokens"])]
+            and p["cosine"] >= COS_MIN
+            and p["cosine_silu_reference"] < COS_MIN
+            for p in probes
         ),
     }
 
@@ -798,11 +984,19 @@ E_FIXTURE = os.path.join(
 )
 
 
-def _fixture_entries() -> dict[str, Any]:
-    """The census digest of the 16 layer-0 tensors Case E reads (dtype,
-    shape, bytes, shard file) -- pinned so a Hub-side change cannot pass
-    silently."""
-    with open(E_FIXTURE, encoding="utf-8") as fh:
+F_FIXTURE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "tests",
+    "data",
+    "minimax_m3_layer3_real_experts.json",
+)
+
+
+def _fixture_entries(path: str = E_FIXTURE) -> dict[str, Any]:
+    """The pinned census digest of the real-pack tensors a case reads
+    (dtype, shape, bytes, shard file) -- pinned so a Hub-side change
+    cannot pass silently."""
+    with open(path, encoding="utf-8") as fh:
         return json.load(fh)
 
 
@@ -1021,6 +1215,154 @@ def _case_e(device: torch.device, token_file: str | None) -> dict[str, Any]:
         "offsets": list(B_OFFSETS),
         "pass": all(
             v >= COS_MIN for cos in per_m.values() for v in cos.values()
+        ),
+    }
+
+
+# ── Case F: real pack routed experts, mixed-K batched dispatch ──────────────
+
+
+def _case_f(device: torch.device, token_file: str | None) -> dict[str, Any]:
+    """Three REAL layer-3 routed experts -- one per (K_gate, K_up, K_down)
+    tuple of the pack's census -- evaluated router-free through the plugin's
+    production MoE entry point at m in {1, 96}. This is the exact mixed-K
+    batched dispatch the serve takes for this pack at EVERY batch shape
+    (mixed-K layers never qualify for the coop kernel), against a
+    definitional mul1-dequant + act-3 reference per projection."""
+    entries = _fixture_entries(F_FIXTURE)
+    if not token_file:
+        token_file = E_TOKEN_FILE
+    if not os.path.isfile(token_file):
+        return {
+            "skip": (
+                f"no HF token file at {token_file}; Case F (real pack "
+                "routed experts) needs --hf-token-file"
+            )
+        }
+    with open(token_file, encoding="utf-8") as fh:
+        token = fh.read().strip()
+    if not token:
+        return {"error": "empty HF token file", "pass": False}
+
+    data_base, header = _shard_header(token)
+    base = f"language_model.model.layers.{F_LAYER}.block_sparse_moe.experts"
+    # w1 -> gate, w3 -> up, w2 -> down (the loader's own projection map,
+    # ats_alias.py proj_of): (in_features, out_features) per checkpoint slot.
+    proj_of = {"gate": ("w1", F_HIDDEN, F_INTER), "up": ("w3", F_HIDDEN, F_INTER),
+               "down": ("w2", F_INTER, F_HIDDEN)}
+
+    def fetch(name: str) -> torch.Tensor:
+        ent = entries[name]
+        hdr = header.get(name)
+        if hdr is None:
+            raise RuntimeError(f"{name} is not in the shard header")
+        if hdr.get("dtype") != ent["dtype"]:
+            raise RuntimeError(
+                f"{name}: header dtype {hdr.get('dtype')} != census "
+                f"{ent['dtype']}"
+            )
+        if list(hdr.get("shape", [])) != list(ent["shape"]):
+            raise RuntimeError(
+                f"{name}: header shape {hdr.get('shape')} != census "
+                f"{ent['shape']}"
+            )
+        b, e = hdr["data_offsets"]
+        if e - b != ent["bytes"]:
+            raise RuntimeError(
+                f"{name}: header span {e - b} != census {ent['bytes']} bytes"
+            )
+        raw = _hf_range(token, data_base + b, e - b)
+        u8 = torch.frombuffer(bytearray(raw), dtype=torch.uint8).to(device)
+        return exl3.coerce_checkpoint_region(
+            u8, _TORCH_DTYPES[ent["dtype"]], ent["shape"]
+        )
+
+    inners = []
+    ks = []
+    for e in F_EXPERTS:
+        inner = {}
+        tup = []
+        for p, (w, in_f, out_f) in proj_of.items():
+            trellis = fetch(f"{base}.{e}.{w}.trellis")
+            suh = fetch(f"{base}.{e}.{w}.suh")
+            svh = fetch(f"{base}.{e}.{w}.svh")
+            marker = fetch(f"{base}.{e}.{w}.mul1")
+            if int(marker.reshape(-1)[0].item()) != exl3.MUL1_MARKER_SIGNED_INT32:
+                raise RuntimeError(
+                    f"expert {e} {w}.mul1 marker is not the loader's mul1 int32"
+                )
+            # The loader's own geometry gate BEFORE any LinearEXL3
+            # construction (run 3 died inside LinearEXL3 on a flat region).
+            tup.append(exl3.assert_exl3_trellis_3d(trellis, in_f, out_f))
+            inner[p] = exl3.make_linear_exl3(
+                trellis, suh, svh, None, marker.reshape(1)
+            )
+        # (K_gate, K_up, K_down) == (w1, w3, w2) Ks, in proj_of order.
+        ks.append((tup[0], tup[1], tup[2]))
+        inners.append(inner)
+    if ks != [(2, 2, 2), (2, 2, 3), (3, 3, 3)]:
+        raise RuntimeError(f"layer-{F_LAYER} expert K tuples are {ks}")
+
+    layer = _moe_layer(
+        "swigluoai_uninterleave",
+        swiglu_alpha=exl3.MINIMAX_SWIGLU_ALPHA_DEFAULT,
+        swiglu_beta=1.0,
+        swiglu_limit=exl3.MINIMAX_SWIGLU_LIMIT_DEFAULT,
+        _exl3_inners=inners,
+        _exl3_hidden_size=F_HIDDEN,
+        _exl3_intermediate_local=F_INTER,
+        _exl3_mixed_k=True,
+        w13_suh=torch.zeros(1, dtype=torch.float16, device=device),
+    )
+    layer._exl3_codebook_flags = _loader_codebook_flags(
+        [(False, True)] * 3
+    )
+    exl3.build_exl3_fused_state(layer, inners)
+    assert [kt for kt, _ in layer._exl3_k_groups] == [
+        (2, 2, 2), (2, 2, 3), (3, 3, 3)
+    ]
+    assert layer._exl3_coop_compat is False
+    cfg = exl3.Exl3Config.__new__(exl3.Exl3Config)
+    method = exl3.Exl3MoEMethod(SimpleNamespace(), cfg, bits=3)
+
+    # Definitional reference per projection: the transformed-basis decode
+    # with the shard's own mul1 codebook + the identical Hadamard/scale
+    # pipeline + an fp32 GEMM (per-projection K comes from the trellis
+    # width inside _exl3_definitional_ref).
+    x = torch.randn(max(F_MS), F_HIDDEN, dtype=torch.float16, device=device) * 0.1
+    refs = []
+    for e, inner in enumerate(inners):
+        g = _exl3_definitional_ref(x, inner["gate"])
+        u = _exl3_definitional_ref(x, inner["up"])
+        act = _oai(g, u, exl3.MINIMAX_SWIGLU_LIMIT_DEFAULT).half()
+        d = _exl3_definitional_ref(act, inner["down"])
+        refs.append(d)
+        del g, u, act
+    torch.cuda.empty_cache()
+
+    per_m = {}
+    for m in F_MS:
+        slices = {}
+        paths = []
+        for e, eid in enumerate(F_EXPERTS):
+            # Router-free DIRECT expert evaluation: every row of this apply
+            # is forced onto one expert, so each slice is one expert's own
+            # output against its own reference.
+            ids = torch.full((m, 1), e, dtype=torch.long, device=device)
+            w_sel = torch.ones(m, 1, device=device)
+            out = method.apply(layer, x[:m], w_sel, ids, None, None)
+            torch.cuda.synchronize()
+            paths.append(getattr(layer, "_exl3_last_apply", "unknown"))
+            slices[f"expert_{eid}"] = round(_cos(out, refs[e][:m]), 6)
+        per_m[m] = {"paths": paths, "slices": slices}
+    return {
+        "ks": [list(t) for t in ks],
+        "markers": "mul1",
+        "per_m": {str(m): v for m, v in per_m.items()},
+        "pass": all(
+            set(v["paths"]) == {"mixedk_unified"}
+            and all(c >= COS_MIN for c in v["slices"].values())
+            for v in per_m.values()
         ),
     }
 
@@ -1286,6 +1628,63 @@ def _selftest() -> int:
     _check("case A reads the label with an unknown default",
            'getattr(layer, "_exl3_last_apply", "unknown")' in src)
 
+    # Run 4's blocker: the prefill (>256 slots) expert-batched exl3_moe path
+    # scored cosine ~0.10 while the coop decode path matched at 1.0. The
+    # python launch was proven faithful (tests/test_moe_prefill_dispatch_
+    # contract.py mock-records both launches and compares act index,
+    # codebook flags, K and pointer tables); the divergence was the fork
+    # kernel's activation switch, fixed on branch feat/moe-act3-batched.
+    # The tool must now (a) name the batched path in the receipt and bar
+    # on its true label, (b) cover the mixed-K dispatch the real pack's
+    # serve takes (uniform coop is never qualified for the real pack), and
+    # (c) cover the real pack's own experts (Case F).
+    _check("case A bar requires the batched prefill path by name",
+           'prefill_path == "batched"' in src)
+    _check("every batched inner path stamps its own label",
+           'layer._exl3_last_apply = "batched"' in esrc
+           and 'layer._exl3_last_apply = "mixedk_grouped"' in esrc
+           and 'layer._exl3_last_apply = "mixedk_unified"' in esrc)
+    _check("case A2 probes the pack's three K tuples at both modes",
+           list(A_MIXED_TUPLES) == [(2, 2, 2), (2, 2, 3), (3, 3, 3)]
+           and A_MIXED_MS == (64, 512))
+    a2_seg = src.split("def _case_a_mixedk_run", 1)[1].split("# ── Case B", 1)[0]
+    _check("case A2 bars each probe on its pinned true path label",
+           '"mixedk_unified"' in a2_seg
+           and '"mixedk_grouped"' in a2_seg
+           and 'p["path"] == expected[(p["mode"], p["tokens"])]' in a2_seg)
+
+    # Case F fixture consistency (offline): the pinned layer-3 digest covers
+    # exactly one expert per distinct K tuple, all with mul1 markers, all in
+    # shard 1, and the per-projection Ks derived from the trellis widths are
+    # the pack's census tuples.
+    fentries = _fixture_entries(F_FIXTURE)
+    ok_f = len(fentries) == 36 and all(
+        v.get("file") == E_SHARD for v in fentries.values()
+    )
+    fks = []
+    for e in F_EXPERTS:
+        tup = []
+        for w in ("w1", "w3", "w2"):
+            name = (
+                f"language_model.model.layers.{F_LAYER}.block_sparse_moe"
+                f".experts.{e}.{w}"
+            )
+            t = fentries[name + ".trellis"]
+            ok_f = ok_f and t["dtype"] == "I16"
+            ok_f = ok_f and fentries[name + ".mul1"]["shape"] == []
+            ok_f = ok_f and fentries[name + ".mul1"]["dtype"] == "I32"
+            ok_f = ok_f and (
+                t["bytes"] == 2 * t["shape"][0] * t["shape"][1] * t["shape"][2]
+            )
+            tup.append(t["shape"][2] // 16)
+        fks.append(tuple(tup))
+    ok_f = ok_f and fks == [(2, 2, 2), (2, 2, 3), (3, 3, 3)]
+    _check("case F fixture is the 3-expert per-K-tuple digest", bool(ok_f))
+    f_seg = src.split("def _case_f", 1)[1]
+    _check("case F bars the mixedk unified path at both m",
+           'set(v["paths"]) == {"mixedk_unified"}' in f_seg
+           and F_MS == (1, 96))
+
     print("GB10_MINIMAX_M3_PARITY SELFTEST " + ("PASS" if ok else "FAIL")
           + " (no hardware parity claim)")
     return 0 if ok else 1
@@ -1329,6 +1728,13 @@ def main() -> int:
               f"prefill_cosine={ent['prefill_cosine']}")
         verdict = verdict and ent["pass"]
 
+    receipt["case_a_mixedk"] = _case_a_mixedk_run(device)
+    for ent in receipt["case_a_mixedk"]["probes"]:
+        print(f"case A2 mode={ent['mode']} tokens={ent['tokens']}: "
+              f"path={ent['path']} cosine={ent['cosine']} "
+              f"cosine_silu={ent['cosine_silu_reference']}")
+    verdict = verdict and receipt["case_a_mixedk"]["pass"]
+
     receipt["case_b"] = _case_b(device)
     print(f"case B slices: {receipt['case_b']['slices']}")
     verdict = verdict and receipt["case_b"]["pass"]
@@ -1358,6 +1764,13 @@ def main() -> int:
     else:
         print(f"case E: {receipt['case_e']}")
         verdict = verdict and bool(receipt["case_e"].get("pass"))
+
+    receipt["case_f"] = _case_f(device, args.hf_token_file)
+    if "skip" in receipt["case_f"]:
+        print(f"case F: SKIP ({receipt['case_f']['skip']})")
+    else:
+        print(f"case F: {receipt['case_f']}")
+        verdict = verdict and bool(receipt["case_f"].get("pass"))
 
     receipt["mem_peak_gib"] = round(
         torch.cuda.max_memory_allocated() / 2**30, 3

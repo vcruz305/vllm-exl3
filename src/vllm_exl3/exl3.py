@@ -3072,6 +3072,9 @@ def apply_exl3_fused_moe(
                 ptr_tbl = ptrs
                 grp_ord = g_index[standard_local]
             for gi, ((kg, ku, kd), _ids) in enumerate(k_groups):
+                # Per-K-group dispatch is a distinct inner path: stamp it so a
+                # receipt names the kernel family that actually ran.
+                layer._exl3_last_apply = "mixedk_grouped"
                 if grp_ord is None:
                     _lo, _hi = layer._exl3_group_ranges[gi][1:]
                     grp_count = shared_count
@@ -3136,6 +3139,11 @@ def apply_exl3_fused_moe(
                     fn(*args_grp)
             if fat_possible and bool(fat.any().item()):
                 fat_order = local.argsort()
+                # The fat GEMM tier is a distinct inner path: append it to the
+                # base label so the receipt shows both families that ran.
+                layer._exl3_last_apply = (
+                    (layer._exl3_last_apply or "fused") + "+fat"
+                )
                 apply_exl3_batched_fat(
                     xh,
                     flat_token[fat_order],
@@ -3149,6 +3157,9 @@ def apply_exl3_fused_moe(
                 )
             return out
         # Unified mixed-K fused dispatch: per-expert K arrays instead of scalar K.
+        # A distinct inner path: stamp it so a receipt names the kernel family
+        # that actually ran (this is the default mixed-K path).
+        layer._exl3_last_apply = "mixedk_unified"
         fn_mk = exllamav3_ext.exl3_moe_mixedk
         args_mk = (
             xh,
@@ -3191,6 +3202,10 @@ def apply_exl3_fused_moe(
         else:
             fn_mk(*args_mk)
     else:
+        # Uniform-K expert-batched exl3_moe: a distinct inner path (the serve's
+        # prefill path for uniform-K packs); stamp it so a receipt names the
+        # kernel family that actually ran.
+        layer._exl3_last_apply = "batched"
         if k_tuple_single is not None:
             kg, ku, kd = int(k_tuple_single[0]), int(k_tuple_single[1]), int(k_tuple_single[2])
         else:
@@ -3233,6 +3248,11 @@ def apply_exl3_fused_moe(
 
     if fat_possible and bool(fat.any().item()):
         fat_order = local.argsort()
+        # The fat GEMM tier is a distinct inner path: append it to the base
+        # label so the receipt shows both families that ran.
+        layer._exl3_last_apply = (
+            (layer._exl3_last_apply or "fused") + "+fat"
+        )
         apply_exl3_batched_fat(
             xh,
             flat_token[fat_order],

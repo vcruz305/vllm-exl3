@@ -1,0 +1,290 @@
+{
+ "language_model.model.layers.3.block_sparse_moe.experts.0.w1.mul1": {
+  "bytes": 4,
+  "dtype": "I32",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": []
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.0.w1.suh": {
+  "bytes": 12288,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   6144
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.0.w1.svh": {
+  "bytes": 6144,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   3072
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.0.w1.trellis": {
+  "bytes": 4718592,
+  "dtype": "I16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   384,
+   192,
+   32
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.0.w2.mul1": {
+  "bytes": 4,
+  "dtype": "I32",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": []
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.0.w2.suh": {
+  "bytes": 6144,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   3072
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.0.w2.svh": {
+  "bytes": 12288,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   6144
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.0.w2.trellis": {
+  "bytes": 7077888,
+  "dtype": "I16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   192,
+   384,
+   48
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.0.w3.mul1": {
+  "bytes": 4,
+  "dtype": "I32",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": []
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.0.w3.suh": {
+  "bytes": 12288,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   6144
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.0.w3.svh": {
+  "bytes": 6144,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   3072
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.0.w3.trellis": {
+  "bytes": 4718592,
+  "dtype": "I16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   384,
+   192,
+   32
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.1.w1.mul1": {
+  "bytes": 4,
+  "dtype": "I32",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": []
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.1.w1.suh": {
+  "bytes": 12288,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   6144
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.1.w1.svh": {
+  "bytes": 6144,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   3072
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.1.w1.trellis": {
+  "bytes": 7077888,
+  "dtype": "I16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   384,
+   192,
+   48
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.1.w2.mul1": {
+  "bytes": 4,
+  "dtype": "I32",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": []
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.1.w2.suh": {
+  "bytes": 6144,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   3072
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.1.w2.svh": {
+  "bytes": 12288,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   6144
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.1.w2.trellis": {
+  "bytes": 7077888,
+  "dtype": "I16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   192,
+   384,
+   48
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.1.w3.mul1": {
+  "bytes": 4,
+  "dtype": "I32",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": []
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.1.w3.suh": {
+  "bytes": 12288,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   6144
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.1.w3.svh": {
+  "bytes": 6144,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   3072
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.1.w3.trellis": {
+  "bytes": 7077888,
+  "dtype": "I16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   384,
+   192,
+   48
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.2.w1.mul1": {
+  "bytes": 4,
+  "dtype": "I32",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": []
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.2.w1.suh": {
+  "bytes": 12288,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   6144
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.2.w1.svh": {
+  "bytes": 6144,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   3072
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.2.w1.trellis": {
+  "bytes": 4718592,
+  "dtype": "I16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   384,
+   192,
+   32
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.2.w2.mul1": {
+  "bytes": 4,
+  "dtype": "I32",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": []
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.2.w2.suh": {
+  "bytes": 6144,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   3072
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.2.w2.svh": {
+  "bytes": 12288,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   6144
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.2.w2.trellis": {
+  "bytes": 4718592,
+  "dtype": "I16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   192,
+   384,
+   32
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.2.w3.mul1": {
+  "bytes": 4,
+  "dtype": "I32",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": []
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.2.w3.suh": {
+  "bytes": 12288,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   6144
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.2.w3.svh": {
+  "bytes": 6144,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   3072
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.2.w3.trellis": {
+  "bytes": 4718592,
+  "dtype": "I16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   384,
+   192,
+   32
+  ]
+ }
+}

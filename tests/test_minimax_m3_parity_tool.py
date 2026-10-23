@@ -283,6 +283,80 @@ def test_case_a_receipt_must_name_the_inner_dispatch_path():
     assert tool.A_PREFILL_TOKENS * tool.TOPK > 256
 
 
+def test_case_a_bars_the_batched_prefill_path_by_name():
+    # Run 4: the prefill probe's cosine was ~0.10 (the batched kernel's
+    # activation switch had no act-3 instance) and the receipt could only
+    # print the generic entry label. The bar must now name the batched
+    # inner path, and every batched inner path must stamp its own label.
+    esrc = (REPO / "src/vllm_exl3/exl3.py").read_text()
+    for label in ("batched", "mixedk_grouped", "mixedk_unified"):
+        assert f'layer._exl3_last_apply = "{label}"' in esrc
+    src = (REPO / "tools/gb10_minimax_m3_parity.py").read_text()
+    seg = src.split("def _case_a_run(", 1)[1].split("# ── Case B", 1)[0]
+    assert 'prefill_path == "batched"' in seg
+
+
+def test_case_a2_covers_the_packs_mixedk_dispatch():
+    # The real pack is MIXED-K with three distinct per-expert K tuples, so
+    # the serve NEVER qualifies for the coop kernel: every batch shape runs
+    # a batched mixed-K dispatch. The tool must probe the pack's own three
+    # tuples, in the default (unified) mode and the explicit grouped mode,
+    # at a decode-size and a prefill-size batch, and bar each probe on its
+    # pinned true path label.
+    tool = _tool()
+    src = (REPO / "tools/gb10_minimax_m3_parity.py").read_text()
+    assert list(tool.A_MIXED_TUPLES) == [(2, 2, 2), (2, 2, 3), (3, 3, 3)]
+    assert tool.A_MIXED_MS == (64, 512)
+    seg = src.split("def _case_a_mixedk_run(", 1)[1].split("# ── Case B", 1)[0]
+    assert '"mixedk_unified"' in seg
+    assert '"mixedk_grouped"' in seg
+    assert 'p["path"] == expected[(p["mode"], p["tokens"])]' in seg
+
+
+def test_case_f_fixture_is_the_per_k_tuple_digest():
+    # Case F pins one real layer-3 expert per distinct K tuple: 36 census
+    # entries (3 experts x w1/w2/w3 x trellis/suh/svh/mul1), all in shard 1,
+    # with the per-projection Ks derived from the trellis widths equal to
+    # the pack's census tuples.
+    tool = _tool()
+    fixture = (
+        REPO / "tests/data/minimax_m3_layer3_real_experts.json"
+    )
+    if not fixture.is_file():
+        pytest.skip("layer-3 expert fixture not on this box")
+    entries = json.loads(fixture.read_text())
+    assert len(entries) == 36
+    assert all(v["file"] == "model-00001-of-00016.safetensors"
+              for v in entries.values())
+    ks = []
+    for e in tool.F_EXPERTS:
+        tup = []
+        for w in ("w1", "w3", "w2"):
+            name = (
+                f"language_model.model.layers.{tool.F_LAYER}."
+                f"block_sparse_moe.experts.{e}.{w}"
+            )
+            t = entries[name + ".trellis"]
+            assert t["dtype"] == "I16"
+            assert entries[name + ".mul1"]["dtype"] == "I32"
+            assert entries[name + ".mul1"]["shape"] == []
+            assert t["bytes"] == 2 * t["shape"][0] * t["shape"][1] * t["shape"][2]
+            tup.append(t["shape"][2] // 16)
+        ks.append(tuple(tup))
+    assert ks == [(2, 2, 2), (2, 2, 3), (3, 3, 3)]
+
+
+def test_case_f_bars_the_mixedk_unified_path_at_both_m():
+    # The serve's default mixed-K path is the unified exl3_moe_mixedk
+    # launch (VLLM_EXL3_MIXEDK_MODE unset); Case F must run each real
+    # expert router-free at m in {1, 96} and require that exact path.
+    tool = _tool()
+    src = (REPO / "tools/gb10_minimax_m3_parity.py").read_text()
+    assert tool.F_MS == (1, 96)
+    seg = src.split("def _case_f(", 1)[1].split("# ── CPU self-test", 1)[0]
+    assert 'set(v["paths"]) == {"mixedk_unified"}' in seg
+
+
 # ── DSpark draft quantization: the plugin declines by construction ─────────
 
 
