@@ -72,6 +72,12 @@ def register() -> None:
     # The shim is idempotent, so plugin auto-discovery may safely call it again.
     install_mixed_bf16_madv_compat(exl3)
 
+    # Unified-memory load hygiene (per-MoE-layer trim, post-load embedding
+    # alias). Inert unless VLLM_EXL3_TRIM_AFTER_LAYER / VLLM_EXL3_UMA_POSTLOAD.
+    from .uma_load_memory import install_uma_load_memory
+
+    install_uma_load_memory(exl3)
+
     # Standalone-saved NemotronH VL packs (text model saved under backbone.*
     # instead of language_model.backbone.*) need the name-rewriting loader.
     # Importing registers the load format; runs are started with
