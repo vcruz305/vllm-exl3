@@ -17,6 +17,20 @@ def _src(name):
 ext_modules = []
 cmdclass = {}
 
+
+def _cxx_std():
+    """C++ standard for the extension: torch >= 2.14 headers refuse anything below C++20."""
+    override = os.environ.get("VLLM_EXL3_CXX_STD")
+    if override:
+        return f"-std={override}"
+    try:
+        import torch
+
+        major, minor = (int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
+    except Exception:
+        return "-std=c++17"
+    return "-std=c++20" if (major, minor) >= (2, 14) else "-std=c++17"
+
 if os.environ.get("VLLM_EXL3_NO_CUDA", "0") != "1":
     try:
         from torch.utils.cpp_extension import BuildExtension, CUDAExtension
@@ -62,8 +76,8 @@ if os.environ.get("VLLM_EXL3_NO_CUDA", "0") != "1":
                 ],
                 include_dirs=include_dirs,
                 extra_compile_args={
-                    "cxx": ["-O3", "-std=c++17"],
-                    "nvcc": ["-O3", "-std=c++17"],
+                    "cxx": ["-O3", _cxx_std()],
+                    "nvcc": ["-O3", _cxx_std()],
                 },
             )
         )
