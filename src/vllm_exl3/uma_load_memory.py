@@ -34,6 +34,14 @@ Switches (all default off; the recipe turns them on):
     moment later. Draft checkpoints that do ship either table are loaded
     unchanged.
 
+``VLLM_EXL3_TRIM_BEFORE_KV=1``
+    After the startup profile run (which compiles the model for
+    max_num_batched_tokens and leaves its activations cached by the torch
+    allocator and its compile scratch in glibc arenas), trim before the
+    worker allocates the KV cache and again before kernel warmup / CUDA graph
+    capture. Installed lazily on the vLLM GPU Worker from the target
+    post-load hook.
+
 ``VLLM_EXL3_MEM_PROBE=1``
     One ``MEMPROBE`` log line per trim point (defaults on whenever one of the
     two switches above is on).
@@ -256,6 +264,50 @@ def install_uma_load_memory(exl3: Any) -> None:
     install_postload_hook(DefaultModelLoader)
 
 
+def trim_before_kv_enabled() -> bool:
+    return _flag("VLLM_EXL3_TRIM_BEFORE_KV")
+
+
+def _staged(fn: Any, tag: str) -> Any:
+    @wraps(fn)
+    def run(self, *args, **kwargs):
+        if trim_before_kv_enabled():
+            if probe_enabled():
+                logger.info("%s", mem_line(f"PRE_{tag}_UNTRIMMED"))
+            trim()
+            STATS[f"trim_{tag.lower()}"] = STATS.get(f"trim_{tag.lower()}", 0) + 1
+        if probe_enabled():
+            logger.info("%s", mem_line(f"PRE_{tag}"))
+        out = fn(self, *args, **kwargs)
+        if probe_enabled():
+            logger.info("%s", mem_line(f"POST_{tag}"))
+        return out
+
+    run._uma_staged = True
+    return run
+
+
+def install_worker_hooks(worker_cls: Any) -> bool:
+    """Trim/probe around KV allocation and warmup (idempotent)."""
+    done = False
+    for attr, tag in (("initialize_from_config", "KV"), ("compile_or_warm_up_model", "WARMUP")):
+        fn = getattr(worker_cls, attr, None)
+        if fn is None or getattr(fn, "_uma_staged", False):
+            continue
+        setattr(worker_cls, attr, _staged(fn, tag))
+        done = True
+    return done
+
+
+def _install_worker_hooks_from_loaded_modules() -> None:
+    import sys
+
+    mod = sys.modules.get("vllm.v1.worker.gpu_worker")
+    cls = getattr(mod, "Worker", None) if mod is not None else None
+    if cls is not None and install_worker_hooks(cls):
+        logger.info("EXL3 UMA worker hooks installed on %s.%s", cls.__module__, cls.__name__)
+
+
 # Draft architectures whose embed_tokens / lm_head are shared from the target
 # when the draft checkpoint omits them (vLLM v1 dspark/utils.py
 # load_dspark_model -> maybe_share_target_embed / lm_head share).
@@ -383,6 +435,8 @@ def install_postload_hook(loader_cls: Any, embedding_method_cls: Any = None) -> 
                     logger.info("%s", mem_line("POST_DRAFT_LOAD"))
             else:
                 postload(model)
+        if not draft and (trim_before_kv_enabled() or probe_enabled()):
+            _install_worker_hooks_from_loaded_modules()
         return model
 
     load_model._uma_postload = True

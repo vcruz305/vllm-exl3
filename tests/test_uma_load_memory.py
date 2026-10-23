@@ -16,6 +16,7 @@ def _clean_env(monkeypatch):
         "VLLM_EXL3_UMA_POSTLOAD",
         "VLLM_EXL3_MEM_PROBE",
         "VLLM_EXL3_DRAFT_VOCAB_META",
+        "VLLM_EXL3_TRIM_BEFORE_KV",
     ):
         monkeypatch.delenv(k, raising=False)
     for k in uma.STATS:
@@ -251,3 +252,53 @@ def test_draft_load_never_runs_the_embedding_alias(monkeypatch, tmp_path):
     monkeypatch.setenv("VLLM_EXL3_UMA_POSTLOAD", "1")
     Loader().load_model(None, _draft_cfg(tmp_path))
     assert seen == ["trim"]
+
+
+def test_worker_hooks_trim_before_kv_and_warmup(monkeypatch):
+    calls = []
+
+    class Worker:
+        def initialize_from_config(self, cfg):
+            calls.append(("kv", cfg))
+
+        def compile_or_warm_up_model(self):
+            calls.append(("warmup",))
+            return "times"
+
+    monkeypatch.setattr(uma, "trim", lambda: calls.append("trim"))
+    assert uma.install_worker_hooks(Worker) is True
+    assert uma.install_worker_hooks(Worker) is False  # idempotent
+    w = Worker()
+    w.initialize_from_config("cfg")  # flag off: no trim
+    assert calls == [("kv", "cfg")]
+    calls.clear()
+    monkeypatch.setenv("VLLM_EXL3_TRIM_BEFORE_KV", "1")
+    w.initialize_from_config("cfg")
+    assert w.compile_or_warm_up_model() == "times"
+    assert calls == ["trim", ("kv", "cfg"), "trim", ("warmup",)]
+    assert uma.STATS["trim_kv"] >= 1 and uma.STATS["trim_warmup"] >= 1
+
+
+def test_target_load_installs_worker_hooks_lazily(monkeypatch):
+    import sys
+
+    class Worker:
+        def initialize_from_config(self, cfg):
+            return None
+
+        def compile_or_warm_up_model(self):
+            return None
+
+    fake = types.ModuleType("vllm.v1.worker.gpu_worker")
+    fake.Worker = Worker
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu_worker", fake)
+    monkeypatch.setenv("VLLM_EXL3_TRIM_BEFORE_KV", "1")
+    Loader = _loader_cls(object())
+    uma.install_postload_hook(Loader)
+    target_cfg = types.SimpleNamespace(
+        model="/nonexistent",
+        hf_config=types.SimpleNamespace(architectures=["MiniMaxM3SparseForConditionalGeneration"]),
+    )
+    Loader().load_model(None, target_cfg)
+    assert getattr(Worker.initialize_from_config, "_uma_staged", False)
+    assert getattr(Worker.compile_or_warm_up_model, "_uma_staged", False)
