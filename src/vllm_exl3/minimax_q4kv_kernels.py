@@ -539,6 +539,52 @@ def _fp8_bytes(t: torch.Tensor | None) -> torch.Tensor | None:
     return t.view(torch.uint8)
 
 
+# The q4 KV Triton kernels are CUDA-only. A tensor on any other device
+# must never reach Triton: it dies there with the opaque "Pointer
+# argument cannot be accessed from Triton (cpu tensor?)" of the GB10
+# val4 run, which says nothing about WHICH argument was misplaced. The
+# wrappers therefore gate placement themselves and name the offender.
+# The CPU-only test suite simulates the GPU boundary by patching this
+# constant (never by weakening the check itself).
+_REQUIRED_DEVICE_TYPE = "cuda"
+
+
+def _off_device(ref_device: torch.device, named_tensors) -> list:
+    """(argument name, device string) for every tensor NOT on ref_device.
+
+    None entries (an argument the caller legitimately omitted, e.g. the
+    index buffers on the index-topk reuse layers) pass. Pure function:
+    tests call it directly with a CUDA reference device and CPU tensors
+    to pin that every kernel-facing argument is named.
+    """
+    bad = []
+    for name, t in named_tensors:
+        if t is not None and t.device != ref_device:
+            bad.append((name, str(t.device)))
+    return bad
+
+
+def _device_gate(
+    query: torch.Tensor, query_name: str, named_tensors
+) -> None:
+    """Fail closed unless every tensor is on the query's CUDA device."""
+    if query.device.type != _REQUIRED_DEVICE_TYPE:
+        raise ValueError(
+            f"q4 KV refused: '{query_name}' must be on a "
+            f"{_REQUIRED_DEVICE_TYPE} device, got {query.device} "
+            "(the q4 KV Triton kernels are CUDA-only)"
+        )
+    bad = _off_device(query.device, named_tensors)
+    if bad:
+        raise ValueError(
+            "q4 KV refused: "
+            + "; ".join(
+                f"'{name}' is on {dev}, expected {query.device}"
+                for name, dev in bad
+            )
+        )
+
+
 # ---------------------------------------------------------------------------
 # W1 wrapper
 # ---------------------------------------------------------------------------
@@ -566,6 +612,23 @@ def q4_w1_insert(
     index_q_out: torch.Tensor | None,
 ) -> None:
     """Run W1. Fail closed: refuses unsupported configurations."""
+    _device_gate(
+        qkv, "qkv",
+        (
+            ("q_out", q_out),
+            ("index_q_out", index_q_out),
+            ("q_norm_w", q_norm_w),
+            ("k_norm_w", k_norm_w),
+            ("index_q_norm_w", index_q_norm_w),
+            ("index_k_norm_w", index_k_norm_w),
+            ("cos_sin_cache", cos_sin_cache),
+            ("positions", positions),
+            ("slot_mapping", slot_mapping),
+            ("index_slot_mapping", index_slot_mapping),
+            ("pool", pool),
+            ("index_cache", index_cache),
+        ),
+    )
     errors = ref.validate_w1_call(
         qkv_dtype=_dtype_name(qkv),
         qkv_width=qkv.shape[1],
@@ -650,6 +713,16 @@ def q4_sparse_decode(
     decode_query_len: int,
 ) -> None:
     """Run R2 + the unchanged vLLM merge kernel. Fail closed on geometry."""
+    _device_gate(
+        q, "q",
+        (
+            ("pool", pool),
+            ("topk_idx", topk_idx),
+            ("block_table", block_table),
+            ("seq_lens", seq_lens),
+            ("output", output),
+        ),
+    )
     total_q, num_heads, head_dim = q.shape
     if head_dim != 128:
         raise ValueError("q4 decode requires head_dim == 128")

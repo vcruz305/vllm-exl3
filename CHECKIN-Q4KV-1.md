@@ -447,3 +447,78 @@ actual verdict. One GB10 run now yields the full picture: the receipt
 will contain per-gate ulp/code-distance/mismatch/cosine numbers for
 q_out, processed K, index_k, the packing byte comparison, both R2
 cosines, the pool byte counts and the CUDA-graph replay result.
+
+## Post-val4 fix: device placement at the kernel boundary (this commit)
+
+The 4th GB10 run (receipts/val4) passed the frontend check and every
+W1 unit (1a within 1 bf16 ulp, 1b/1c byte- and code-exact, 1d clean)
+and case 3, but cases 2 and 4 both died with
+`ValueError: Pointer argument cannot be accessed from Triton (cpu
+tensor?)`. **Root cause: the harness, not the kernels.** `_run_r2`
+moved the five R2 inputs to CUDA but the caller passed the OUTPUT
+buffer `torch.zeros_like(inp["q"])` — a CPU tensor — straight into
+`q4_sparse_decode`, where it reached vLLM's unchanged merge kernel.
+The R2 Triton kernel itself never executed; nothing about R2 numerics
+was wrong.
+
+**Harness fix — one mover, explicit placement everywhere:**
+
+- `_bundle_to_device` is the single recursive mover (dicts/tuples/
+  lists; non-tensors pass through unchanged). Every case now names its
+  kernel-facing keys (`_W1_KERNEL_KEYS`, `_R2_KERNEL_KEYS`) and moves
+  the ENTIRE bundle with the one mover; per-tensor `.cuda()` calls are
+  gone. Everything not in those key sets is a reference-path input and
+  stays on the CPU bundle by construction.
+- `_r2_static_bundle` allocates the R2 output buffer ON the target
+  device (`torch.zeros_like(gpu_q)`), never inherits it from the CPU
+  bundle; `_launch_r2` is the only call site of the R2 wrapper
+  (eager, warmup and capture all go through it).
+- The pure-torch reference paths are pinned CPU-only: `_fp8_baseline`
+  (and the oracle) refuse any non-CPU tensor with a named error, so a
+  GPU-side tensor can never leak into baseline math either.
+
+**Case 4 rewritten to the static-buffer rules.** Every input is a
+preallocated CUDA tensor from `_r2_static_bundle`; the check is
+two-stage: (a) replay on the captured bytes must equal the eager run
+bit-identically, and (b) after NEW pool bytes are copied into the
+static buffer (whole pages rotated), replay must equal the eager run on
+THOSE bytes and must differ from the captured-bytes output — a stale
+replay of captured data, or a vacuous mutation, both fail loudly.
+
+**Src fix — fail-closed device gate (both wrappers).**
+`minimax_q4kv_kernels.py` now has `_device_gate`/`_off_device`: the
+query tensor must be on a CUDA device and every kernel-facing argument
+must be on the query's device, else the wrapper raises BEFORE any
+validation or triton import, naming the offending argument(s) and
+device(s) (`q4 KV refused: 'output' is on cpu, expected cuda:0`). A
+serving-side placement bug now dies with a precise message instead of
+an opaque Triton pointer error. The internal split-K partials already
+follow `q.device`; the gate makes the whole boundary symmetric. The
+CPU-only test suite simulates the GPU boundary by patching
+`_REQUIRED_DEVICE_TYPE` (the gate itself is tested unpatched and must
+fire).
+
+**Dry run extended (dry/4-device-audit, meta simulation).** For the
+GPU path it asserts, with the meta device standing in for CUDA: the
+mover puts EVERY tensor of both cases' kernel-facing bundles on the
+target (count/shape/dtype preserved, nothing dropped), the R2 output
+buffer is allocated on the target, non-tensors pass through unchanged,
+`_off_device` names every offender (and only the offender in a mixed
+bundle), the real wrappers refuse an all-CPU bundle before any triton
+import naming `'q'`/`'qkv'`, and the fp8 baseline refuses a
+target-device tensor. VERDICT PASS (7/7 units) on this VPS.
+
+**Tests:** 3 new (42/42 green in `tests/test_minimax_q4kv.py`): the
+device gate names every off-device argument and refuses all-CPU bundles
+pre-triton; the gate does not shadow the geometry/fail-closed
+validation; and the dry-run device audit + static-buffer case-4 pins.
+Full suite: **613 passed, 39 skipped, the same 8 pre-existing
+failures** (failure set verified identical to the unmodified tree by
+re-running it: 610 passed there, +3 = the new tests).
+
+**Unverified on this VPS (no GPU, no triton):** whether cases 2 and 4
+now pass on GB10 — the R2/merge kernels have still never executed; the
+next val run must show both R2 cosines >= 0.99 and the two-stage
+graph-replay result. The device gate and mover are proven only in
+simulation (meta) and by source pins; their first hardware exercise is
+that same run.

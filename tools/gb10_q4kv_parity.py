@@ -51,13 +51,27 @@ Units:
       against the fp32 oracle, with no NaN/Inf.
   3.  Pool bytes: the allocated pool is 73728 B/page and 576
       B/token/layer for 4 KV heads (spec arithmetic).
-  4.  CUDA-graph capture of R2: capture and replay reproduce the eager
-      output bit-identically.
+  4.  CUDA-graph capture of R2 under the static-buffer rules: every
+      input is a preallocated CUDA tensor that is copied into before
+      replay; the replay must reproduce the eager output bit-identically
+      AND must read the CURRENT bytes of the static buffers (verified
+      by copying new pool bytes in between replays).
 
 Every unit builds its inputs from tools/q4kv_harness_inputs.py and runs
 that module's input-consistency validator BEFORE any kernel or reference
 call. A harness data bug aborts the unit with a message naming the
 input, never as an IndexError that looks like a kernel bug.
+
+Device placement is explicit end to end (the GB10 val4 lesson: one CPU
+output buffer reached the merge kernel and Triton died with an opaque
+"Pointer argument cannot be accessed from Triton (cpu tensor?)"): the
+one bundle mover ``_bundle_to_device`` moves each case's ENTIRE
+kernel-facing bundle to the target device, the R2 output buffer is
+allocated on the target, the pure-torch reference paths (fp8 baseline,
+fp32 oracle) are CPU-only and refuse anything else, and the src
+wrappers themselves fail closed naming any off-device argument. The
+``--cpu-dry-run`` device audit simulates the move on the meta device to
+prove the mover would leave nothing behind on the CPU.
 """
 
 from __future__ import annotations
@@ -89,8 +103,58 @@ NUM_REQS = hi.NUM_REQS
 TOPK = hi.TOPK
 
 
-def _cuda(*ts: torch.Tensor) -> tuple[torch.Tensor, ...]:
-    return tuple(t.cuda() for t in ts)
+def _bundle_to_device(bundle, device):
+    """Move every tensor in a case-input bundle to ``device``.
+
+    One mover for every case: it walks dicts/tuples/lists recursively and
+    returns a NEW bundle with the same structure; non-tensor entries
+    (scales, eps) pass through unchanged. The GPU cases move their whole
+    kernel-facing bundle to CUDA with it, and --cpu-dry-run simulates
+    the same move on the meta device to audit coverage, so nothing is
+    ever left on the CPU because a builder forgot a key (the GB10 val4
+    failure: one CPU output buffer reached the merge kernel and Triton
+    died with an opaque pointer error).
+    """
+    if isinstance(bundle, torch.Tensor):
+        return bundle.to(device)
+    if isinstance(bundle, dict):
+        return {k: _bundle_to_device(v, device) for k, v in bundle.items()}
+    if isinstance(bundle, tuple):
+        return tuple(_bundle_to_device(v, device) for v in bundle)
+    if isinstance(bundle, list):
+        return [_bundle_to_device(v, device) for v in bundle]
+    return bundle
+
+
+def _iter_tensors(bundle, prefix=""):
+    """(path, tensor) for every tensor in a bundle, recursively."""
+    if isinstance(bundle, torch.Tensor):
+        yield prefix or "<root>", bundle
+    elif isinstance(bundle, dict):
+        for k, v in bundle.items():
+            yield from _iter_tensors(
+                v, f"{prefix}.{k}" if prefix else str(k)
+            )
+    elif isinstance(bundle, (tuple, list)):
+        for i, v in enumerate(bundle):
+            yield from _iter_tensors(v, f"{prefix}[{i}]")
+
+
+# Exactly the tensors each Triton kernel (plus, for R2, the unchanged
+# vLLM merge kernel) receives, by harness bundle key. Everything else
+# in a case bundle is a reference-path input and stays on the CPU
+# bundle, where the pure-torch oracles consume it.
+_W1_KERNEL_KEYS = (
+    "qkv", "norm_ws", "cos_sin", "positions", "slot_mapping",
+    "index_slot_mapping", "pool", "index_cache", "q_out", "index_q_out",
+)
+_R2_KERNEL_KEYS = ("q", "pool", "topk", "block_table", "seq_lens")
+
+
+def _kernel_bundle(inp: dict, keys, device) -> dict:
+    """The kernel-facing slice of a VALIDATED case bundle, with every
+    tensor moved to ``device`` by the one bundle mover."""
+    return _bundle_to_device({k: inp[k] for k in keys}, device)
 
 
 def _cos(a, b):
@@ -122,29 +186,32 @@ class _W1Evidence:
         self.inp = inp
         n = inp["qkv"].shape[0]
         self.n = n
-        nw = inp["norm_ws"]
-        (qkv, q_nw, k_nw, iq_nw, ik_nw, cos_sin, positions, slot_mapping,
-         index_slot_mapping, pool, index_cache, q_out, index_q_out) = _cuda(
-            inp["qkv"], nw["q"], nw["k"], nw["iq"], nw["ik"], inp["cos_sin"],
-            inp["positions"], inp["slot_mapping"], inp["index_slot_mapping"],
-            inp["pool"], inp["index_cache"], inp["q_out"], inp["index_q_out"],
-        )
+        # The ENTIRE kernel-facing bundle on one device, via the one
+        # bundle mover (nothing may be moved tensor-by-tensor again:
+        # a forgotten tensor is exactly the val4 failure class).
+        gpu = _kernel_bundle(inp, _W1_KERNEL_KEYS, "cuda")
+        nw = gpu["norm_ws"]
         q4k.q4_w1_insert(
-            qkv, q_nw, k_nw, cos_sin, positions,
-            NQ, NKV, ROTARY, EPS, iq_nw, ik_nw, NIQ,
-            slot_mapping, index_slot_mapping, pool, index_cache, BLOCK,
-            q_out, index_q_out,
+            gpu["qkv"], nw["q"], nw["k"], gpu["cos_sin"], gpu["positions"],
+            NQ, NKV, ROTARY, EPS, nw["iq"], nw["ik"], NIQ,
+            gpu["slot_mapping"], gpu["index_slot_mapping"], gpu["pool"],
+            gpu["index_cache"], BLOCK, gpu["q_out"], gpu["index_q_out"],
         )
         torch.cuda.synchronize()
         # The kernel's own outputs, read back after the call.
-        self.qkv_after = qkv.cpu()
-        self.q_out = q_out.cpu()
-        self.index_q_bytes = index_q_out.cpu().view(torch.uint8)
-        self.pool_after = (
-            pool.cpu().reshape(NUM_PAGES, 2 * NKV, ref.SLOT_REGION)
+        self.qkv_after = gpu["qkv"].cpu()
+        self.q_out = gpu["q_out"].cpu()
+        self.index_q_bytes = (
+            gpu["index_q_out"].cpu().view(torch.uint8)
         )
-        self.index_cache_after = index_cache.cpu().view(torch.uint8)
+        self.pool_after = (
+            gpu["pool"].cpu().reshape(NUM_PAGES, 2 * NKV, ref.SLOT_REGION)
+        )
+        self.index_cache_after = (
+            gpu["index_cache"].cpu().view(torch.uint8)
+        )
         # The reference paths (CPU, independent device path).
+        nw = inp["norm_ws"]
         self.ref_out = ref.reference_w1_write(
             inp["qkv"], nw["q"], nw["k"], nw["iq"], nw["ik"],
             inp["cos_sin"], inp["positions"], EPS, ROTARY, NQ, NKV, NIQ,
@@ -317,7 +384,21 @@ def unit_1d() -> dict:
 
 
 def _fp8_baseline(fp8_pool, block_table, topk, q, sm_scale):
-    """Exact attention over the fp8-quantized pool (baseline math)."""
+    """Exact attention over the fp8-quantized pool (baseline math).
+
+    Reference path, CPU-only by construction: it consumes the same
+    validated CPU bundle the oracles use, and a tensor that lives on the
+    GPU side (or a simulated meta device) must never be handed in here.
+    """
+    for name, t in (
+        ("fp8_pool", fp8_pool), ("block_table", block_table),
+        ("topk", topk), ("q", q),
+    ):
+        if t.device.type != "cpu":
+            raise ValueError(
+                f"fp8 baseline is a CPU-only reference path: {name} is on "
+                f"{t.device}"
+            )
     total_q = q.shape[0]
     values = fp8_pool.view(NUM_PAGES, 2 * NKV, BLOCK, 128).to(torch.float32)
     # The fp8 pool is blocked [K | V], NOT interleaved like the q4 slots.
@@ -347,22 +428,40 @@ def _decode_fixture():
     return inp
 
 
-def _run_r2(inp, out):
-    (q, pool, block_table, topk, seq_lens) = _cuda(
-        inp["q"], inp["pool"], inp["block_table"], inp["topk"],
-        inp["seq_lens"],
-    )
+def _r2_static_bundle(inp: dict, device) -> dict:
+    """Preallocated static buffers for R2 + the merge kernel.
+
+    Every kernel-facing input is moved to ``device`` by the one bundle
+    mover and the output buffer is ALLOCATED there (never inherited
+    from the CPU bundle — the val4 failure). Case 4 (CUDA graph) copies
+    new bytes into these static buffers before replay; case 2 runs the
+    very same buffers eagerly.
+    """
+    gpu = _kernel_bundle(inp, _R2_KERNEL_KEYS, device)
+    gpu["sm_scale"] = inp["sm_scale"]  # non-tensor passthrough
+    gpu["output"] = torch.zeros_like(gpu["q"])
+    return gpu
+
+
+def _launch_r2(gpu: dict) -> None:
+    """The only call site of the R2 wrapper (eager, warmup and capture)."""
     q4k.q4_sparse_decode(
-        q, pool, topk, block_table, seq_lens, NKV, inp["sm_scale"], out, 1
+        gpu["q"], gpu["pool"], gpu["topk"], gpu["block_table"],
+        gpu["seq_lens"], NKV, gpu["sm_scale"], gpu["output"], 1,
     )
+
+
+def _run_r2_bundle(gpu: dict) -> torch.Tensor:
+    _launch_r2(gpu)
     torch.cuda.synchronize()
-    return out.cpu()
+    return gpu["output"].cpu()
 
 
 def unit_2() -> dict:
     """R2 decode cosine >= 0.99 vs fp8 baseline and fp32 oracle."""
     inp = _decode_fixture()
-    out = _run_r2(inp, torch.zeros_like(inp["q"]))
+    gpu = _r2_static_bundle(inp, "cuda")
+    out = _run_r2_bundle(gpu)
     base = _fp8_baseline(
         inp["fp8_pool"], inp["block_table"], inp["topk"], inp["q"],
         inp["sm_scale"],
@@ -411,43 +510,60 @@ def unit_3() -> dict:
 
 
 def unit_4() -> dict:
-    """R2 must be CUDA-graph capturable with identical output."""
+    """R2 must be CUDA-graph capturable, and the replay must read the
+    CURRENT bytes of the static input buffers.
+
+    Static-buffer rules: every input is a preallocated CUDA tensor that
+    is copied into before replay. The check is two-stage: (a) replay on
+    the captured fixture bytes must reproduce the eager output
+    bit-identically, and (b) after NEW pool bytes are copied into the
+    static buffer, the replay must reproduce the eager run on THOSE
+    bytes — a stale replay of the captured bytes fails (b) because the
+    outputs differ.
+    """
     inp = _decode_fixture()
-    eager = _run_r2(inp, torch.zeros_like(inp["q"]))
-    (q, pool, topk, block_table, seq_lens) = _cuda(
-        inp["q"], inp["pool"], inp["topk"], inp["block_table"],
-        inp["seq_lens"],
-    )
-    out = torch.zeros_like(q)
+    gpu = _r2_static_bundle(inp, "cuda")
+    eager_fixture = _run_r2_bundle(gpu)
     # Warmup on a side stream (torch requirement for capture).
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         for _ in range(3):
-            q4k.q4_sparse_decode(
-                q, pool, topk, block_table, seq_lens, NKV,
-                inp["sm_scale"], out, 1,
-            )
+            _launch_r2(gpu)
     torch.cuda.current_stream().wait_stream(s)
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        q4k.q4_sparse_decode(
-            q, pool, topk, block_table, seq_lens, NKV,
-            inp["sm_scale"], out, 1,
-        )
-    out.zero_()
+        _launch_r2(gpu)
+    # Stage (a): replay on the captured bytes == eager on those bytes.
+    gpu["output"].zero_()
     g.replay()
     torch.cuda.synchronize()
-    replay = out.cpu()
-    identical = bool(torch.equal(replay, eager))
-    return {
-        "passed": identical,
-        "summary": (
-            "capture replay bit-identical to eager"
-            if identical
-            else "capture replay differs from eager"
-        ),
-    }
+    replay_fixture = gpu["output"].cpu()
+    stage_a = bool(torch.equal(replay_fixture, eager_fixture))
+    # Stage (b): copy NEW bytes into the static pool buffer, then replay
+    # must match the eager run on the NEW bytes (whole pages rotated, so
+    # every K/V value moves to a different block).
+    gpu["pool"].copy_(torch.roll(gpu["pool"], shifts=3, dims=0))
+    eager_mutated = _run_r2_bundle(gpu)
+    gpu["output"].zero_()
+    g.replay()
+    torch.cuda.synchronize()
+    replay_mutated = gpu["output"].cpu()
+    stage_b = bool(torch.equal(replay_mutated, eager_mutated))
+    mutation_live = not bool(torch.equal(eager_mutated, eager_fixture))
+    passed = stage_a and stage_b and mutation_live
+    if passed:
+        summary = (
+            "replay reproduces the eager output bit-identically and reads "
+            "the current static-buffer bytes"
+        )
+    elif not stage_a:
+        summary = "replay on the captured bytes differs from eager"
+    elif not mutation_live:
+        summary = "static-buffer mutation vacuous (outputs unchanged)"
+    else:
+        summary = "replay did not read the mutated static-buffer bytes"
+    return {"passed": passed, "summary": summary}
 
 
 # ---------------------------------------------------------------------------
@@ -738,6 +854,140 @@ def _dry_decode() -> dict:
     }
 
 
+def _dry_device_audit() -> dict:
+    """Simulated GPU-boundary audit (no GPU on this VPS): for the GPU
+    path, the one bundle mover must put EVERY tensor of each case's
+    kernel-facing bundle on the target device (simulated with the meta
+    device), keep shapes/dtypes/counts intact, and pass non-tensors
+    through unchanged; the output buffer must be allocated on the
+    target; and the src wrappers must name every off-device argument
+    instead of letting Triton fail opaquely."""
+    device = torch.device("meta")
+    problems: list[str] = []
+
+    # (a) mover coverage: nothing in a kernel-facing bundle may stay on
+    #     the CPU (or silently change) when the bundle is moved.
+    for name, build, validate, keys in (
+        ("w1", hi.w1_inputs, hi.validate_w1_inputs, _W1_KERNEL_KEYS),
+        ("r2", hi.decode_inputs, hi.validate_decode_inputs,
+         _R2_KERNEL_KEYS),
+    ):
+        inp = build()
+        validate(inp)
+        before = dict(_iter_tensors({k: inp[k] for k in keys}))
+        moved = _kernel_bundle(inp, keys, device)
+        after = dict(_iter_tensors(moved))
+        if set(before) != set(after):
+            problems.append(f"{name}: mover dropped/duplicated tensors")
+        for path, b in before.items():
+            a = after.get(path)
+            if a is None:
+                continue
+            if a.device != device:
+                problems.append(f"{name}/{path} stayed on {a.device}")
+            if a.shape != b.shape or a.dtype != b.dtype:
+                problems.append(f"{name}/{path} changed shape/dtype")
+
+    # (b) the R2 static bundle: the OUTPUT buffer is allocated on the
+    #     target (the val4 bug was a CPU output buffer), and the
+    #     non-tensor sm_scale passes through unchanged.
+    dec = hi.decode_inputs()
+    hi.validate_decode_inputs(dec)
+    static = _r2_static_bundle(dec, device)
+    if static["output"].device != device or (
+        static["output"].shape != dec["q"].shape
+    ):
+        problems.append("r2: output buffer not allocated on the target")
+    if static["sm_scale"] != dec["sm_scale"]:
+        problems.append("r2: sm_scale passthrough broken")
+    for key in _R2_KERNEL_KEYS:
+        if static[key].device != device:
+            problems.append(f"r2/{key} not on the target device")
+
+    # (c) non-tensor entries pass through the mover unchanged.
+    passthrough = _bundle_to_device(
+        {"sm_scale": 0.08, "eps": 1e-4, "none": None}, device
+    )
+    if passthrough != {"sm_scale": 0.08, "eps": 1e-4, "none": None}:
+        problems.append("mower mutated non-tensor entries")
+
+    # (d) the src device gate names every off-device argument: a CUDA
+    #     reference device against CPU tensors must flag each one.
+    cuda_ref = torch.device("cuda:0")
+    r2_named = (
+        ("pool", dec["pool"]), ("topk_idx", dec["topk"]),
+        ("block_table", dec["block_table"]), ("seq_lens", dec["seq_lens"]),
+        ("output", torch.zeros_like(dec["q"])),
+    )
+    flagged = [n for n, _ in q4k._off_device(cuda_ref, r2_named)]
+    if flagged != [n for n, _ in r2_named]:
+        problems.append(f"r2 gate did not name every argument: {flagged}")
+    #     and only the misplaced one when the rest are on the reference.
+    #     (a meta reference device stands in for cuda here: every CPU
+    #     tensor is off-device relative to it, exactly as on GB10.)
+    mixed = [
+        (n, t.to(device) if n != "output" else t)
+        for n, t in r2_named
+    ]
+    flagged = [n for n, _ in q4k._off_device(device, mixed)]
+    if flagged != ["output"]:
+        problems.append(f"r2 gate misreported the mixed bundle: {flagged}")
+
+    # (e) end to end: the real R2 wrapper with an all-CPU bundle fails
+    #     closed BEFORE any triton import, naming the query argument.
+    try:
+        q4k.q4_sparse_decode(
+            dec["q"], dec["pool"], dec["topk"], dec["block_table"],
+            dec["seq_lens"], NKV, dec["sm_scale"],
+            torch.zeros_like(dec["q"]), 1,
+        )
+        problems.append("r2 wrapper accepted an all-CPU bundle")
+    except ValueError as exc:
+        msg = str(exc)
+        if "'q'" not in msg or "cuda" not in msg:
+            problems.append(f"r2 refusal does not name the argument: {msg}")
+    #     and the W1 wrapper does the same for its query tensor.
+    w1 = hi.w1_inputs()
+    hi.validate_w1_inputs(w1)
+    try:
+        nw = w1["norm_ws"]
+        q4k.q4_w1_insert(
+            w1["qkv"], nw["q"], nw["k"], w1["cos_sin"], w1["positions"],
+            hi.NQ, hi.NKV, hi.ROTARY, hi.EPS, nw["iq"], nw["ik"], hi.NIQ,
+            w1["slot_mapping"], w1["index_slot_mapping"], w1["pool"],
+            w1["index_cache"], hi.BLOCK, w1["q_out"], w1["index_q_out"],
+        )
+        problems.append("w1 wrapper accepted an all-CPU bundle")
+    except ValueError as exc:
+        msg = str(exc)
+        if "'qkv'" not in msg or "cuda" not in msg:
+            problems.append(f"w1 refusal does not name the argument: {msg}")
+
+    # (f) the fp8 baseline is a CPU-only reference path: a target-device
+    #     tensor handed to it must fail closed with a named error.
+    try:
+        _fp8_baseline(
+            dec["fp8_pool"].to(device), dec["block_table"], dec["topk"],
+            dec["q"], dec["sm_scale"],
+        )
+        problems.append("fp8 baseline accepted a target-device tensor")
+    except ValueError as exc:
+        if "fp8_pool" not in str(exc):
+            problems.append(f"fp8 baseline refusal unnamed: {exc}")
+
+    return {
+        "passed": not problems,
+        "problems": problems,
+        "summary": (
+            "bundle mover covers every kernel-facing tensor; output "
+            "buffers are allocated on the target; the src device gate "
+            "names every off-device argument"
+            if not problems
+            else "; ".join(problems)
+        ),
+    }
+
+
 def cpu_dry_run() -> int:
     units = [
         ("dry/0-w1-reference-runs", _dry_w1_reference),
@@ -746,6 +996,7 @@ def cpu_dry_run() -> int:
         ("dry/1c-gate-index-codes-selftest", _dry_gate_c),
         ("dry/2-decode-reference-runs", _dry_decode),
         ("dry/3-pool-bytes", unit_3),
+        ("dry/4-device-audit", _dry_device_audit),
     ]
     return run_units(
         units,

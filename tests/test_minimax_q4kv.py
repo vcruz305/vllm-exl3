@@ -775,9 +775,15 @@ def test_w1_insert_hands_fp8_buffers_as_uint8_views(monkeypatch) -> None:
     """GB10 val1 fix: the fp8 index buffers must reach the kernel as uint8
     byte views of the same storage; a raw fp8 pointer makes Triton's
     frontend try to cast the stored bytes to fp8e4nv and fail to compile.
+
+    This test targets the launch-order/view convention only, so it
+    simulates the GPU boundary by patching the wrapper's required device
+    type (the device gate itself is tested separately and must fire on
+    the unpatched wrapper).
     """
     calls: list = []
     _install_kernel_recorders(monkeypatch, calls)
+    monkeypatch.setattr(q4kernels, "_REQUIRED_DEVICE_TYPE", "cpu")
     inp = _real_w1_inputs()
     q4kernels.q4_w1_insert(
         inp["qkv"], inp["norm_w"], inp["norm_w"], inp["cos_sin"],
@@ -813,6 +819,7 @@ def test_w1_insert_none_fallbacks_are_not_viewed(monkeypatch) -> None:
     """
     calls: list = []
     _install_kernel_recorders(monkeypatch, calls)
+    monkeypatch.setattr(q4kernels, "_REQUIRED_DEVICE_TYPE", "cpu")
     inp = _real_w1_inputs()
     q4kernels.q4_w1_insert(
         inp["qkv"], inp["norm_w"], inp["norm_w"], inp["cos_sin"],
@@ -831,9 +838,14 @@ def test_decode_wrapper_boundary_convention(monkeypatch) -> None:
     """R2 takes no fp8 tensors: the uint8 pool must be handed over
     as-is (no view, no copy) and the split-K partials must be bf16/fp32.
     The unchanged vLLM merge kernel is reached through a stub module.
+
+    Launch-order/dtype convention only: the GPU boundary is simulated by
+    patching the required device type (the device gate is tested
+    separately on the unpatched wrapper).
     """
     calls: list = []
     _install_kernel_recorders(monkeypatch, calls)
+    monkeypatch.setattr(q4kernels, "_REQUIRED_DEVICE_TYPE", "cpu")
     merge_calls: list = []
 
     class _MergeKernel:
@@ -1078,14 +1090,19 @@ def test_gb10_harness_validates_inputs_before_every_case() -> None:
             f"{unit} must gate the shared W1 evidence"
         )
     # The decode fixture validates before any R2 launch (units 2 and 4
-    # reach the kernel only through _run_r2, which the fixture precedes).
+    # reach the kernel only through the static-bundle/launch helpers,
+    # which the fixture precedes).
     dec = body("def _decode_fixture")
     assert dec.index("hi.validate_decode_inputs") < dec.index("return inp")
     for unit in ("def unit_2", "def unit_4"):
         b = body(unit)
-        assert b.index("_decode_fixture()") < b.index("_run_r2")
-    run_r2 = body("def _run_r2")
-    assert run_r2.index("q4k.q4_sparse_decode") > 0
+        assert b.index("_decode_fixture()") < b.index("_r2_static_bundle")
+    launch = body("def _launch_r2")
+    assert launch.index("q4k.q4_sparse_decode") > 0
+    # The static bundle moves the kernel-facing inputs with the one
+    # bundle mover and allocates the output buffer ON the target device.
+    static = body("def _r2_static_bundle")
+    assert static.index("_kernel_bundle") < static.index("zeros_like")
     # The dry-run reference units validate their inputs too.
     for unit, act in (
         ("def _dry_w1_reference", "ref.reference_w1_write"),
@@ -1342,8 +1359,118 @@ def test_cpu_dry_run_exercises_the_new_gates() -> None:
         "dry/1c-gate-index-codes-selftest",
         "dry/2-decode-reference-runs",
         "dry/3-pool-bytes",
+        "dry/4-device-audit",
     ):
         assert f'("{name}"' in harness, f"missing dry-run unit {name}"
     assert "bf16_ulp_step" in harness  # the 1-ulp perturbation is exercised
     assert "e4m3_code_step" in harness
     assert "^= 0x01" in harness  # single flipped nibble/scale byte must fail
+
+
+def test_dry_run_device_audit_is_fail_closed() -> None:
+    """The GB10 val4 lesson: a CPU tensor reaching a Triton kernel dies
+    with an opaque pointer error, so --cpu-dry-run must audit device
+    placement on the meta device — the bundle mover must cover every
+    kernel-facing tensor of cases 1/2/4, allocate the R2 output buffer
+    on the target, pass non-tensors through, and prove the src device
+    gate names every off-device argument."""
+    root = Path(__file__).resolve().parents[1]
+    harness = (root / "tools" / "gb10_q4kv_parity.py").read_text()
+
+    def body(marker: str) -> str:
+        start = harness.index(marker)
+        return harness[start:harness.index("\ndef ", start + 1)]
+
+    audit = body("def _dry_device_audit")
+    for needle in (
+        "_bundle_to_device",  # the one mover, exercised on the meta device
+        'torch.device("meta")',  # meta simulates the CUDA target
+        "_off_device",  # the src gate must name every offender
+        "zeros_like",  # the R2 output buffer is allocated on the target
+        "_fp8_baseline",  # the CPU reference paths refuse GPU tensors
+    ):
+        assert needle in audit, f"device audit missing {needle}"
+    # The audit runs against the REAL fixture builders and validators.
+    assert "hi.validate_w1_inputs" in audit
+    assert "hi.validate_decode_inputs" in audit
+    # And the GPU cases move their bundles with the same mover.
+    unit_2 = body("def unit_2")
+    unit_4 = body("def unit_4")
+    for unit in (unit_2, unit_4):
+        assert '_r2_static_bundle(inp, "cuda")' in unit
+    # Case 4 obeys the static-buffer rules: replay must read the CURRENT
+    # bytes of the preallocated CUDA buffers, not the captured bytes.
+    assert "copy_" in unit_4 and "torch.roll" in unit_4
+    assert "mutation_live" in unit_4
+
+
+def test_device_gate_names_every_off_device_argument() -> None:
+    """The src device gate: (a) _off_device must flag every tensor that is
+    not on the reference device and name it, (b) None passes (arguments
+    the caller legitimately omitted), and (c) the real wrappers refuse an
+    all-CPU bundle BEFORE any triton import, naming the query tensor."""
+    cuda = torch.device("cuda:0")
+    meta = torch.device("meta")
+    q = torch.zeros(2, NQ, 128, dtype=torch.bfloat16)
+    pool = _make_pool(4)
+    topk = torch.zeros(NKV, 2, 8, dtype=torch.int32)
+    bt = torch.zeros(2, 8, dtype=torch.int32)
+    seq = torch.full((2,), 8 * 128, dtype=torch.int32)
+    out = torch.zeros_like(q)
+    named = (
+        ("pool", pool), ("topk_idx", topk), ("block_table", bt),
+        ("seq_lens", seq), ("output", out),
+    )
+    # every CPU tensor vs a CUDA reference: all five named.
+    flagged = [n for n, _ in q4kernels._off_device(cuda, named)]
+    assert flagged == ["pool", "topk_idx", "block_table", "seq_lens",
+                       "output"]
+    # only the misplaced one is named when the rest are on the reference.
+    mixed = [(n, t.to(meta) if n != "output" else t) for n, t in named]
+    flagged = [n for n, _ in q4kernels._off_device(meta, mixed)]
+    assert flagged == ["output"]
+    # None (omitted argument) passes.
+    assert q4kernels._off_device(cuda, (("pool", None), ("output", out))) \
+        == [("output", "cpu")]
+    # the real wrappers refuse an all-CPU bundle before any triton
+    # import, naming the query argument (the val4 failure shape).
+    with pytest.raises(ValueError, match="'q'.*cuda"):
+        q4kernels.q4_sparse_decode(
+            q, pool, topk, bt, seq, NKV, 0.08, out, 1
+        )
+    w1 = _real_w1_inputs()
+    with pytest.raises(ValueError, match="'qkv'.*cuda"):
+        q4kernels.q4_w1_insert(
+            w1["qkv"], w1["norm_w"], w1["norm_w"], w1["cos_sin"],
+            w1["positions"], NQ, NKV, ROTARY, EPS,
+            w1["norm_w"], w1["norm_w"], NIQ,
+            w1["slot_mapping"], w1["index_slot_mapping"], w1["pool"],
+            w1["index_cache"], 128, w1["q_out"], w1["index_q_out"],
+        )
+
+
+def test_device_gate_does_not_replace_the_geometry_checks(monkeypatch) -> None:
+    """With the GPU boundary simulated, the wrapper's geometry refusals
+    must still fire: the device gate comes first, it does not shadow the
+    fail-closed geometry validation."""
+    monkeypatch.setattr(q4kernels, "_REQUIRED_DEVICE_TYPE", "cpu")
+    q = torch.zeros(2, NQ, 128, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="head_dim"):
+        q4kernels.q4_sparse_decode(
+            q[:, :, :64], _make_pool(4),
+            torch.zeros(NKV, 2, 8, dtype=torch.int32),
+            torch.zeros(2, 8, dtype=torch.int32),
+            torch.full((2,), 8 * 128, dtype=torch.int32),
+            NKV, 0.08, torch.zeros(2, NQ, 64, dtype=torch.bfloat16), 1,
+        )
+    # and the fail-closed W1 validation still runs after the device gate.
+    w1 = _real_w1_inputs()
+    with pytest.raises(ValueError, match="q4 W1 refused"):
+        q4kernels.q4_w1_insert(
+            w1["qkv"], w1["norm_w"], w1["norm_w"], w1["cos_sin"],
+            w1["positions"], NQ, NKV, ROTARY, EPS,
+            w1["norm_w"], w1["norm_w"], NIQ,
+            w1["slot_mapping"], w1["index_slot_mapping"],
+            torch.zeros(4, NKV, 128, 256, dtype=torch.uint8),  # fp8 pool
+            w1["index_cache"], 128, w1["q_out"], w1["index_q_out"],
+        )
