@@ -43,6 +43,12 @@ worktree bind-mounted at /plugin and PYTHONPATH=/plugin/src:
           mixed-K batched dispatch the serve takes for this pack at EVERY
           batch shape, against a definitional mul1-dequant + act-3
           reference per projection.
+  Case G  REAL layer-0 index_q/index_k through the plugin's
+          VLLM_EXL3_INDEXER_MXFP8 glue (retention -> vLLM's own MXFP8
+          linear kernel, resolved fail-closed), against the BF16-dequant
+          reference the default path computes from the same bytes; gates
+          cosine >= 0.9999, max-abs within a factor of 4 of the
+          reference, zero NaN, and unchanged payload bits.
 
 ``--cpu-selftest`` runs everything that needs no kernel launch (Case C in
 full, the pack/reference construction of A/B/D, the entry-point act
@@ -147,6 +153,20 @@ F_LAYER = 3
 F_EXPERTS = (2, 0, 1)
 F_HIDDEN, F_INTER = 6144, 3072
 F_MS = (1, 96)
+
+# Case G (retained-MXFP8 indexer): the REAL layer-0 index_q/index_k shards
+# through the plugin's VLLM_EXL3_INDEXER_MXFP8 glue -- retention ->
+# vLLM's own MXFP8 linear kernel (the sm_121 backend the image selects) --
+# against the BF16-dequant reference the default path computes. The gate is
+# stricter than COS_MIN: the indexer projections are small GEMMs whose
+# outputs feed the sparse-attention scores, so the retained path must be
+# near-identical to the dequant path.
+G_COS_MIN = 0.9999
+# Max-abs bound: the kernel output's magnitude must stay within a factor
+# of the reference (catches scale blow-up/collapse that a cosine alone
+# can miss); the accuracy gate is the cosine.
+G_ABS_FACTOR = 4.0
+G_MS = (1, 64)
 
 
 def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -1427,6 +1447,166 @@ def _case_f(device: torch.device, token_file: str | None) -> dict[str, Any]:
     }
 
 
+# ── Case G: retained-MXFP8 indexer vs the BF16-dequant reference ──────────
+
+
+def _case_g(device: torch.device, token_file: str | None) -> dict[str, Any]:
+    """REAL layer-0 index_q/index_k through the VLLM_EXL3_INDEXER_MXFP8 glue.
+
+    The exact production path the opt-in switch drives at load: the
+    plugin's retention (F8_E4M3 payload bitcast + row-major E8M0 block-32
+    scales), vLLM's own MXFP8 linear kernel resolved fail-closed, the
+    kernel's load step (its F8_128x4 scale swizzle), then its apply at
+    decode- and prefill-family row counts -- against the BF16-dequant
+    reference the default (switch-off) path computes from the same bytes.
+    Gates: cosine >= G_COS_MIN, max-abs within G_ABS_FACTOR of the
+    reference, zero NaN, and the payload bytes unchanged by the kernel's
+    load step (a value cast would destroy the E4M3 bit pattern, the
+    run-3 lesson).
+    """
+    entries = _fixture_entries()
+    if not token_file:
+        token_file = E_TOKEN_FILE
+    if not os.path.isfile(token_file):
+        return {
+            "skip": (
+                f"no HF token file at {token_file}; Case G (real pack "
+                "indexer MXFP8) needs --hf-token-file"
+            )
+        }
+    with open(token_file, encoding="utf-8") as fh:
+        token = fh.read().strip()
+    if not token:
+        return {"error": "empty HF token file", "pass": False}
+
+    data_base, header = _shard_header(token)
+    names = {
+        "iq_w": "language_model.model.layers.0.self_attn.index_q_proj.weight",
+        "iq_s": "language_model.model.layers.0.self_attn.index_q_proj.weight_scale_inv",
+        "ik_w": "language_model.model.layers.0.self_attn.index_k_proj.weight",
+        "ik_s": "language_model.model.layers.0.self_attn.index_k_proj.weight_scale_inv",
+    }
+
+    def fetch(tag: str) -> torch.Tensor:
+        name = names[tag]
+        ent = entries[name]
+        hdr = header.get(name)
+        if hdr is None:
+            raise RuntimeError(f"{name} is not in the shard header")
+        if hdr.get("dtype") != ent["dtype"]:
+            raise RuntimeError(
+                f"{name}: header dtype {hdr.get('dtype')} != census "
+                f"{ent['dtype']}"
+            )
+        if list(hdr.get("shape", [])) != list(ent["shape"]):
+            raise RuntimeError(
+                f"{name}: header shape {hdr.get('shape')} != census "
+                f"{ent['shape']}"
+            )
+        b, e = hdr["data_offsets"]
+        if e - b != ent["bytes"]:
+            raise RuntimeError(
+                f"{name}: header span {e - b} != census {ent['bytes']} bytes"
+            )
+        raw = _hf_range(token, data_base + b, e - b)
+        u8 = torch.frombuffer(bytearray(raw), dtype=torch.uint8).to(device)
+        t = exl3.coerce_checkpoint_region(
+            u8, _TORCH_DTYPES[ent["dtype"]], ent["shape"]
+        )
+        # The F8_E4M3 payload arrives as float8 (the safetensors dtype);
+        # the plugin's retention bitcasts it back for the kernel.
+        return t
+
+    x = torch.randn(max(G_MS), B_IN, dtype=torch.bfloat16, device=device) * 0.1
+    shards = []
+    for tag_w, tag_s, label in (
+        ("iq_w", "iq_s", "index_q"),
+        ("ik_w", "ik_s", "index_k"),
+    ):
+        payload = fetch(tag_w).view(torch.uint8)
+        scales = fetch(tag_s)
+        # The BF16-dequant reference: exactly what the default path's
+        # staging computes from the same bytes (hand decode, independent
+        # of the plugin's dequant).
+        ref_w = _mxfp8_dequant(payload, scales)
+        entry: dict[str, Any] = {
+            "shard": label,
+            "shape": list(payload.shape),
+            "bf16_mib_per_layer": round(
+                ref_w.numel() * 2 / 2**20, 3
+            ),
+        }
+        try:
+            # The production glue, fail closed: retention -> kernel ->
+            # shim -> the kernel's own load step.
+            payload_fp8, scales_u8 = exl3.indexer_mxfp8_retain(
+                payload, scales
+            )
+            kernel = exl3.indexer_mxfp8_kernel(tuple(payload_fp8.shape))
+            shim = exl3.make_indexer_mxfp8_shim(payload_fp8, scales_u8)
+            kernel.process_weights_after_loading(shim)
+            torch.cuda.synchronize()
+            # The kernel's load step must not touch the payload bits and
+            # must have re-ordered the scale block (its F8_128x4 swizzle).
+            entry["payload_bits_unchanged"] = bool(
+                torch.equal(shim.weight.data.view(torch.uint8), payload)
+            )
+            entry["scale_block_reordered"] = bool(
+                shim.weight_scale.data.reshape(-1).numel()
+                == scales_u8.numel()
+                and not torch.equal(shim.weight_scale.data.reshape(-1), scales_u8.reshape(-1))
+            )
+            entry["retained_mib_per_layer"] = round(
+                (payload.numel() + scales.numel()) / 2**20, 3
+            )
+            per_m: dict[str, Any] = {}
+            for m in G_MS:
+                y = kernel.apply_weights(shim, x[:m].contiguous())
+                torch.cuda.synchronize()
+                y_ref = (
+                    x[:m].float() @ ref_w.t().float()
+                )
+                nan = int(torch.isnan(y).sum().item())
+                max_y = float(y.abs().max().item()) if y.numel() else 0.0
+                max_ref = float(y_ref.abs().max().item()) or 1.0
+                per_m[f"m{m}"] = {
+                    "cosine": round(_cos(y, y_ref), 6) if nan == 0 else None,
+                    "max_abs": round(max_y, 6),
+                    "max_abs_ratio": round(max_y / max_ref, 6),
+                    "nan": nan,
+                }
+            entry["per_m"] = per_m
+            entry["pass"] = (
+                entry["payload_bits_unchanged"]
+                and entry["scale_block_reordered"]
+                and all(
+                    v["cosine"] is not None
+                    and v["cosine"] >= G_COS_MIN
+                    and 1.0 / G_ABS_FACTOR <= v["max_abs_ratio"] <= G_ABS_FACTOR
+                    and v["nan"] == 0
+                    for v in per_m.values()
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Fail closed is a FAIL here, not a skip: the switch-on path
+            # must run on the device the serve targets.
+            entry["error"] = str(exc)[:400]
+            entry["pass"] = False
+        finally:
+            torch.cuda.empty_cache()
+        shards.append(entry)
+        del ref_w
+        torch.cuda.empty_cache()
+    return {
+        "backend": "FlashInferCutlassMxfp8LinearKernel (vLLM's own, via the "
+        "plugin's fail-closed resolver)",
+        "gate": f"cos>={G_COS_MIN} max_abs_ratio in "
+        f"[{1.0 / G_ABS_FACTOR}, {G_ABS_FACTOR}] nan==0",
+        "shards": shards,
+        "pass": all(s.get("pass") for s in shards),
+    }
+
+
 # ── CPU self-test ──────────────────────────────────────────────────────────
 
 
@@ -1797,6 +1977,40 @@ def _selftest() -> int:
     _check("load cross-validates the K arrays against the K-group tuples",
            "K arrays disagree with the per-K-group tuples" in esrc)
 
+    # Case G structure: the retained-MXFP8 indexer case must gate on the
+    # strict cosine AND a max-abs bound, run the REAL layer-0 bytes
+    # through the plugin's own production glue, and treat a fail-closed
+    # resolver as a FAIL (never a skip and never a BF16 fallback).
+    _check("case G gate is stricter than the harness minimum",
+           G_COS_MIN == 0.9999 and G_COS_MIN > COS_MIN
+           and G_ABS_FACTOR == 4.0)
+    g_seg = src.split("def _case_g", 1)[1].split("# ── CPU self-test", 1)[0]
+    _check("case G runs the real layer-0 indexer through the plugin glue",
+           "index_q_proj.weight" in g_seg and "index_k_proj.weight" in g_seg
+           and "exl3.indexer_mxfp8_retain" in g_seg
+           and "exl3.indexer_mxfp8_kernel" in g_seg
+           and "exl3.make_indexer_mxfp8_shim" in g_seg
+           and "_mxfp8_dequant" in g_seg)
+    _check("case G gates cosine, max-abs and NaN",
+           "G_COS_MIN" in g_seg and "G_ABS_FACTOR" in g_seg
+           and "max_abs_ratio" in g_seg and '"nan"] == 0' in g_seg)
+    _check("case G keeps the fail-closed resolver a FAIL, never a skip",
+           'entry["error"] = str(exc)[:400]' in g_seg
+           and 'entry["pass"] = False' in g_seg.split("except Exception", 1)[1][:400])
+    # Plugin-side: the retention resolver must be fail-closed (both the
+    # platform and the shape gate, clear errors naming the switch), the
+    # BF16 staging union must be gated on the switch, and apply must route
+    # the two indexer slices through the bound kernel.
+    resolver_seg = esrc.split("def indexer_mxfp8_kernel", 1)[1]
+    resolver_seg = resolver_seg.split("def make_indexer_mxfp8_shim", 1)[0]
+    _check("plugin indexer kernel resolver is fail-closed",
+           "is_supported" in resolver_seg and "can_implement" in resolver_seg
+           and "VLLM_EXL3_INDEXER_MXFP8=1" in resolver_seg)
+    _check("the BF16 staging union is gated on the switch",
+           "if indexer_shards and not _indexer_mxfp8_enabled():" in esrc)
+    _check("apply routes the indexer slices through the bound kernel",
+           "kernel.apply_weights(shim, x_2d)" in esrc)
+
     print("GB10_MINIMAX_M3_PARITY SELFTEST " + ("PASS" if ok else "FAIL")
           + " (no hardware parity claim)")
     return 0 if ok else 1
@@ -1883,6 +2097,14 @@ def main() -> int:
     else:
         print(f"case F: {receipt['case_f']}")
         verdict = verdict and bool(receipt["case_f"].get("pass"))
+
+    receipt["case_g"] = _case_g(device, args.hf_token_file)
+    if "skip" in receipt["case_g"]:
+        print(f"case G: SKIP ({receipt['case_g']['skip']})")
+    else:
+        for ent in receipt["case_g"].get("shards", []):
+            print(f"case G shard={ent.get('shard')}: {ent}")
+        verdict = verdict and bool(receipt["case_g"].get("pass"))
 
     receipt["mem_peak_gib"] = round(
         torch.cuda.max_memory_allocated() / 2**30, 3

@@ -436,6 +436,47 @@ def test_case_f_probes_the_router_weight_applied_exactly_once():
     assert "w * refs[e][:m]" in seg
 
 
+# ── Case G: retained-MXFP8 indexer (VLLM_EXL3_INDEXER_MXFP8) ───────────────
+
+
+def test_case_g_gates_the_real_indexer_shards():
+    # Case G reads the SAME pinned layer-0 fixture tensors Case E reads,
+    # drives the plugin's production retention glue, and gates on the
+    # strict cosine + max-abs bound; a fail-closed kernel resolver is a
+    # FAIL, never a skip and never a BF16 fallback.
+    tool = _tool()
+    src = (REPO / "tools/gb10_minimax_m3_parity.py").read_text()
+    seg = src.split("def _case_g(", 1)[1].split("# ── CPU self-test", 1)[0]
+    assert "index_q_proj.weight" in seg and "index_k_proj.weight" in seg
+    assert "exl3.indexer_mxfp8_retain" in seg
+    assert "exl3.indexer_mxfp8_kernel" in seg
+    assert "exl3.make_indexer_mxfp8_shim" in seg
+    # The reference is the BF16 dequant of the same bytes (the default
+    # path's staging), never the kernel's own output.
+    assert "_mxfp8_dequant" in seg
+    assert tool.G_COS_MIN == 0.9999 and tool.G_COS_MIN > tool.COS_MIN
+    assert tool.G_ABS_FACTOR == 4.0
+    assert "max_abs_ratio" in seg and '"nan"] == 0' in seg
+    assert 'entry["error"] = str(exc)[:400]' in seg
+    assert 'entry["pass"] = False' in seg.split("except Exception", 1)[1][:400]
+    # main() wires the case into the overall verdict.
+    main_seg = src.split("def main(", 1)[1]
+    assert 'receipt["case_g"]' in main_seg
+    assert 'verdict and bool(receipt["case_g"].get("pass"))' in main_seg
+
+
+def test_case_g_is_skipped_without_a_token_file():
+    tool = _tool()
+    res = tool._case_g(torch.device("cpu"), "/nonexistent-token-file")
+    assert "skip" in res and "pass" not in res
+
+
+def test_case_g_gate_constants_are_pinned():
+    tool = _tool()
+    assert tool.G_MS == (1, 64)
+
+
+
 def test_plugin_karrays_carry_the_true_bit_width():
     # Run 5's root cause: build_exl3_fused_state built the unified kernel's
     # per-expert K arrays as trellis.shape[-1] // 8 = 2*K, but the kernel

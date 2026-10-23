@@ -1893,6 +1893,136 @@ def dequant_minimax_indexer(
     return weight.reshape(out_rows, in_cols).to(torch.bfloat16)
 
 
+def _indexer_mxfp8_enabled() -> bool:
+    """Whether VLLM_EXL3_INDEXER_MXFP8 keeps the indexer shards in MXFP8.
+
+    Default OFF: the indexer projections are dequantized to BF16 at load,
+    exactly as before this switch existed. When ON, the two shards stay
+    (F8_E4M3 payload, E8M0 block-32 scales) on device and their GEMM runs
+    vLLM's own MXFP8 linear kernel; the kernel must be available or the
+    load fails closed (no silent BF16 fallback).
+    """
+    return os.environ.get("VLLM_EXL3_INDEXER_MXFP8", "").strip() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _validate_indexer_mxfp8_geometry(
+    packed: "torch.Tensor",
+    scales: "torch.Tensor",
+    block: int = MINIMAX_MXFP8_BLOCK,
+) -> tuple[int, int]:
+    out_rows, in_cols = int(packed.shape[0]), int(packed.shape[1])
+    if packed.dim() != 2 or in_cols % block:
+        raise ValueError(
+            f"MXFP8 indexer retention: payload must be 2D with an input dim "
+            f"divisible by the {block}-wide scale block, got "
+            f"{tuple(packed.shape)}"
+        )
+    if tuple(scales.shape) != (out_rows, in_cols // block):
+        raise ValueError(
+            f"MXFP8 indexer retention: scales shape {tuple(scales.shape)} "
+            f"does not match ({out_rows}, {in_cols // block})"
+        )
+    return out_rows, in_cols
+
+
+def indexer_mxfp8_retain(
+    packed: "torch.Tensor",
+    scales: "torch.Tensor",
+    block: int = MINIMAX_MXFP8_BLOCK,
+) -> tuple["torch.Tensor", "torch.Tensor"]:
+    """Retain an indexer projection in its native MXFP8 checkpoint form.
+
+    The complement of :func:`dequant_minimax_indexer` for the
+    VLLM_EXL3_INDEXER_MXFP8 path: instead of decoding the payload to BF16,
+    keep it as the (F8_E4M3 payload, E8M0 block-32 scale) pair vLLM's MXFP8
+    linear kernel consumes. The payload is bitcast (never value-cast) to
+    ``float8_e4m3fn`` -- the safetensors dtype the kernel asserts -- and the
+    scale bytes stay ``uint8`` row-major ``[out, in // block]``, the layout
+    the kernel's own ``process_weights_after_loading`` expects before it
+    swizzles them into the F8_128x4 order the GEMM reads.
+    """
+    _validate_indexer_mxfp8_geometry(packed, scales, block)
+    if scales.dtype != torch.uint8:
+        raise ValueError(
+            "MXFP8 indexer retention: scales must be uint8 E8M0 exponent "
+            f"bytes, got {scales.dtype}"
+        )
+    payload_fp8 = (
+        packed.view(torch.uint8).view(torch.float8_e4m3fn).contiguous()
+        if packed.dtype != torch.float8_e4m3fn
+        else packed.contiguous()
+    )
+    return payload_fp8, scales.contiguous()
+
+
+def indexer_mxfp8_kernel(weight_shape: tuple[int, int]):
+    """Resolve vLLM's MXFP8 linear kernel for an indexer shard, fail closed.
+
+    Imports vLLM's own FlashInfer CUTLASS MXFP8 linear kernel (the backend
+    the sm_121 image selects for the DSpark draft's ModelOpt MXFP8 layers)
+    and instantiates it for ``weight_shape``. Both the platform gate
+    (``is_supported``) and the shape gate (``can_implement``) must admit
+    the shard; anything else is a clear error, never a BF16 fallback.
+    """
+    try:
+        from vllm.model_executor.kernels.linear.mxfp8.Mxfp8LinearKernel import (
+            Mxfp8LinearLayerConfig,
+        )
+        from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+            FlashInferCutlassMxfp8LinearKernel,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "VLLM_EXL3_INDEXER_MXFP8=1 requires vLLM's MXFP8 linear kernel "
+            "API (vllm.model_executor.kernels.linear.mxfp8) and it could "
+            f"not be imported: {exc!r}"
+        ) from exc
+    supported, reason = FlashInferCutlassMxfp8LinearKernel.is_supported()
+    if not supported:
+        raise RuntimeError(
+            "VLLM_EXL3_INDEXER_MXFP8=1: vLLM's FlashInfer CUTLASS MXFP8 "
+            f"linear kernel is unavailable on this platform: {reason}"
+        )
+    config = Mxfp8LinearLayerConfig(weight_shape=tuple(weight_shape))
+    implementable, reason = FlashInferCutlassMxfp8LinearKernel.can_implement(
+        config
+    )
+    if not implementable:
+        raise RuntimeError(
+            "VLLM_EXL3_INDEXER_MXFP8=1: vLLM's FlashInfer CUTLASS MXFP8 "
+            f"linear kernel refuses the indexer shard shape "
+            f"{tuple(weight_shape)}: {reason}"
+        )
+    return FlashInferCutlassMxfp8LinearKernel(config)
+
+
+def make_indexer_mxfp8_shim(
+    payload_fp8: "torch.Tensor",
+    scales: "torch.Tensor",
+    params_dtype: "torch.dtype" = torch.bfloat16,
+):
+    """Build the parameter shim vLLM's MXFP8 kernel applies against.
+
+    The kernel's ``process_weights_after_loading`` / ``apply_weights``
+    read ``weight`` (F8_E4M3, ``[N, K]``), ``weight_scale`` (uint8 E8M0,
+    ``[N, K // 32]`` row-major before its own swizzle) and
+    ``params_dtype`` (the activation/output dtype the layer runs). The
+    indexer shards are the only consumers, so a shim per shard is kept
+    instead of registering vLLM parameters on the fused layer.
+    """
+    from types import SimpleNamespace
+
+    shim = SimpleNamespace()
+    shim.weight = torch.nn.Parameter(payload_fp8, requires_grad=False)
+    shim.weight_scale = torch.nn.Parameter(scales, requires_grad=False)
+    shim.params_dtype = params_dtype
+    return shim
+
+
 
 def moe_layer_is_gateless(layer: torch.nn.Module) -> bool:
     """Whether this layer's experts are non-gated (no gate projection at all)."""
@@ -5669,7 +5799,11 @@ class Exl3LinearMethod(LinearMethodBase):
         # Unified BF16-staging shard list: config bf16 shards plus the
         # dequantized indexer shards, in ascending order (the apply-side row
         # offsets and the staging allocation must agree on this ordering).
-        bf16_shards = sorted(set(bf16_shards) | set(indexer_shards))
+        # With VLLM_EXL3_INDEXER_MXFP8=1 the indexer shards stay MXFP8 and
+        # run vLLM's own MXFP8 linear kernel instead, so they must NOT enter
+        # the BF16 staging (neither its allocation nor its apply-side rows).
+        if indexer_shards and not _indexer_mxfp8_enabled():
+            bf16_shards = sorted(set(bf16_shards) | set(indexer_shards))
 
         # K words per shard
         k_words = self.bits * 16
@@ -6128,13 +6262,19 @@ class Exl3LinearMethod(LinearMethodBase):
         n_shards = int(layer._exl3_linear_n_shards)
         output_sizes = layer._exl3_linear_output_partition_sizes
         bf16_shards = getattr(layer, "_exl3_linear_bf16_shards", [])
+        # VLLM_EXL3_INDEXER_MXFP8=1 keeps the indexer shards MXFP8 (payload +
+        # E8M0 scales handed to vLLM's own MXFP8 linear kernel); the default
+        # path dequantizes them into the BF16 staging rows as before.
+        indexer_shards = getattr(layer, "_exl3_indexer_shards", ())
+        indexer_mxfp8 = bool(indexer_shards) and _indexer_mxfp8_enabled()
 
         mcg_vals = layer.mcg.reshape(-1)
         mul1_vals = layer.mul1.reshape(-1)
 
         for i in range(n_shards):
             # Skip marker checks for bf16 shards - they don't use LinearEXL3
-            if i in bf16_shards:
+            # (and for retained-MXFP8 indexer shards, which are not EXL3).
+            if i in bf16_shards or (indexer_mxfp8 and i in indexer_shards):
                 continue
             mcg_is_set = mcg_vals[i].item() != 0
             mul1_is_set = mul1_vals[i].item() != 0
@@ -6168,6 +6308,10 @@ class Exl3LinearMethod(LinearMethodBase):
             n_shards > 1
             and not bf16_shards
             and not padded
+            # The retained-MXFP8 indexer shards are not EXL3 and must keep
+            # their per-shard slots (one kernel shim each), so the fused
+            # qkv+indexer layer never coalesces on this path either.
+            and not indexer_mxfp8
             and os.environ.get("VLLM_EXL3_COALESCE_SHARDS", "1") != "0"
         )
         linears = []
@@ -6227,6 +6371,11 @@ class Exl3LinearMethod(LinearMethodBase):
                     # bf16 shards don't use LinearEXL3; store None as placeholder
                     linears.append(None)
                     continue
+                if indexer_mxfp8 and i in indexer_shards:
+                    # Retained-MXFP8 indexer shards run vLLM's MXFP8 kernel
+                    # (one shim per shard, built below); no LinearEXL3.
+                    linears.append(None)
+                    continue
                 trellis_shard = layer._exl3_shard_trellis[i].detach().contiguous()
                 if trellis_shard.numel() == 0:
                     raise RuntimeError(
@@ -6248,38 +6397,16 @@ class Exl3LinearMethod(LinearMethodBase):
         layer._exl3_opaque_name = _exl3_register_opaque_layer(layer, "linear", self)
 
         # Keep bf16 weights if present, remove weight staging param if all loaded
-        # MiniMax indexer shards first: dequantize the stashed MXFP8 payloads
-        # (F8_E4M3 + E8M0 block-32 scales) into their BF16 staging rows; the
-        # bf16 handling below then carries them into _exl3_bf16_weight and
-        # apply() runs the plain BF16 GEMM for these two slices of the fused
+        # MiniMax indexer shards first: either dequantized into the BF16
+        # staging rows (default) or retained in MXFP8 for vLLM's own kernel
+        # (VLLM_EXL3_INDEXER_MXFP8=1); the bf16 handling below then carries
+        # the default path's rows into _exl3_bf16_weight and apply() runs
+        # the plain BF16 GEMM for those two slices of the fused
         # [q | k | v | index_q | index_k] output.
-        indexer_shards = getattr(layer, "_exl3_indexer_shards", ())
         if indexer_shards:
-            staging_in = int(layer.weight.data.shape[1])
-            for slot, shard_idx in enumerate(indexer_shards):
-                payload = layer._exl3_indexer_payloads[slot]
-                scales = layer._exl3_indexer_scales[slot]
-                if payload is None or scales is None:
-                    raise RuntimeError(
-                        f"EXL3 indexer shard {shard_idx} incomplete at load end "
-                        f"(payload={'set' if payload is not None else 'missing'}, "
-                        f"scales={'set' if scales is not None else 'missing'})"
-                    )
-                if payload.dtype != torch.uint8:
-                    payload = payload.view(torch.uint8)
-                weight_bf16 = dequant_minimax_indexer(payload, scales)
-                bf16_idx = bf16_shards.index(shard_idx)
-                row_start = sum(output_sizes[j] for j in bf16_shards[:bf16_idx])
-                row_end = row_start + output_sizes[shard_idx]
-                if tuple(weight_bf16.shape) != (row_end - row_start, staging_in):
-                    raise RuntimeError(
-                        f"EXL3 indexer shard {shard_idx} dequant shape "
-                        f"{tuple(weight_bf16.shape)} does not match its staging "
-                        f"rows ({row_end - row_start}, {staging_in})"
-                    )
-                layer.weight.data[row_start:row_end].copy_(weight_bf16)
-                layer._exl3_indexer_payloads[slot] = None
-                layer._exl3_indexer_scales[slot] = None
+            self._process_indexer_shards(
+                layer, output_sizes, bf16_shards, indexer_shards, indexer_mxfp8
+            )
         if bf16_shards and hasattr(layer, "weight"):
             bf16_rows = sum(output_sizes[i] for i in bf16_shards)
             if bf16_rows > 0:
@@ -6310,6 +6437,73 @@ class Exl3LinearMethod(LinearMethodBase):
                 delattr(layer, "_exl3_shard_trellis")
             except Exception:
                 pass
+
+    def _process_indexer_shards(
+        self,
+        layer,
+        output_sizes,
+        bf16_shards,
+        indexer_shards,
+        indexer_mxfp8,
+    ) -> None:
+        """Finish the MiniMax MSA indexer shards at load end.
+
+        Default (switch off): dequantize the stashed MXFP8 payloads
+        (F8_E4M3 + E8M0 block-32 scales) into their BF16 staging rows --
+        byte-identical to the pre-switch loader. With
+        VLLM_EXL3_INDEXER_MXFP8=1: retain each shard in its native MXFP8
+        form (payload fp8 + E8M0 scales in the layout vLLM's kernel
+        expects) and bind vLLM's own MXFP8 linear kernel, failing closed
+        if the kernel is unavailable; the stash is freed either way.
+        """
+        if indexer_mxfp8:
+            shims = []
+            for slot, shard_idx in enumerate(indexer_shards):
+                payload = layer._exl3_indexer_payloads[slot]
+                scales = layer._exl3_indexer_scales[slot]
+                if payload is None or scales is None:
+                    raise RuntimeError(
+                        f"EXL3 indexer shard {shard_idx} incomplete at load end "
+                        f"(payload={'set' if payload is not None else 'missing'}, "
+                        f"scales={'set' if scales is not None else 'missing'})"
+                    )
+                payload_fp8, scales_u8 = indexer_mxfp8_retain(payload, scales)
+                kernel = indexer_mxfp8_kernel(tuple(payload_fp8.shape))
+                shim = make_indexer_mxfp8_shim(payload_fp8, scales_u8)
+                # The kernel's own load-time step: it swizzles the E8M0
+                # block into the F8_128x4 order its GEMM reads; the fp8
+                # payload stays 1 byte/elem on device.
+                kernel.process_weights_after_loading(shim)
+                shims.append((kernel, shim))
+                layer._exl3_indexer_payloads[slot] = None
+                layer._exl3_indexer_scales[slot] = None
+            layer._exl3_indexer_mxfp8 = shims
+            return
+        staging_in = int(layer.weight.data.shape[1])
+        for slot, shard_idx in enumerate(indexer_shards):
+            payload = layer._exl3_indexer_payloads[slot]
+            scales = layer._exl3_indexer_scales[slot]
+            if payload is None or scales is None:
+                raise RuntimeError(
+                    f"EXL3 indexer shard {shard_idx} incomplete at load end "
+                    f"(payload={'set' if payload is not None else 'missing'}, "
+                    f"scales={'set' if scales is not None else 'missing'})"
+                )
+            if payload.dtype != torch.uint8:
+                payload = payload.view(torch.uint8)
+            weight_bf16 = dequant_minimax_indexer(payload, scales)
+            bf16_idx = bf16_shards.index(shard_idx)
+            row_start = sum(output_sizes[j] for j in bf16_shards[:bf16_idx])
+            row_end = row_start + output_sizes[shard_idx]
+            if tuple(weight_bf16.shape) != (row_end - row_start, staging_in):
+                raise RuntimeError(
+                    f"EXL3 indexer shard {shard_idx} dequant shape "
+                    f"{tuple(weight_bf16.shape)} does not match its staging "
+                    f"rows ({row_end - row_start}, {staging_in})"
+                )
+            layer.weight.data[row_start:row_end].copy_(weight_bf16)
+            layer._exl3_indexer_payloads[slot] = None
+            layer._exl3_indexer_scales[slot] = None
 
     def apply(
         self,
@@ -6358,10 +6552,21 @@ class Exl3LinearMethod(LinearMethodBase):
         output_sizes = layer._exl3_linear_output_partition_sizes
         n_shards = len(linears)
 
+        # Retained-MXFP8 indexer shards (VLLM_EXL3_INDEXER_MXFP8=1): one
+        # (kernel, shim) pair per shard; their GEMM is vLLM's own MXFP8
+        # linear kernel and the output slice lands in the same fused
+        # [q | k | v | index_q | index_k] layout with the same dtype.
+        indexer_mxfp8 = getattr(layer, "_exl3_indexer_mxfp8", None)
+        indexer_shard_ids = getattr(layer, "_exl3_indexer_shards", ())
+
         # Run each shard in declared order
         outputs = []
         for i in range(n_shards):
-            if i in bf16_shards:
+            if indexer_mxfp8 is not None and i in indexer_shard_ids:
+                kernel, shim = indexer_mxfp8[indexer_shard_ids.index(i)]
+                out = kernel.apply_weights(shim, x_2d).to(dtype=torch.float32)
+                outputs.append(out)
+            elif i in bf16_shards:
                 # BF16 shard: use dense linear
                 if bf16_weight is None:
                     raise RuntimeError(
