@@ -131,3 +131,12 @@ def test_register_installs_the_trim_wrapper():
 
     vllm_exl3.register()
     assert getattr(exl3.prepare_trellis_arena_plan, "_uma_trim", False)
+
+
+def test_tensor_census_counts_cpu_storages_once():
+    torch = pytest.importorskip("torch")
+    a = torch.zeros(1024, 1024, dtype=torch.int16)
+    b = a[:10]  # same storage
+    line = uma.tensor_census()
+    assert line.startswith("TENSORS cpu_storages=") and "(1024, 1024):int16x1=2MiB" in line
+    del a, b

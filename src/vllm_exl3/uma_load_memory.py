@@ -106,6 +106,68 @@ def mem_line(tag: str) -> str:
     )
 
 
+def tensor_census(top: int = 6) -> str:
+    """Live CPU tensors by unique storage (VLLM_EXL3_MEM_PROBE_TENSORS=1 only).
+
+    Counts every CPU torch tensor the garbage collector can see, once per
+    storage, split into pinned and pageable, with the largest (shape, dtype)
+    groups. Storages that view a mapped file are counted too; the group shapes
+    tell them apart from anonymous copies.
+    """
+    import collections
+
+    try:
+        import torch
+    except Exception:
+        return "TENSORS unavailable"
+    seen: set[int] = set()
+    total = pinned = 0
+    by_key: collections.Counter = collections.Counter()
+    n_key: collections.Counter = collections.Counter()
+    for obj in gc.get_objects():
+        try:
+            if not isinstance(obj, torch.Tensor) or obj.device.type != "cpu":
+                continue
+            st = obj.untyped_storage()
+            ptr = int(st.data_ptr())
+            if ptr == 0 or ptr in seen:
+                continue
+            seen.add(ptr)
+            nbytes = int(st.nbytes())
+            total += nbytes
+            if obj.is_pinned():
+                pinned += nbytes
+            key = (tuple(int(x) for x in obj.shape[:4]), str(obj.dtype).replace("torch.", ""))
+            by_key[key] += nbytes
+            n_key[key] += 1
+        except Exception:
+            continue
+    tops = ", ".join(
+        f"{k[0]}:{k[1]}x{n_key[k]}={v / 2**20:.0f}MiB" for k, v in by_key.most_common(top)
+    )
+    host = ""
+    try:
+        hs = torch.cuda.host_memory_stats()
+        host = (
+            f" host_alloc={hs.get('allocated_bytes.current', hs.get('allocated_bytes', 0)) / 2**30:.2f}GiB"
+            f" host_reserved={hs.get('reserved_bytes.current', hs.get('reserved_bytes', 0)) / 2**30:.2f}GiB"
+        )
+    except Exception:
+        pass
+    p1 = df = ""
+    try:
+        from . import exl3 as _ex
+
+        p1 = f" p1={dict(_ex._P1_STATS)}"
+        df = f" fill_calls={_ex._DIRECT_FILL_STATS.get('DIRECT_FILL_CALLS')}"
+    except Exception:
+        pass
+    return (
+        f"TENSORS cpu_storages={len(seen)} cpu={total / 2**30:.2f}GiB "
+        f"pinned={pinned / 2**30:.2f}GiB{host}{p1}{df} top=[{tops}]"
+    )
+
+
 def trim() -> None:
     """Return freed host and CUDA blocks to the shared pool."""
     gc.collect()
@@ -133,6 +195,8 @@ def postload(model: Any) -> int:
     STATS["postload_runs"] += 1
     if probe_enabled():
         logger.info("%s", mem_line("POST_LOAD"))
+        if _flag("VLLM_EXL3_MEM_PROBE_TENSORS"):
+            logger.info("%s POST_LOAD", tensor_census())
     n = 0
     try:
         from . import ats_alias
@@ -159,6 +223,8 @@ def install_uma_load_memory(exl3: Any) -> None:
                 STATS["layer_trims"] += 1
                 if probe_enabled():
                     logger.info("%s layer=%s", mem_line("PRE_ARENA"), _layer_name(layer))
+                    if _flag("VLLM_EXL3_MEM_PROBE_TENSORS") and STATS["layer_trims"] % 8 == 1:
+                        logger.info("%s layer=%s", tensor_census(), _layer_name(layer))
             return orig_plan(layer, shapes_by_proj, *args, **kwargs)
 
         prepare_trellis_arena_plan._uma_trim = True
