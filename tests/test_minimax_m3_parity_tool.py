@@ -484,6 +484,82 @@ def test_case_g_gate_constants_are_pinned():
     assert tool.G_MS == (1, 64)
 
 
+def test_case_g2_starts_from_cpu_resident_shards(monkeypatch):
+    # boot14: the real serve crashed because the retained indexer stash
+    # was still CPU-resident when the Marlin repack ran. Case G2 must
+    # start from exactly that placement and drive the plugin's PRODUCTION
+    # load step -- the move to the layer device happens inside the
+    # plugin, never in the tool -- and gate the device placement, the CPU
+    # release and case G's numerics.
+    tool = _tool()
+    src = (REPO / "tools/gb10_minimax_m3_parity.py").read_text()
+    seg = src.split("def _case_g2(", 1)[1].split("# ── CPU self-test", 1)[0]
+    # CPU-resident sources exactly as the loader leaves them.
+    assert "torch.frombuffer(bytearray(raw), dtype=torch.uint8)" in seg
+    assert "exl3.coerce_checkpoint_region" in seg
+    assert 't.device.type != "cpu"' in seg
+    fetch = seg.split("def fetch_cpu", 1)[1].split("return t", 1)[0]
+    assert ".to(device)" not in fetch
+    # The production load step, not a tool-side move.
+    assert "method._process_indexer_shards(" in seg
+    assert "exl3.indexer_mxfp8_move_to_device" not in seg
+    assert "exl3.indexer_mxfp8_retain" not in seg
+    # The device-placement and CPU-release gates.
+    assert 'shim.weight.data.device.type == "cuda"' in seg
+    assert "cpu_source_released" in seg
+    assert "data_ptr()" in seg
+    assert "gptq_marlin_repack" in seg
+    # Case G's numeric gates and the weight-only kernel requirement.
+    assert "G_COS_MIN" in seg and "G_ABS_FACTOR" in seg
+    assert 'entry["kernel"] == "MarlinMxfp8LinearKernel"' in seg
+    assert '"nan"] == 0' in seg
+    # Fail-closed is a FAIL, never a skip.
+    assert '"pass": False' in seg.split("except Exception", 1)[1]
+    # main() wires the case into the overall verdict.
+    main_seg = src.split("def main(", 1)[1]
+    assert 'receipt["case_g2"]' in main_seg
+    assert 'verdict and bool(receipt["case_g2"].get("pass"))' in main_seg
+
+
+def test_case_g2_is_skipped_without_a_token_file():
+    tool = _tool()
+    res = tool._case_g2(torch.device("cpu"), "/nonexistent-token-file")
+    assert "skip" in res and "pass" not in res
+
+
+def test_case_g2_refuses_non_cpu_sources(monkeypatch):
+    # A source tensor that is not CPU-resident is not the real-serve
+    # placement; the case must refuse it instead of quietly testing a
+    # different placement than the one that crashed boot14.
+    tool = _tool()
+    src = (REPO / "tools/gb10_minimax_m3_parity.py").read_text()
+    seg = src.split("def _case_g2(", 1)[1].split("# ── CPU self-test", 1)[0]
+    assert 'raise RuntimeError(f"{name}: case G2 requires CPU-resident sources")' in seg
+
+
+def test_plugin_load_step_moves_the_stash_before_the_repack():
+    # Source-level pin on the fix itself: the production load step must
+    # resolve the layer's CUDA device, move the stash onto it BEFORE the
+    # kernel binding/repack, and the mover must fail closed and release
+    # the CPU source views (GB10 UMA).
+    src = (REPO / "src/vllm_exl3/exl3.py").read_text()
+    load_seg = src.split("def _process_indexer_shards", 1)[1]
+    load_seg = load_seg.split("def apply(", 1)[0]
+    assert "_indexer_mxfp8_target_device(layer)" in load_seg
+    assert load_seg.index("indexer_mxfp8_move_to_device(") < load_seg.index(
+        "indexer_mxfp8_kernel("
+    )
+    move_seg = src.split("def indexer_mxfp8_move_to_device", 1)[1]
+    move_seg = move_seg.split("def moe_layer_is_gateless", 1)[0]
+    assert "VLLM_EXL3_INDEXER_MXFP8=1" in move_seg
+    assert "moved_payload.device != device" in move_seg
+    assert "_madv_dontneed_cpu_tensor(payload)" in move_seg
+    resolver_seg = src.split("def _indexer_mxfp8_target_device", 1)[1]
+    resolver_seg = resolver_seg.split("def _indexer_mxfp8_tensor_to_device", 1)[0]
+    assert "VLLM_EXL3_INDEXER_MXFP8=1" in resolver_seg
+    assert 'device.type == "cuda"' in resolver_seg
+
+
 
 def test_plugin_karrays_carry_the_true_bit_width():
     # Run 5's root cause: build_exl3_fused_state built the unified kernel's

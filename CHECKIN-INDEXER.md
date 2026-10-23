@@ -263,3 +263,95 @@ cd <tree> && PYTHONPATH=src python3 tools/gb10_minimax_m3_parity.py --cpu-selfte
   by arithmetic, but only the rerun proves the marlin_gemm execution at
   those N.
 - The m=1 decode arm under Marlin (case D ran m=64 only).
+
+## Checkin 2: real-serve load fix (boot14) -- the retained shards were on
+the CPU when the Marlin repack ran
+
+### Root cause (from the loader code, not a guess)
+
+The real serve boots through vLLM's
+`model_executor/model_loader/utils.py::process_weights_after_loading`,
+which wraps every quant method's hook in `device_loading_context`: the
+layer's REGISTERED parameters are moved onto the CUDA target for
+load-time processing and restored to their pinned-CPU/UVA placement
+afterwards. The retained indexer payload/scales are stashed as PLAIN
+list attributes (`_exl3_indexer_payloads/_scales`) -- never parameters --
+so nothing ever moves them: at `_process_indexer_shards` time they are
+still the CPU mmap source views the loaders built. The DEFAULT path
+never hit this because its dequant output goes through
+`layer.weight.data[rows].copy_(weight_bf16)`: the staging parameter IS
+on the target device at that point, so the copy performs the H2D
+transfer and the rows survive as `_exl3_bf16_weight`. The switch-on path
+handed the CPU stash straight to the kernel, and
+`gptq_marlin_repack` only has a CUDA backend (receipts/val2/
+boot14-container.log ~260-300).
+
+### Fix
+
+- `src/vllm_exl3/exl3.py`
+  - `_indexer_mxfp8_target_device()` -- resolves the ONE device the
+    fused layer's parameters agree on at load processing and requires
+    it to be CUDA; anything else (CPU params, disagreement, no params)
+    fails closed naming `VLLM_EXL3_INDEXER_MXFP8`.
+  - `indexer_mxfp8_move_to_device()` -- moves one shard's payload and
+    scales onto that device before any repack: no-op if already there,
+    refuses mixed devices, verifies BOTH tensors landed exactly on the
+    target (else fails closed naming the switch), then releases the
+    consumed CPU source views (`_madv_dontneed_cpu_tensor`, the same
+    reclaim the loader uses after H2D).
+  - `_process_indexer_shards()` (switch-on branch) now resolves the
+    target device once, moves each shard, and clears the stash slots and
+    the loop locals BEFORE retention/kernel binding, so no reference to
+    the CPU tensors survives (GB10 UMA: a lingering CPU copy would erase
+    the 218 MiB saving). The repack transient stays per shard: the
+    kernel's load step `replace_parameter`s the payload/scales with the
+    repacked tensors, so the retained fp8 form is released in the same
+    step.
+  - Default (switch-off) branch untouched: byte-identical staging.
+- `tools/gb10_minimax_m3_parity.py`
+  - New case G2: the boot14 real-serve placement. The REAL layer-0
+    index_q/index_k bytes are fetched into CPU-resident tensors exactly as
+    the loader leaves them (never `.to(device)`), the layer carries only
+    the 0-row switch-on staging parameter on CUDA (as
+    `device_loading_context` leaves it), and the case drives the
+    plugin's PRODUCTION load step
+    (`Exl3LinearMethod._process_indexer_shards`), not a tool-side move.
+    Per shard it gates: repacked tensors on CUDA, the layer holds no
+    reference to the CPU sources (stash cleared, no pointer alias),
+    byte-preserving repack, and case G's numeric gates (cos >= 0.9999,
+    max-abs within 4x, 0 NaN) against the BF16-dequant reference of the
+    same bytes. Fail-closed is a FAIL, never a skip; wired into the
+    verdict next to case G. `--cpu-selftest` gained 5 G2 structure bars
+    plus 2 plugin-side bars (move-before-repack ordering, fail-closed
+    mover with source release); selftest still PASS.
+- `tests/test_indexer_mxfp8_retention.py` -- the switch-on tests now
+  simulate the real-serve placement (CPU stash + patched device seams);
+  new tests pin: move BEFORE the kernel load step in shard order, the
+  shim holds the moved tensors never the CPU stash, no reachable layer
+  reference to the CPU tensors, resolver fails closed on CPU/disagreeing
+  parameters, mover no-op on-device / real move + source release /
+  fail-closed on off-device landing and mixed devices (the real transfer
+  arm uses the meta device; the CUDA transfer is gated by case G2).
+- `tests/test_minimax_m3_parity_tool.py` -- new case G2 tests (CPU
+  sources, production load step, device/release/numeric gates,
+  fail-closed FAIL, main() wiring) and a source pin that the plugin's
+  load step moves the stash before the kernel binding.
+
+### Test counts
+
+- Before this checkin: 591 passed, 39 skipped, 8 failed (the same 8
+  pre-existing `test_compact_safetensors*.py` /
+  `test_compact_source_verification_window.py` failures).
+- After: **602 passed, 39 skipped, 8 failed** (identical failure set,
+  +11 new tests, all passing). Parity tool `--cpu-selftest`:
+  `GB10_MINIMAX_M3_PARITY SELFTEST PASS`.
+
+### Unverified without the GPU
+
+- The real GB10 case G2 verdict (this box has no GPU): the on-hardware
+  move, the Marlin repack at the moved tensors, and the m in {1, 64}
+  numeric gates must be proven by the parent's rerun; case G's numerics
+  are already settled at cos 0.999999, but G2 additionally proves the
+  production load step's placement path.
+- The real serve boot with `VLLM_EXL3_INDEXER_MXFP8=1` (needs the GB10
+  dev image; the boot14 crash path is what case G2 exercises).

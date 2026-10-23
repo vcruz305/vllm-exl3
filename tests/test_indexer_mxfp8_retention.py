@@ -88,6 +88,34 @@ def _fake_layer(payloads, scales, *, bf16_staging: bool):
     return layer
 
 
+def _patch_serve_placement(monkeypatch, events: list) -> None:
+    """Simulate the real-serve placement on a CPU box.
+
+    In the real serve the fused layer's parameters sit on the CUDA target
+    (vLLM's device_loading_context) while the stashed indexer payload and
+    scales are still on the CPU (the loader's source views) -- the boot14
+    crash placement. The two plugin seams are patched: the target-device
+    resolver resolves to CUDA, and the mover records its call (order is
+    asserted against the kernel's load step) and returns fresh stand-in
+    copies playing the moved device tensors -- a CPU box cannot hold
+    real CUDA tensors, and the real transfer is gated by the GB10 parity
+    harness' case G2.
+    """
+    monkeypatch.setattr(
+        exl3,
+        "_indexer_mxfp8_target_device",
+        lambda layer: torch.device("cuda"),
+    )
+
+    def fake_move(payload, scales, device, shard_idx):
+        events.append(("move", shard_idx, id(payload), id(scales), device))
+        return payload.clone(), scales.clone()
+
+    monkeypatch.setattr(
+        exl3, "indexer_mxfp8_move_to_device", fake_move
+    )
+
+
 # ---------------------------------------------------------------------------
 # (a) switch parsing + default-off byte-identity
 # ---------------------------------------------------------------------------
@@ -162,9 +190,12 @@ def test_default_off_incomplete_stash_still_raises(monkeypatch):
 def test_switch_on_fails_closed_without_vllm_kernel(monkeypatch):
     # This VPS has no vllm and no GPU: the switch-on path must refuse to
     # run with a clear error naming the switch, never fall back to BF16.
+    # The real-serve placement is simulated so the failure under test is
+    # the kernel resolver's, not the device resolution's.
     monkeypatch.setenv("VLLM_EXL3_INDEXER_MXFP8", "1")
     payloads, scales = _indexer_stash()
     layer = _fake_layer(payloads, scales, bf16_staging=False)
+    _patch_serve_placement(monkeypatch, [])
     with pytest.raises(RuntimeError, match="VLLM_EXL3_INDEXER_MXFP8"):
         _method()._process_indexer_shards(
             layer, OUTS, [], INDEXER_SHARDS, True
@@ -283,13 +314,26 @@ class _FakeKernel:
 
 
 def test_switch_on_binds_kernel_shims_and_frees_stash(monkeypatch):
+    # The real-serve placement (boot14): the stash is CPU-resident at
+    # process time. The move to the layer's CUDA device must happen
+    # BEFORE the kernel's load step (the Marlin repack), the shim must
+    # hold the moved tensors -- never the CPU stash -- and no reference
+    # to the CPU tensors may survive on the layer.
     monkeypatch.setenv("VLLM_EXL3_INDEXER_MXFP8", "1")
     payloads, scales = _indexer_stash()
     layer = _fake_layer(payloads, scales, bf16_staging=False)
+    events: list = []
+    _patch_serve_placement(monkeypatch, events)
     made = []
 
     def make(shape):
         k = _FakeKernel()
+
+        def process(shim, _k=k):
+            events.append(("process", shape))
+            _k.processed.append(shim)
+
+        k.process_weights_after_loading = process
         made.append((shape, k))
         return k
 
@@ -302,10 +346,21 @@ def test_switch_on_binds_kernel_shims_and_frees_stash(monkeypatch):
     # The bound kernel classes are recorded on the layer (the GB10 receipt
     # cross-checks them against the weight-only Marlin requirement).
     assert layer._exl3_indexer_mxfp8_kernels == ["_FakeKernel", "_FakeKernel"]
+    # The move to the layer device happens BEFORE the kernel's load step,
+    # once per shard, in shard order, and the mover saw the ORIGINAL
+    # CPU-resident stash tensors and the CUDA target.
+    assert [e[0] for e in events] == ["move", "process", "move", "process"]
+    for slot, shard_idx in enumerate(INDEXER_SHARDS):
+        move_ev = events[2 * slot]
+        assert move_ev[1] == shard_idx
+        assert move_ev[2] == id(payloads[slot])
+        assert move_ev[3] == id(scales[slot])
+        assert move_ev[4] == torch.device("cuda")
     # One shim per indexer shard, in shard order, with the checkpoint
-    # geometry; the payload is the bitcast fp8 view, the scales stay the
-    # row-major uint8 block the kernel's load step expects, and the shim
-    # carries the true partition sizes the kernel's apply reads.
+    # geometry; the payload is the bitcast fp8 view of the MOVED tensor,
+    # the scales stay the row-major uint8 block the kernel's load step
+    # expects, and the shim carries the true partition sizes the kernel's
+    # apply reads.
     for slot, (n, (kernel, shim)) in enumerate(zip(INDEXER_OUTS, shims)):
         assert made[slot][0] == (n, IN)
         assert kernel.processed == [shim]
@@ -319,8 +374,133 @@ def test_switch_on_binds_kernel_shims_and_frees_stash(monkeypatch):
         assert shim.input_size_per_partition == IN
         assert shim.bias is None
         assert shim.params_dtype == torch.bfloat16
+    # The CPU-side stash is fully released: the slots are cleared and no
+    # attribute reachable from the layer still references the original
+    # CPU tensor objects (the moved stand-ins are fresh storages).
     assert layer._exl3_indexer_payloads == [None, None]
     assert layer._exl3_indexer_scales == [None, None]
+    originals = {id(t) for t in payloads + scales}
+
+    def _referenced(obj, seen):
+        if id(obj) in seen:
+            return set()
+        seen.add(id(obj))
+        found = set()
+        if isinstance(obj, torch.Tensor):
+            if id(obj) in originals:
+                found.add(id(obj))
+        elif isinstance(obj, (list, tuple)):
+            for item in obj:
+                found |= _referenced(item, seen)
+        elif isinstance(obj, SimpleNamespace):
+            for value in vars(obj).values():
+                found |= _referenced(value, seen)
+        elif isinstance(obj, dict):
+            for value in obj.values():
+                found |= _referenced(value, seen)
+        return found
+
+    assert not _referenced(layer._exl3_indexer_mxfp8, set())
+    assert not _referenced(vars(layer), set()) & originals
+
+
+def test_switch_on_fails_closed_when_the_layer_is_not_on_cuda(monkeypatch):
+    # boot14's shape if vLLM's device-loading context had not moved the
+    # layer: the parameters resolve to CPU, so the switch-on path must
+    # fail closed naming the switch instead of handing the Marlin repack
+    # off-device tensors -- never a silent CPU repack attempt.
+    monkeypatch.setenv("VLLM_EXL3_INDEXER_MXFP8", "1")
+    payloads, scales = _indexer_stash()
+    layer = _fake_layer(payloads, scales, bf16_staging=False)
+    layer.weight = torch.nn.Parameter(
+        torch.empty(0, dtype=torch.bfloat16), requires_grad=False
+    )
+    with pytest.raises(RuntimeError, match="VLLM_EXL3_INDEXER_MXFP8=1"):
+        _method()._process_indexer_shards(
+            layer, OUTS, [], INDEXER_SHARDS, True
+        )
+    assert not hasattr(layer, "_exl3_indexer_mxfp8")
+
+
+def test_target_device_resolver_fails_closed_on_disagreement():
+    # Parameters that do not resolve to ONE cuda device (here CPU vs meta)
+    # must fail closed naming the switch.
+    layer = SimpleNamespace()
+    layer.weight = torch.nn.Parameter(
+        torch.empty(0, dtype=torch.bfloat16), requires_grad=False
+    )
+    layer.suh = torch.nn.Parameter(
+        torch.empty(0, dtype=torch.float16, device=torch.device("meta")),
+        requires_grad=False,
+    )
+    with pytest.raises(RuntimeError, match="VLLM_EXL3_INDEXER_MXFP8=1"):
+        exl3._indexer_mxfp8_target_device(layer)
+
+
+def test_target_device_resolver_fails_closed_without_any_parameter():
+    layer = SimpleNamespace()
+    with pytest.raises(RuntimeError, match="VLLM_EXL3_INDEXER_MXFP8=1"):
+        exl3._indexer_mxfp8_target_device(layer)
+
+
+def test_move_to_device_is_a_noop_when_already_on_the_device():
+    # A loader that streams the shards straight onto the device leaves
+    # nothing to move: the tensors are passed through unchanged.
+    payload = _finite_e4m3_bytes((4, IN))
+    scales = _scales((4, IN // 32))
+    got_payload, got_scales = exl3.indexer_mxfp8_move_to_device(
+        payload, scales, payload.device, 3
+    )
+    assert got_payload is payload and got_scales is scales
+
+
+def test_move_to_device_moves_and_releases_the_cpu_source(monkeypatch):
+    # The real mover end-to-end on a CPU box: the transfer target is the
+    # meta device (the only non-CPU device constructible here), so the
+    # move branch, its post-placement check and the source release all
+    # run for real; the actual CUDA transfer is gated by GB10 case G2.
+    payload = _finite_e4m3_bytes((4, IN))
+    scales = _scales((4, IN // 32))
+    released = []
+    monkeypatch.setattr(
+        exl3, "_madv_dontneed_cpu_tensor", lambda t: released.append(id(t)) or True
+    )
+    moved_payload, moved_scales = exl3.indexer_mxfp8_move_to_device(
+        payload, scales, torch.device("meta"), 3
+    )
+    assert moved_payload is not payload and moved_scales is not scales
+    assert moved_payload.device.type == "meta"
+    assert moved_scales.device.type == "meta"
+    assert tuple(moved_payload.shape) == tuple(payload.shape)
+    # The consumed CPU source views are released before the caller drops
+    # them (GB10 UMA: the source pages must not linger).
+    assert released == [id(payload), id(scales)]
+
+
+def test_move_to_device_fails_closed_when_the_move_lands_off_device(monkeypatch):
+    # A silent no-op move (the boot14 failure shape) must be caught by the
+    # post-placement check and fail closed naming the switch.
+    payload = _finite_e4m3_bytes((4, IN))
+    scales = _scales((4, IN // 32))
+    monkeypatch.setattr(
+        exl3,
+        "_indexer_mxfp8_tensor_to_device",
+        lambda tensor, device: tensor,
+    )
+    with pytest.raises(RuntimeError, match="VLLM_EXL3_INDEXER_MXFP8=1"):
+        exl3.indexer_mxfp8_move_to_device(
+            payload, scales, torch.device("meta"), 3
+        )
+
+
+def test_move_to_device_fails_closed_on_mixed_devices():
+    # Payload and scales on different devices never reach the transfer.
+    payload = _finite_e4m3_bytes((4, IN))
+    scales = _scales((4, IN // 32)).to(torch.device("meta"))
+    with pytest.raises(RuntimeError, match="VLLM_EXL3_INDEXER_MXFP8=1"):
+        exl3.indexer_mxfp8_move_to_device(
+            payload, scales, torch.device("meta"), 3
+        )
 
 
 def test_retention_rejects_bad_geometry():

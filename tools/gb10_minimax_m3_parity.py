@@ -49,6 +49,15 @@ worktree bind-mounted at /plugin and PYTHONPATH=/plugin/src:
           reference the default path computes from the same bytes; gates
           cosine >= 0.9999, max-abs within a factor of 4 of the
           reference, zero NaN, and unchanged payload bits.
+  Case G2 the boot14 real-serve load placement: the same REAL layer-0
+          indexer shards start CPU-resident exactly as the loader leaves
+          them (the plugin's stash is never moved by vLLM's
+          device-loading context), and the plugin's own production load
+          step (Exl3LinearMethod._process_indexer_shards) must move them
+          onto the layer's CUDA device BEFORE the Marlin repack, release
+          the CPU sources, and then pass case G's numeric gates on the
+          repacked shims; anything else -- off-device repack, lingering
+          CPU reference, fail-closed device check -- is a FAIL.
 
 ``--cpu-selftest`` runs everything that needs no kernel launch (Case C in
 full, the pack/reference construction of A/B/D, the entry-point act
@@ -1622,6 +1631,230 @@ def _case_g(device: torch.device, token_file: str | None) -> dict[str, Any]:
     }
 
 
+def _case_g2(device: torch.device, token_file: str | None) -> dict[str, Any]:
+    """REAL-serve load placement: CPU-resident shards through the
+    production load step (the boot14 regression).
+
+    boot14 crashed exactly here: in the real serve the retained indexer
+    payload/scales were still on the CPU -- the loader's mmap source
+    views, because vLLM's device-loading context moves only REGISTERED
+    parameters and the plugin stashes these as plain attributes -- when
+    the Marlin repack ran, so gptq_marlin_repack dispatched on the CPU
+    backend and the boot died at load. Case G proves the numerics from
+    device-resident tensors; this case starts from the REAL placement
+    (the shard tensors CPU-resident exactly as the loader leaves them,
+    the layer's parameters on the CUDA device as device_loading_context
+    leaves them) and drives the plugin's own production load step
+    (Exl3LinearMethod._process_indexer_shards), so the move-to-device
+    fix, its fail-closed device checks and the CPU-source release all
+    run on hardware. Per shard the receipt gates: the repacked tensors
+    landed on the CUDA device, the layer keeps NO reference to the CPU
+    sources (stash cleared, no pointer alias), the repack stayed
+    byte-preserving, and case G's numeric gates against the BF16-dequant
+    reference of the same bytes (cosine >= G_COS_MIN, max-abs within
+    G_ABS_FACTOR, zero NaN). A fail-closed resolver or device check is
+    a FAIL, never a skip.
+    """
+    entries = _fixture_entries()
+    if not token_file:
+        token_file = E_TOKEN_FILE
+    if not os.path.isfile(token_file):
+        return {
+            "skip": (
+                f"no HF token file at {token_file}; Case G2 (real-serve "
+                "load placement) needs --hf-token-file"
+            )
+        }
+    with open(token_file, encoding="utf-8") as fh:
+        token = fh.read().strip()
+    if not token:
+        return {"error": "empty HF token file", "pass": False}
+
+    data_base, header = _shard_header(token)
+    names = {
+        "iq_w": "language_model.model.layers.0.self_attn.index_q_proj.weight",
+        "iq_s": "language_model.model.layers.0.self_attn.index_q_proj.weight_scale_inv",
+        "ik_w": "language_model.model.layers.0.self_attn.index_k_proj.weight",
+        "ik_s": "language_model.model.layers.0.self_attn.index_k_proj.weight_scale_inv",
+    }
+
+    def fetch_cpu(tag: str) -> torch.Tensor:
+        # The real loader's placement: the checkpoint region is materialized
+        # in CPU memory and STAYS there -- the stash the weight loaders
+        # build; the tensor never touches the device before the plugin's
+        # own load step moves it.
+        name = names[tag]
+        ent = entries[name]
+        hdr = header.get(name)
+        if hdr is None:
+            raise RuntimeError(f"{name} is not in the shard header")
+        if hdr.get("dtype") != ent["dtype"]:
+            raise RuntimeError(
+                f"{name}: header dtype {hdr.get('dtype')} != census "
+                f"{ent['dtype']}"
+            )
+        if list(hdr.get("shape", [])) != list(ent["shape"]):
+            raise RuntimeError(
+                f"{name}: header shape {hdr.get('shape')} != census "
+                f"{ent['shape']}"
+            )
+        b, e = hdr["data_offsets"]
+        if e - b != ent["bytes"]:
+            raise RuntimeError(
+                f"{name}: header span {e - b} != census {ent['bytes']} bytes"
+            )
+        raw = _hf_range(token, data_base + b, e - b)
+        u8 = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+        t = exl3.coerce_checkpoint_region(
+            u8, _TORCH_DTYPES[ent["dtype"]], ent["shape"]
+        )
+        if t.device.type != "cpu":
+            raise RuntimeError(f"{name}: case G2 requires CPU-resident sources")
+        return t
+
+    labels = (("index_q", "iq_w", "iq_s"), ("index_k", "ik_w", "ik_s"))
+    cpu_payloads = []
+    cpu_scales = []
+    refs = []
+    shapes = []
+    for _label, tag_w, tag_s in labels:
+        payload = fetch_cpu(tag_w).view(torch.uint8)
+        scales = fetch_cpu(tag_s)
+        shapes.append(tuple(int(d) for d in payload.shape))
+        # The BF16-dequant reference of the same bytes (hand-decoded on
+        # the CPU source, moved to the device only for the comparison).
+        refs.append(_mxfp8_dequant(payload, scales).to(device))
+        cpu_payloads.append(payload)
+        cpu_scales.append(scales)
+
+    # The layer exactly as the real serve leaves it at load processing:
+    # the stash CPU-resident, the 0-row (switch-on) staging parameter on
+    # the CUDA device. The mxfp8 branch of _process_indexer_shards never
+    # reads output_sizes; the real fused partition sizes are passed so
+    # the call signature stays honest.
+    layer = SimpleNamespace()
+    layer._exl3_indexer_shards = (3, 4)
+    layer._exl3_indexer_payloads = list(cpu_payloads)
+    layer._exl3_indexer_scales = list(cpu_scales)
+    layer.weight = torch.nn.Parameter(
+        torch.empty(0, dtype=torch.bfloat16, device=device),
+        requires_grad=False,
+    )
+    output_sizes = [0, 0, 0, shapes[0][0], shapes[1][0]]
+    method = exl3.Exl3LinearMethod.__new__(exl3.Exl3LinearMethod)
+    x = torch.randn(max(G_MS), B_IN, dtype=torch.bfloat16, device=device) * 0.1
+
+    shards = []
+    try:
+        method._process_indexer_shards(layer, output_sizes, [], (3, 4), True)
+        torch.cuda.synchronize()
+        shims = layer._exl3_indexer_mxfp8
+        if shims is None or len(shims) != len(labels):
+            raise RuntimeError(
+                f"the production load step bound {0 if shims is None else len(shims)} "
+                "indexer shims, expected 2"
+            )
+        for slot, (label, _tag_w, _tag_s) in enumerate(labels):
+            kernel, shim = shims[slot]
+            repacked_bytes = (
+                shim.weight.data.numel() * shim.weight.data.element_size()
+                + shim.weight_scale.data.numel()
+                * shim.weight_scale.data.element_size()
+            )
+            # The moved tensors must be fresh device storages: the CPU
+            # sources stay alive in this harness's own lists (they are the
+            # byte reference), so the release gate is that the LAYER keeps
+            # no reference to them and the repacked tensors do not alias
+            # their pointers.
+            cpu_released = (
+                layer._exl3_indexer_payloads == [None, None]
+                and layer._exl3_indexer_scales == [None, None]
+                and shim.weight.data.data_ptr()
+                != cpu_payloads[slot].data_ptr()
+                and shim.weight_scale.data.data_ptr()
+                != cpu_scales[slot].data_ptr()
+            )
+            on_device = (
+                shim.weight.data.device.type == "cuda"
+                and shim.weight_scale.data.device.type == "cuda"
+            )
+            per_m: dict[str, Any] = {}
+            for m in G_MS:
+                y = kernel.apply_weights(shim, x[:m].contiguous())
+                torch.cuda.synchronize()
+                y_ref = x[:m].float() @ refs[slot].t().float()
+                nan = int(torch.isnan(y).sum().item())
+                max_y = float(y.abs().max().item()) if y.numel() else 0.0
+                max_ref = float(y_ref.abs().max().item()) or 1.0
+                per_m[f"m{m}"] = {
+                    "cosine": round(_cos(y, y_ref), 6) if nan == 0 else None,
+                    "max_abs": round(max_y, 6),
+                    "max_abs_ratio": round(max_y / max_ref, 6),
+                    "nan": nan,
+                }
+            entry: dict[str, Any] = {
+                "shard": label,
+                "source_placement": "cpu (the loader's placement)",
+                "repacked_device": str(shim.weight.data.device),
+                "kernel": type(kernel).__name__,
+                "moved_before_repack": bool(on_device),
+                "cpu_source_released": bool(cpu_released),
+                "repacked_bytes_preserved": bool(
+                    repacked_bytes
+                    == cpu_payloads[slot].numel() + cpu_scales[slot].numel()
+                ),
+                "per_m": per_m,
+            }
+            entry["pass"] = (
+                entry["kernel"] == "MarlinMxfp8LinearKernel"
+                and entry["moved_before_repack"]
+                and entry["cpu_source_released"]
+                and entry["repacked_bytes_preserved"]
+                and all(
+                    v["cosine"] is not None
+                    and v["cosine"] >= G_COS_MIN
+                    and 1.0 / G_ABS_FACTOR <= v["max_abs_ratio"] <= G_ABS_FACTOR
+                    and v["nan"] == 0
+                    for v in per_m.values()
+                )
+            )
+            shards.append(entry)
+            refs[slot] = None  # release the comparison copy per shard
+            torch.cuda.empty_cache()
+    except Exception as exc:  # noqa: BLE001
+        # boot14's crash shape -- any fail-closed device check, resolver
+        # refusal, or off-device repack -- is a FAIL here, never a skip.
+        return {
+            "crash_signature": (
+                "boot14: NotImplementedError: Could not run "
+                "'_C::gptq_marlin_repack' with arguments from the 'CPU' "
+                "backend"
+            ),
+            "error": str(exc)[:400],
+            "shards": shards,
+            "pass": False,
+        }
+    finally:
+        del layer
+        del cpu_payloads, cpu_scales
+        torch.cuda.empty_cache()
+    return {
+        "backend": "the plugin's production load step "
+        "(Exl3LinearMethod._process_indexer_shards) from CPU-resident "
+        "loader sources onto the layer's CUDA device",
+        "crash_signature": (
+            "boot14: NotImplementedError: Could not run "
+            "'_C::gptq_marlin_repack' with arguments from the 'CPU' "
+            "backend"
+        ),
+        "gate": f"repacked on cuda cos>={G_COS_MIN} max_abs_ratio in "
+        f"[{1.0 / G_ABS_FACTOR}, {G_ABS_FACTOR}] nan==0 "
+        "cpu_source_released",
+        "shards": shards,
+        "pass": bool(shards) and all(s.get("pass") for s in shards),
+    }
+
+
 # ── CPU self-test ──────────────────────────────────────────────────────────
 
 
@@ -1999,7 +2232,7 @@ def _selftest() -> int:
     _check("case G gate is stricter than the harness minimum",
            G_COS_MIN == 0.9999 and G_COS_MIN > COS_MIN
            and G_ABS_FACTOR == 4.0)
-    g_seg = src.split("def _case_g", 1)[1].split("# ── CPU self-test", 1)[0]
+    g_seg = src.split("def _case_g(", 1)[1].split("def _case_g2", 1)[0]
     _check("case G runs the real layer-0 indexer through the plugin glue",
            "index_q_proj.weight" in g_seg and "index_k_proj.weight" in g_seg
            and "exl3.indexer_mxfp8_retain" in g_seg
@@ -2016,6 +2249,36 @@ def _selftest() -> int:
     _check("case G keeps the fail-closed resolver a FAIL, never a skip",
            'entry["error"] = str(exc)[:400]' in g_seg
            and 'entry["pass"] = False' in g_seg.split("except Exception", 1)[1][:400])
+
+    # Case G2 structure: the boot14 real-serve load placement. The case
+    # must start from CPU-resident shard tensors exactly as the loader
+    # leaves them, drive the plugin's PRODUCTION load step (the move to
+    # the layer device happens inside the plugin, never in the tool),
+    # require the repacked shims on CUDA with the CPU sources released,
+    # and keep case G's numeric gates; a fail-closed device check is a
+    # FAIL, never a skip.
+    g2_seg = src.split("def _case_g2", 1)[1].split("# ── CPU self-test", 1)[0]
+    _check("case G2 starts from CPU-resident shards like the real loader",
+           'torch.frombuffer(bytearray(raw), dtype=torch.uint8)' in g2_seg
+           and "exl3.coerce_checkpoint_region" in g2_seg
+           and 't.device.type != "cpu"' in g2_seg
+           and ".to(device)" not in g2_seg.split("def fetch_cpu", 1)[1]
+                .split("return t", 1)[0])
+    _check("case G2 drives the plugin production load step",
+           "_process_indexer_shards" in g2_seg
+           and "exl3.indexer_mxfp8_move_to_device" not in g2_seg
+           and "exl3.indexer_mxfp8_retain" not in g2_seg)
+    _check("case G2 gates the device placement and the CPU release",
+           'shim.weight.data.device.type == "cuda"' in g2_seg
+           and "cpu_source_released" in g2_seg
+           and "data_ptr()" in g2_seg
+           and "gptq_marlin_repack" in g2_seg)
+    _check("case G2 keeps case G's numeric gates and kernel requirement",
+           "G_COS_MIN" in g2_seg and "G_ABS_FACTOR" in g2_seg
+           and 'entry["kernel"] == "MarlinMxfp8LinearKernel"' in g2_seg
+           and '"nan"] == 0' in g2_seg)
+    _check("case G2 keeps the fail-closed placement a FAIL, never a skip",
+           '"pass": False' in g2_seg.split("except Exception", 1)[1])
     # Plugin-side: the retention resolver must be fail-closed (both the
     # platform and the shape gate, clear errors naming the switch), must
     # bind the WEIGHT-ONLY Marlin kernel and never a W8A8 backend, the
@@ -2035,6 +2298,25 @@ def _selftest() -> int:
            "if indexer_shards and not _indexer_mxfp8_enabled():" in esrc)
     _check("apply routes the indexer slices through the bound kernel",
            "kernel.apply_weights(shim, x_2d)" in esrc)
+    # boot14: the real serve died because the retained stash was still on
+    # the CPU at load processing. The production load step must resolve the
+    # layer's CUDA device, move the stash onto it BEFORE the Marlin repack,
+    # release the CPU sources (GB10 UMA: a lingering copy erases the
+    # saving), and fail closed -- naming the switch -- at every step.
+    move_seg = esrc.split("def indexer_mxfp8_move_to_device", 1)[1]
+    move_seg = move_seg.split("def moe_layer_is_gateless", 1)[0]
+    load_seg = esrc.split("def _process_indexer_shards", 1)[1]
+    load_seg = load_seg.split("def apply(", 1)[0]
+    _check("plugin load step moves the stash to the layer device before the repack",
+           "_indexer_mxfp8_target_device" in esrc
+           and "indexer_mxfp8_move_to_device(" in load_seg
+           and "indexer_mxfp8_kernel(" in load_seg
+           and load_seg.index("indexer_mxfp8_move_to_device(")
+               < load_seg.index("indexer_mxfp8_kernel("))
+    _check("plugin placement move fails closed and releases the CPU source",
+           "VLLM_EXL3_INDEXER_MXFP8=1" in move_seg
+           and "_madv_dontneed_cpu_tensor(payload)" in move_seg
+           and "moved_payload.device != device" in move_seg)
 
     print("GB10_MINIMAX_M3_PARITY SELFTEST " + ("PASS" if ok else "FAIL")
           + " (no hardware parity claim)")
@@ -2130,6 +2412,16 @@ def main() -> int:
         for ent in receipt["case_g"].get("shards", []):
             print(f"case G shard={ent.get('shard')}: {ent}")
         verdict = verdict and bool(receipt["case_g"].get("pass"))
+
+    receipt["case_g2"] = _case_g2(device, args.hf_token_file)
+    if "skip" in receipt["case_g2"]:
+        print(f"case G2: SKIP ({receipt['case_g2']['skip']})")
+    else:
+        for ent in receipt["case_g2"].get("shards", []):
+            print(f"case G2 shard={ent.get('shard')}: {ent}")
+        if not receipt["case_g2"].get("pass"):
+            print(f"case G2 error: {receipt['case_g2'].get('error')}")
+        verdict = verdict and bool(receipt["case_g2"].get("pass"))
 
     receipt["mem_peak_gib"] = round(
         torch.cuda.max_memory_allocated() / 2**30, 3

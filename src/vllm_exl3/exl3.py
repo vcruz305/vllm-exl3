@@ -2038,6 +2038,99 @@ def make_indexer_mxfp8_shim(
 
 
 
+def _indexer_mxfp8_target_device(layer) -> "torch.device":
+    """Resolve the CUDA device the fused layer's parameters are on at load.
+
+    vLLM wraps every quant method's ``process_weights_after_loading`` in
+    ``device_loading_context``: the layer's REGISTERED parameters are
+    moved onto the global target device for the load-time processing and
+    restored to their (pinned-CPU / UVA) placement afterwards. The
+    retained indexer payloads/scales are stashed as plain list attributes,
+    never parameters, so nothing moves them: in the real serve they are
+    still on the CPU (the loader's mmap-backed source views) when the
+    Marlin repack runs -- the boot14 GB10 crash
+    (``_C::gptq_marlin_repack ... 'CPU' backend``). The default BF16
+    path never hits this because its dequant output is copied into the
+    staging parameter (``layer.weight.data[rows].copy_``), which IS on the
+    target device at this point, and the copy performs the transfer.
+
+    This resolver returns the one device the layer's parameters agree on
+    and fails closed -- naming the switch -- when they do not resolve to a
+    single CUDA device, instead of ever handing the Marlin repack
+    off-device tensors.
+    """
+    devices = set()
+    for name in ("weight", "trellis", "suh", "svh"):
+        param = getattr(layer, name, None)
+        if param is None:
+            continue
+        devices.add(param.device)
+    if len(devices) == 1:
+        device = next(iter(devices))
+        if device.type == "cuda":
+            return device
+    raise RuntimeError(
+        "VLLM_EXL3_INDEXER_MXFP8=1: the retained indexer shards must be "
+        "repacked on the fused layer's CUDA device, but the layer's "
+        "parameters resolve to "
+        f"{sorted(str(d) for d in devices) if devices else 'no device at all'} "
+        "at load processing (vLLM's device-loading context must have moved "
+        "them onto the target device); failing closed instead of running "
+        "the Marlin repack on off-device tensors"
+    )
+
+
+def _indexer_mxfp8_tensor_to_device(
+    tensor: "torch.Tensor", device: "torch.device"
+) -> "torch.Tensor":
+    return tensor.to(device)
+
+
+def indexer_mxfp8_move_to_device(
+    payload: "torch.Tensor",
+    scales: "torch.Tensor",
+    device: "torch.device",
+    shard_idx: int,
+) -> tuple["torch.Tensor", "torch.Tensor"]:
+    """Move one retained indexer shard onto the layer's device, fail closed.
+
+    The single placement fix for the boot14 real-serve crash: the stashed
+    payload/scales are CPU-resident (mmap-backed loader source views) at
+    load-processing time, and vLLM's Marlin repack only exists for the
+    CUDA backend. Both tensors must land exactly on ``device`` -- already
+    being there is fine (a future loader that streams straight to the
+    device) -- and anything else fails closed with an error naming the
+    switch. The consumed CPU source views are released (madvise + caller
+    drops every reference): on GB10 CPU and GPU share one physical memory
+    pool, so a lingering CPU copy of the payload would erase the ~218 MiB
+    unified-memory saving the switch exists for.
+    """
+    if payload.device == device and scales.device == device:
+        return payload, scales
+    if payload.device != scales.device:
+        raise RuntimeError(
+            f"VLLM_EXL3_INDEXER_MXFP8=1: indexer shard {shard_idx} payload "
+            f"({payload.device}) and scales ({scales.device}) are on "
+            "different devices; failing closed instead of running the "
+            "Marlin repack on mismatched tensors"
+        )
+    moved_payload = _indexer_mxfp8_tensor_to_device(payload, device)
+    moved_scales = _indexer_mxfp8_tensor_to_device(scales, device)
+    if moved_payload.device != device or moved_scales.device != device:
+        raise RuntimeError(
+            f"VLLM_EXL3_INDEXER_MXFP8=1: indexer shard {shard_idx} "
+            f"payload/scales did not land on the layer device {device}; "
+            "failing closed instead of running the Marlin repack on "
+            "off-device tensors"
+        )
+    # Release the consumed CPU source views' pages (safetensors mmap COW)
+    # before the caller drops them: the moved tensors are fresh device
+    # storages, the source must not linger on the UMA pool.
+    _madv_dontneed_cpu_tensor(payload)
+    _madv_dontneed_cpu_tensor(scales)
+    return moved_payload, moved_scales
+
+
 def moe_layer_is_gateless(layer: torch.nn.Module) -> bool:
     """Whether this layer's experts are non-gated (no gate projection at all)."""
     act = getattr(getattr(layer, "moe_config", None), "activation", None)
@@ -6474,6 +6567,13 @@ class Exl3LinearMethod(LinearMethodBase):
         if indexer_mxfp8:
             shims = []
             kernel_names = []
+            # The real-serve placement fix (boot14): the stashed payload and
+            # scales are CPU-resident loader source views here -- vLLM's
+            # device-loading context moves only REGISTERED parameters --
+            # so they must be moved onto the layer's CUDA device before
+            # the Marlin repack, and the CPU copies released (GB10 UMA:
+            # a lingering CPU copy would erase the saving).
+            target_device = _indexer_mxfp8_target_device(layer)
             for slot, shard_idx in enumerate(indexer_shards):
                 payload = layer._exl3_indexer_payloads[slot]
                 scales = layer._exl3_indexer_scales[slot]
@@ -6483,19 +6583,32 @@ class Exl3LinearMethod(LinearMethodBase):
                         f"(payload={'set' if payload is not None else 'missing'}, "
                         f"scales={'set' if scales is not None else 'missing'})"
                     )
-                payload_fp8, scales_u8 = indexer_mxfp8_retain(payload, scales)
+                moved_payload, moved_scales = indexer_mxfp8_move_to_device(
+                    payload, scales, target_device, shard_idx
+                )
+                # Drop every reference to the CPU-side stash immediately:
+                # the moved tensors are fresh device storages and the
+                # source views must not linger on the shared UMA pool.
+                layer._exl3_indexer_payloads[slot] = None
+                layer._exl3_indexer_scales[slot] = None
+                payload = None
+                scales = None
+                payload_fp8, scales_u8 = indexer_mxfp8_retain(
+                    moved_payload, moved_scales
+                )
                 kernel = indexer_mxfp8_kernel(tuple(payload_fp8.shape))
                 shim = make_indexer_mxfp8_shim(payload_fp8, scales_u8)
                 # The kernel's own load-time step: it repacks the fp8
                 # payload and the E8M0 scale block into its weight-only
                 # (W8A16) GEMM format -- a byte-preserving permutation at
                 # these shard shapes, so the retained footprint does not
-                # grow.
+                # grow. The repack transient is per shard: the kernel's
+                # load step replaces the shim's payload/scale parameters
+                # with the repacked tensors, releasing the retained fp8
+                # form in the same step.
                 kernel.process_weights_after_loading(shim)
                 shims.append((kernel, shim))
                 kernel_names.append(type(kernel).__name__)
-                layer._exl3_indexer_payloads[slot] = None
-                layer._exl3_indexer_scales[slot] = None
             layer._exl3_indexer_mxfp8 = shims
             layer._exl3_indexer_mxfp8_kernels = kernel_names
             return
