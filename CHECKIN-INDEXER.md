@@ -144,3 +144,122 @@ results are in `receipt_gb10.json` under `case_g`
 ```
 cd /plugin && PYTHONPATH=/plugin/src python3 tools/gb10_minimax_m3_parity.py --cpu-selftest
 ```
+
+## Reroute to the weight-only Marlin kernel (W8A16) after the run-1 case G failure
+
+Run 1 (receipts in `/root/work/minimax-m31/receipts/val1/`) failed case G
+on both shards: index_q m1 cos 0.999615 / m64 0.999673, index_k m1
+0.999586 / m64 0.999659, against the 0.9999 gate.
+
+### What the 607c94e path selected on sm_121 and why
+
+The resolver hardcoded vLLM's
+`FlashInferCutlassMxfp8LinearKernel`. On GB10 (sm_121) its gates admit
+the shards (`has_device_capability(100)` is true for capability 121 and
+its `can_implement` takes the SM12x `mm_mxfp8` route when N % 32 == 0),
+so it executed -- but it is a W8A8 backend: it quantizes the ACTIVATION
+to MXFP8 inside the kernel. Run-1's case D isolated the loss to exactly
+that activation quantization: the weight-only `MarlinMxfp8LinearKernel`
+scored cos 0.999999 on the same device (activations stay bf16), while
+every W8A8 candidate landed at ~0.9998. The indexer drives top-k token
+selection, so its activations must stay bf16.
+
+### The fix
+
+- `indexer_mxfp8_kernel()` now binds vLLM's own
+  `MarlinMxfp8LinearKernel` (W8A16) and nothing else; the fail-closed
+  contract is unchanged (missing import, platform refusal, or shape
+  refusal each raise a clear `RuntimeError` naming
+  `VLLM_EXL3_INDEXER_MXFP8`; the kernel's own constructor re-asserts
+  both gates). The bound kernel class names are recorded on the layer
+  (`_exl3_indexer_mxfp8_kernels`).
+- The shim now carries the fields Marlin's load/apply steps read:
+  `output_size_per_partition` / `input_size_per_partition` (the shard's
+  true N/K) and `bias=None`; retention (fp8 payload bitcast + row-major
+  uint8 E8M0 scales) is unchanged.
+- Case G in `tools/gb10_minimax_m3_parity.py` now RECORDS the kernel
+  class the resolver bound (per shard, `kernel`) and requires it to be
+  `MarlinMxfp8LinearKernel`; a W8A8 re-point can never pass silently.
+  The numeric gates are unchanged (cos >= 0.9999 at m in {1, 64},
+  max_abs_ratio in [1/4, 4], 0 NaN). The old FlashInfer-specific
+  payload-bits/scale-swizzle checks are replaced by an honest
+  byte-accounting check: the Marlin load step replaces payload+scales
+  with its repacked tensors, and the receipt verifies
+  `repacked_bytes_preserved` (the repack must not grow the footprint).
+
+### Honest memory accounting (Marlin path)
+
+Per layer the shards are (512, 6144) and (128, 6144):
+
+- Marlin repack: `marlin_padded_nk` needs NO tile padding at these
+  shapes (both already satisfy the 64/128 thread-tile families), the
+  repacked qweight is (K/16, 4N) int32 == exactly the payload bytes, and
+  the permuted scale block comes back as 1-byte e8m0fnu == the scale
+  bytes. Resident per layer is unchanged: 3.094 (index_q) + 0.773
+  (index_k) = 3.867 MiB.
+- Marlin workspace: ONE shared persistent `marlin_locks` tensor of
+  num_compute_units x 4 int32 (~2 KiB total for the whole model, via
+  vLLM's workspace manager), not per-layer.
+- Load-time transient (honest): the repack staging (an int32 copy of
+  the payload plus the repack output, and a short-lived fp32 scale
+  staging) roughly doubles-to-triples the shard bytes for the duration
+  of the load step and is freed immediately (stash freed +
+  `replace_parameter`). Peak per layer during load ~9.7 MiB transient --
+  still BELOW the default path's own load peak (the 3.87 MiB stash plus
+  the 7.5 MiB BF16 staging rows, ~11.4 MiB), and the switch-on path
+  never allocates the persistent 7.5 MiB staging at all.
+
+Bottom line (unchanged by the reroute): 60 indexer layers
+**450.0 MiB BF16 -> 232.0 MiB resident, saving 218 MiB (~0.21 GiB)** of
+the 121.69 GiB GB10 UMA pool.
+
+### CPU tests
+
+`tests/test_indexer_mxfp8_retention.py` rewritten where the backend
+changed: the F8_128x4 swizzle round-trip tests are gone (that layout
+belonged to the W8A8 kernel); new tests pin (i) the resolver binds the
+weight-only Marlin kernel and fails closed on platform/shape refusal
+(through a fake vllm kernel API), (ii) the resolver source names no W8A8
+backend, (iii) the Marlin tile rule needs no padding at the pack shapes
+and the repack is byte-preserving, (iv) the shim carries the partition
+sizes Marlin reads. Default-off byte-identity tests are untouched.
+Suite: 591 passed / 39 skipped / 8 failed -- the same 8 pre-existing
+`test_compact_safetensors_attestation.py` /
+`test_compact_source_verification_window.py` failures, nothing new.
+Parity tool `--cpu-selftest`: `GB10_MINIMAX_M3_PARITY SELFTEST PASS`.
+
+### Exact GPU command (the parent runs this on the GB10)
+
+Same harness, same gates; only case G's backend changed. With this
+worktree at `<tree>` and the Hub token at `/run/hf_token`, inside the
+dev image:
+
+```
+docker run --rm --gpus all \
+    -v <tree>:/plugin:ro \
+    -v /root/work/minimax-m31/receipts:/receipts \
+    -v /run/hf_token:/run/hf_token:ro \
+    -e PYTHONPATH=/plugin/src \
+    <dev-image> \
+    python3 /plugin/tools/gb10_minimax_m3_parity.py \
+        --json /receipts/parity.json --hf-token-file /run/hf_token
+```
+
+`<tree>` is `/root/work/minimax-m31/lanes/plugin/wt-indexer-mxfp8` and
+`<dev-image>` is the same dev image that produced the run-1 receipt.
+Case G's per-shard `kernel` field must read `MarlinMxfp8LinearKernel`
+and `repacked_bytes_preserved` must be true; the numeric gates are
+unchanged. CPU-only structural check on any box:
+
+```
+cd <tree> && PYTHONPATH=src python3 tools/gb10_minimax_m3_parity.py --cpu-selftest
+```
+
+### Unverified without the GPU
+
+- The real GB10 case G verdict under the Marlin backend (this box has no
+  GPU). Case D proved Marlin at (12288, 6144) on sm_121; the shard
+  shapes (512/128, 6144) pass `can_implement` and need no tile padding
+  by arithmetic, but only the rerun proves the marlin_gemm execution at
+  those N.
+- The m=1 decode arm under Marlin (case D ran m=64 only).

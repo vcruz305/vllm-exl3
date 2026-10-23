@@ -459,6 +459,14 @@ def test_case_g_gates_the_real_indexer_shards():
     assert "max_abs_ratio" in seg and '"nan"] == 0' in seg
     assert 'entry["error"] = str(exc)[:400]' in seg
     assert 'entry["pass"] = False' in seg.split("except Exception", 1)[1][:400]
+    # The receipt RECORDS which kernel class the resolver bound and
+    # requires the weight-only (W8A16) backend: the run-1 W8A8 route
+    # scored cos ~0.9996 (activation quantization), and the fix must never
+    # be reversible without the receipt naming it.
+    assert 'entry["kernel"] = type(kernel).__name__' in seg
+    assert 'entry["kernel"] == "MarlinMxfp8LinearKernel"' in seg
+    assert "repacked_bytes_preserved" in seg
+    assert "payload_bits_unchanged" not in seg
     # main() wires the case into the overall verdict.
     main_seg = src.split("def main(", 1)[1]
     assert 'receipt["case_g"]' in main_seg

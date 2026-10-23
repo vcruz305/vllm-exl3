@@ -156,11 +156,13 @@ F_MS = (1, 96)
 
 # Case G (retained-MXFP8 indexer): the REAL layer-0 index_q/index_k shards
 # through the plugin's VLLM_EXL3_INDEXER_MXFP8 glue -- retention ->
-# vLLM's own MXFP8 linear kernel (the sm_121 backend the image selects) --
-# against the BF16-dequant reference the default path computes. The gate is
-# stricter than COS_MIN: the indexer projections are small GEMMs whose
-# outputs feed the sparse-attention scores, so the retained path must be
-# near-identical to the dequant path.
+# vLLM's own WEIGHT-ONLY Marlin MXFP8 kernel (W8A16; the run-1 W8A8
+# route scored cos ~0.9996 here and case D pinned the loss to the
+# in-kernel activation quantization) -- against the BF16-dequant
+# reference the default path computes. The gate is stricter than
+# COS_MIN: the indexer projections are small GEMMs whose outputs feed
+# the sparse-attention scores, so the retained path must be near-identical
+# to the dequant path.
 G_COS_MIN = 0.9999
 # Max-abs bound: the kernel output's magnitude must stay within a factor
 # of the reference (catches scale blow-up/collapse that a cosine alone
@@ -1455,14 +1457,17 @@ def _case_g(device: torch.device, token_file: str | None) -> dict[str, Any]:
 
     The exact production path the opt-in switch drives at load: the
     plugin's retention (F8_E4M3 payload bitcast + row-major E8M0 block-32
-    scales), vLLM's own MXFP8 linear kernel resolved fail-closed, the
-    kernel's load step (its F8_128x4 scale swizzle), then its apply at
-    decode- and prefill-family row counts -- against the BF16-dequant
-    reference the default (switch-off) path computes from the same bytes.
-    Gates: cosine >= G_COS_MIN, max-abs within G_ABS_FACTOR of the
-    reference, zero NaN, and the payload bytes unchanged by the kernel's
-    load step (a value cast would destroy the E4M3 bit pattern, the
-    run-3 lesson).
+    scales), the plugin's fail-closed resolver, the bound kernel's load
+    step, then its apply at decode- and prefill-family row counts -- against
+    the BF16-dequant reference the default (switch-off) path computes from
+    the same bytes. The receipt RECORDS the kernel class the resolver bound
+    and requires it to be the weight-only (W8A16, bf16-activation) Marlin
+    kernel: the run-1 W8A8 backend quantized the activation in-kernel and
+    scored cos ~0.9996, below the gate. Numeric gates unchanged: cosine
+    >= G_COS_MIN, max-abs within G_ABS_FACTOR of the reference, zero NaN.
+    The load step replaces the payload/scale tensors with its repacked
+    ones; the receipt checks the repack is byte-preserving at these shapes
+    so the retained footprint did not grow.
     """
     entries = _fixture_entries()
     if not token_file:
@@ -1543,21 +1548,30 @@ def _case_g(device: torch.device, token_file: str | None) -> dict[str, Any]:
                 payload, scales
             )
             kernel = exl3.indexer_mxfp8_kernel(tuple(payload_fp8.shape))
+            # Record WHICH kernel class the resolver bound, and require it
+            # to be the weight-only (W8A16) one: a W8A8 re-point would
+            # have to be a deliberate, receipted decision, never a silent
+            # fallback under the cosine gate.
+            entry["kernel"] = type(kernel).__name__
             shim = exl3.make_indexer_mxfp8_shim(payload_fp8, scales_u8)
             kernel.process_weights_after_loading(shim)
             torch.cuda.synchronize()
-            # The kernel's load step must not touch the payload bits and
-            # must have re-ordered the scale block (its F8_128x4 swizzle).
-            entry["payload_bits_unchanged"] = bool(
-                torch.equal(shim.weight.data.view(torch.uint8), payload)
+            # The load step REPLACES the fp8 payload and the uint8 E8M0
+            # scales with its repacked W8A16 tensors; at these shard
+            # shapes the repack is a byte-preserving permutation (no tile
+            # padding: (512, 6144) and (128, 6144) already satisfy the
+            # Marlin tile families), so the retained footprint must not
+            # have grown.
+            repacked_bytes = (
+                shim.weight.data.numel() * shim.weight.data.element_size()
+                + shim.weight_scale.data.numel()
+                * shim.weight_scale.data.element_size()
             )
-            entry["scale_block_reordered"] = bool(
-                shim.weight_scale.data.reshape(-1).numel()
-                == scales_u8.numel()
-                and not torch.equal(shim.weight_scale.data.reshape(-1), scales_u8.reshape(-1))
+            entry["repacked_bytes_preserved"] = bool(
+                repacked_bytes == payload.numel() + scales.numel()
             )
             entry["retained_mib_per_layer"] = round(
-                (payload.numel() + scales.numel()) / 2**20, 3
+                repacked_bytes / 2**20, 3
             )
             per_m: dict[str, Any] = {}
             for m in G_MS:
@@ -1577,8 +1591,8 @@ def _case_g(device: torch.device, token_file: str | None) -> dict[str, Any]:
                 }
             entry["per_m"] = per_m
             entry["pass"] = (
-                entry["payload_bits_unchanged"]
-                and entry["scale_block_reordered"]
+                entry["kernel"] == "MarlinMxfp8LinearKernel"
+                and entry["repacked_bytes_preserved"]
                 and all(
                     v["cosine"] is not None
                     and v["cosine"] >= G_COS_MIN
@@ -1598,8 +1612,9 @@ def _case_g(device: torch.device, token_file: str | None) -> dict[str, Any]:
         del ref_w
         torch.cuda.empty_cache()
     return {
-        "backend": "FlashInferCutlassMxfp8LinearKernel (vLLM's own, via the "
-        "plugin's fail-closed resolver)",
+        "backend": "the plugin's fail-closed resolver (recorded per shard "
+        "as 'kernel'; required: MarlinMxfp8LinearKernel, vLLM's own "
+        "weight-only W8A16 backend)",
         "gate": f"cos>={G_COS_MIN} max_abs_ratio in "
         f"[{1.0 / G_ABS_FACTOR}, {G_ABS_FACTOR}] nan==0",
         "shards": shards,
@@ -1994,11 +2009,16 @@ def _selftest() -> int:
     _check("case G gates cosine, max-abs and NaN",
            "G_COS_MIN" in g_seg and "G_ABS_FACTOR" in g_seg
            and "max_abs_ratio" in g_seg and '"nan"] == 0' in g_seg)
+    _check("case G records and requires the weight-only kernel",
+           'entry["kernel"] = type(kernel).__name__' in g_seg
+           and 'entry["kernel"] == "MarlinMxfp8LinearKernel"' in g_seg
+           and "repacked_bytes_preserved" in g_seg)
     _check("case G keeps the fail-closed resolver a FAIL, never a skip",
            'entry["error"] = str(exc)[:400]' in g_seg
            and 'entry["pass"] = False' in g_seg.split("except Exception", 1)[1][:400])
     # Plugin-side: the retention resolver must be fail-closed (both the
-    # platform and the shape gate, clear errors naming the switch), the
+    # platform and the shape gate, clear errors naming the switch), must
+    # bind the WEIGHT-ONLY Marlin kernel and never a W8A8 backend, the
     # BF16 staging union must be gated on the switch, and apply must route
     # the two indexer slices through the bound kernel.
     resolver_seg = esrc.split("def indexer_mxfp8_kernel", 1)[1]
@@ -2006,6 +2026,11 @@ def _selftest() -> int:
     _check("plugin indexer kernel resolver is fail-closed",
            "is_supported" in resolver_seg and "can_implement" in resolver_seg
            and "VLLM_EXL3_INDEXER_MXFP8=1" in resolver_seg)
+    _check("plugin resolver binds the weight-only Marlin kernel only",
+           "MarlinMxfp8LinearKernel" in resolver_seg
+           and "FlashInferCutlassMxfp8LinearKernel" not in resolver_seg
+           and "B12xMxfp8" not in resolver_seg
+           and "TorchMxFp8" not in resolver_seg)
     _check("the BF16 staging union is gated on the switch",
            "if indexer_shards and not _indexer_mxfp8_enabled():" in esrc)
     _check("apply routes the indexer slices through the bound kernel",

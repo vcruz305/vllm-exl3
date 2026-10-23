@@ -5,10 +5,12 @@ CPU-only (no vLLM, no GPU, no kernel launch):
 - (a) default-off is byte-identical to the pre-switch loader: the stashed
   MXFP8 payloads are dequantized into the same BF16 staging rows and no
   MXFP8 state appears on the layer;
-- (b) the retained (F8_E4M3 payload, E8M0 block-32 scales) pair is
-  bit-preserving, and the emulated MXFP8 GEMM semantics (what the kernel
-  consumes, through the F8_128x4 scale swizzle its load step applies)
-  match a pure-torch dequant+matmul reference on random data;
+- (b) the switch-on resolver binds vLLM's WEIGHT-ONLY Marlin MXFP8 kernel
+  (W8A16, bf16 activations) and nothing else: every other condition --
+  missing kernel, platform refusal, shape refusal -- fails closed with an
+  error naming the switch, and the Marlin repack is byte-preserving at
+  the real pack shapes (no tile padding), so the retained footprint does
+  not grow;
 - (c) memory accounting: the switch-on parameters are fp8+uint8 and their
   total bytes are ~half of the BF16 staging at the real pack shapes
   (60 layers: 450 MiB BF16 -> ~232 MiB retained);
@@ -170,14 +172,99 @@ def test_switch_on_fails_closed_without_vllm_kernel(monkeypatch):
     assert not hasattr(layer, "_exl3_indexer_mxfp8")
 
 
+def _install_fake_vllm_mxfp8(monkeypatch, *, supported, implementable):
+    """Install a fake vllm MXFP8 kernel API into sys.modules.
+
+    The real API is vLLM's own `MarlinMxfp8LinearKernel` behind the
+    `Mxfp8LinearLayerConfig` config; this stand-in lets the resolver's
+    accept/refuse branches run on CPU. monkeypatch restores sys.modules.
+    """
+    import sys
+    import types
+
+    for name in (
+        "vllm",
+        "vllm.model_executor",
+        "vllm.model_executor.kernels",
+        "vllm.model_executor.kernels.linear",
+        "vllm.model_executor.kernels.linear.mxfp8",
+    ):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+
+    cfg_mod = types.ModuleType(
+        "vllm.model_executor.kernels.linear.mxfp8.Mxfp8LinearKernel"
+    )
+
+    class Mxfp8LinearLayerConfig:  # minimal stand-in
+        def __init__(self, weight_shape):
+            self.weight_shape = tuple(weight_shape)
+
+    setattr(cfg_mod, "Mxfp8LinearLayerConfig", Mxfp8LinearLayerConfig)
+    monkeypatch.setitem(sys.modules, cfg_mod.__name__, cfg_mod)
+
+    marlin_mod = types.ModuleType(
+        "vllm.model_executor.kernels.linear.mxfp8.marlin"
+    )
+
+    class MarlinMxfp8LinearKernel:  # stand-in for vLLM's W8A16 kernel
+        def __init__(self, config):
+            self.config = config
+
+        @classmethod
+        def is_supported(cls):
+            return (True, None) if supported else (False, "no marlin here")
+
+        @classmethod
+        def can_implement(cls, config):
+            return (True, None) if implementable else (False, "bad shape")
+
+    setattr(marlin_mod, "MarlinMxfp8LinearKernel", MarlinMxfp8LinearKernel)
+    monkeypatch.setitem(sys.modules, marlin_mod.__name__, marlin_mod)
+    return MarlinMxfp8LinearKernel
+
+
+def test_resolver_binds_the_weight_only_marlin_kernel(monkeypatch):
+    # Both gates admit: the resolver must return vLLM's weight-only Marlin
+    # kernel for the shard -- never a W8A8 backend.
+    cls = _install_fake_vllm_mxfp8(monkeypatch, supported=True, implementable=True)
+    kernel = exl3.indexer_mxfp8_kernel((512, 6144))
+    assert type(kernel) is cls
+    assert type(kernel).__name__ == "MarlinMxfp8LinearKernel"
+    assert kernel.config.weight_shape == (512, 6144)
+
+
+def test_resolver_fails_closed_on_platform_refusal(monkeypatch):
+    cls = _install_fake_vllm_mxfp8(monkeypatch, supported=False, implementable=True)
+    with pytest.raises(RuntimeError, match=r"VLLM_EXL3_INDEXER_MXFP8=1.*Marlin"):
+        exl3.indexer_mxfp8_kernel((512, 6144))
+    assert cls.is_supported() == (False, "no marlin here")
+
+
+def test_resolver_fails_closed_on_shape_refusal(monkeypatch):
+    _install_fake_vllm_mxfp8(monkeypatch, supported=True, implementable=False)
+    with pytest.raises(RuntimeError, match="refuses the indexer shard shape"):
+        exl3.indexer_mxfp8_kernel((512, 6144))
+
+
+def test_resolver_source_names_no_w8a8_backend():
+    # Source-level pin: the resolver names the weight-only Marlin kernel
+    # and no activation-quantizing (W8A8) backend can be re-pointed at it.
+    import inspect
+
+    src = inspect.getsource(exl3.indexer_mxfp8_kernel)
+    assert "MarlinMxfp8LinearKernel" in src
+    for w8a8 in ("FlashInferCutlass", "B12x", "TorchMxFp8", "Humming"):
+        assert w8a8 not in src
+
+
 class _FakeKernel:
-    """Stands in for vLLM's MXFP8 linear kernel on CPU.
+    """Stands in for vLLM's weight-only Marlin MXFP8 kernel on CPU.
 
     ``process_weights_after_loading`` records the call (the real one
-    swizzles the scale block); ``apply_weights`` emulates the kernel's
-    semantics -- dequantize the shim's own (fp8 payload, E8M0 scales)
-    state and matmul -- so the glue can be compared against the BF16
-    path without any GPU.
+    repacks payload+scales into its W8A16 format); ``apply_weights``
+    emulates the kernel's semantics -- dequantize the shim's own (fp8
+    payload, E8M0 scales) state and matmul -- so the glue can be
+    compared against the BF16 path without any GPU.
     """
 
     def __init__(self):
@@ -212,9 +299,13 @@ def test_switch_on_binds_kernel_shims_and_frees_stash(monkeypatch):
     )
     shims = layer._exl3_indexer_mxfp8
     assert len(shims) == 2 and len(made) == 2
+    # The bound kernel classes are recorded on the layer (the GB10 receipt
+    # cross-checks them against the weight-only Marlin requirement).
+    assert layer._exl3_indexer_mxfp8_kernels == ["_FakeKernel", "_FakeKernel"]
     # One shim per indexer shard, in shard order, with the checkpoint
-    # geometry; the payload is the bitcast fp8 view and the scales stay
-    # the row-major uint8 block the kernel's load step expects.
+    # geometry; the payload is the bitcast fp8 view, the scales stay the
+    # row-major uint8 block the kernel's load step expects, and the shim
+    # carries the true partition sizes the kernel's apply reads.
     for slot, (n, (kernel, shim)) in enumerate(zip(INDEXER_OUTS, shims)):
         assert made[slot][0] == (n, IN)
         assert kernel.processed == [shim]
@@ -224,6 +315,9 @@ def test_switch_on_binds_kernel_shims_and_frees_stash(monkeypatch):
         assert shim.weight_scale.data.dtype == torch.uint8
         assert tuple(shim.weight_scale.data.shape) == (n, IN // 32)
         assert torch.equal(shim.weight_scale.data, scales[slot])
+        assert shim.output_size_per_partition == n
+        assert shim.input_size_per_partition == IN
+        assert shim.bias is None
         assert shim.params_dtype == torch.bfloat16
     assert layer._exl3_indexer_payloads == [None, None]
     assert layer._exl3_indexer_scales == [None, None]
@@ -244,79 +338,53 @@ def test_retention_rejects_bad_geometry():
 
 
 # ---------------------------------------------------------------------------
-# (b) emulated MXFP8 GEMM semantics vs a pure-torch reference
+# (b) the Marlin repack is byte-preserving at the real pack shapes
 # ---------------------------------------------------------------------------
 
 
-def _swizzle_reference(sf: torch.Tensor, n: int, k: int) -> torch.Tensor:
-    """Test-local F8_128x4 scale swizzle, from the documented layout.
+def _marlin_padded_nk_reference(n: int, k: int) -> tuple[int, int]:
+    """marlin_utils.marlin_padded_nk's documented tile rule, test-local.
 
-    The scale block [n, k // 32] is padded to 128-row tiles x 4-column
-    tiles, viewed (n/128 tiles, 4, 32, k/128 tiles, 4) and transposed on
-    the (4, k/128) axes -- the permutation vLLM's MXFP8 GEMM reads. The
-    real kernel applies its own swizzle at load; this reference exists so
-    the round trip through the swizzled order can be proven lossless on
-    CPU. The real-kernel agreement is gated on the GB10 (parity case G).
+    Marlin requires (n %% 64, k %% 128) or (n %% 128, k %% 64); shapes
+    satisfying neither are zero-padded up to the cheaper family, with K
+    kept divisible by the 32-wide scale block. This reference exists so
+    the real pack shapes can be proven padding-free on CPU; the
+    real-kernel agreement is gated on the GB10 (parity case G).
     """
-    scale_cols = k // 32
-    mt = (n + 127) // 128
-    ct = (scale_cols + 3) // 4
-    padded = torch.zeros((mt * 128, ct * 4), dtype=sf.dtype)
-    padded[:n, :scale_cols] = sf
-    return (
-        padded.view(mt, 4, 32, ct, 4)
-        .transpose(1, 3)
-        .reshape(-1)
-        .contiguous()
+    import math
+
+    def round_up(x: int, m: int) -> int:
+        return ((x + m - 1) // m) * m
+
+    group = 32
+    candidates = (
+        (round_up(n, 64), round_up(k, math.lcm(128, group))),
+        (round_up(n, 128), round_up(k, math.lcm(64, group))),
     )
+    return min(candidates, key=lambda nk: (nk[0] * nk[1], nk[0] + nk[1]))
 
 
-def _unswizzle_reference(swizzled: torch.Tensor, n: int, k: int) -> torch.Tensor:
-    scale_cols = k // 32
-    mt = (n + 127) // 128
-    ct = (scale_cols + 3) // 4
-    return (
-        swizzled.view(mt, ct, 32, 4, 4)
-        .transpose(1, 3)
-        .reshape(mt * 128, ct * 4)[:n, :scale_cols]
-        .contiguous()
-    )
+def test_marlin_repack_needs_no_tile_padding_at_pack_shapes():
+    # The real shards are (512, 6144) and (128, 6144): both already
+    # satisfy Marlin's thread-tile families, so the load step's zero
+    # padding is a no-op and the repack cannot grow the tensors.
+    for n, k in _real_indexer_shapes():
+        assert _marlin_padded_nk_reference(n, k) == (n, k)
 
 
-def test_swizzle_round_trip_is_a_lossless_permutation():
-    n, k = 8, IN
-    scales = _scales((n, k // 32))
-    swizzled = _swizzle_reference(scales, n, k)
-    # The swizzled block is padded (128-row x 4-col tiles) and reordered...
-    assert swizzled.numel() > scales.numel()
-    assert not torch.equal(swizzled.reshape(-1)[: scales.numel()], scales.reshape(-1))
-    # ...but the round trip through it recovers every scale byte exactly.
-    assert torch.equal(_unswizzle_reference(swizzled, n, k), scales)
-
-
-def test_emulated_mxfp8_gemm_matches_pure_torch_reference():
-    # Random data: the pure-torch reference dequantizes the MXFP8 shard
-    # and matmuls; the emulated kernel path consumes the RETAINED state
-    # through the swizzled scale order. The two must agree exactly.
-    torch.manual_seed(0)
-    n, k = 8, IN
-    payload = _finite_e4m3_bytes((n, k))
-    scales = _scales((n, k // 32))
-    x = torch.randn(6, k, dtype=torch.bfloat16)
-    w_ref = exl3.dequant_minimax_indexer(payload, scales)
-    y_ref = torch.nn.functional.linear(x, w_ref)
-
-    retained_fp8, retained_scales = exl3.indexer_mxfp8_retain(payload, scales)
-    assert torch.equal(retained_fp8.view(torch.uint8), payload)
-    swizzled = _swizzle_reference(retained_scales, n, k)
-    recovered = _unswizzle_reference(swizzled, n, k)
-    w_emulated = exl3.dequant_minimax_indexer(
-        retained_fp8.view(torch.uint8), recovered
-    )
-    assert torch.equal(w_emulated, w_ref)
-    y_emulated = torch.nn.functional.linear(x, w_emulated)
-    assert torch.equal(y_emulated, y_ref)
-    assert y_emulated.dtype == y_ref.dtype == torch.bfloat16
+def test_marlin_repack_is_byte_preserving_at_pack_shapes():
+    # The repacked qweight is (k/16, 4n) int32 -- exactly the payload's
+    # bytes -- and the permuted scale block comes back as 1-byte e8m0fnu,
+    # so the retained footprint is unchanged by the load step.
+    for n, k in _real_indexer_shapes():
+        payload_bytes = n * k
+        scale_bytes = n * (k // 32)
+        repacked_weight_bytes = (k // 16) * (4 * n) * 4
+        repacked_scale_bytes = n * (k // 32)
+        assert repacked_weight_bytes == payload_bytes
+        assert repacked_weight_bytes + repacked_scale_bytes == (
+            payload_bytes + scale_bytes
+        )
 
 
 class _StubExl3Linear:

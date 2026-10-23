@@ -1938,12 +1938,13 @@ def indexer_mxfp8_retain(
 
     The complement of :func:`dequant_minimax_indexer` for the
     VLLM_EXL3_INDEXER_MXFP8 path: instead of decoding the payload to BF16,
-    keep it as the (F8_E4M3 payload, E8M0 block-32 scale) pair vLLM's MXFP8
-    linear kernel consumes. The payload is bitcast (never value-cast) to
-    ``float8_e4m3fn`` -- the safetensors dtype the kernel asserts -- and the
-    scale bytes stay ``uint8`` row-major ``[out, in // block]``, the layout
-    the kernel's own ``process_weights_after_loading`` expects before it
-    swizzles them into the F8_128x4 order the GEMM reads.
+    keep it as the (F8_E4M3 payload, E8M0 block-32 scale) pair vLLM's
+    weight-only MXFP8 kernel consumes. The payload is bitcast (never
+    value-cast) to ``float8_e4m3fn`` -- the safetensors dtype the kernel
+    asserts -- and the scale bytes stay ``uint8`` row-major
+    ``[out, in // block]``, the layout the kernel's own
+    ``process_weights_after_loading`` expects before it repacks them into
+    its W8A16 GEMM format.
     """
     _validate_indexer_mxfp8_geometry(packed, scales, block)
     if scales.dtype != torch.uint8:
@@ -1960,44 +1961,50 @@ def indexer_mxfp8_retain(
 
 
 def indexer_mxfp8_kernel(weight_shape: tuple[int, int]):
-    """Resolve vLLM's MXFP8 linear kernel for an indexer shard, fail closed.
+    """Resolve vLLM's weight-only Marlin MXFP8 kernel, fail closed.
 
-    Imports vLLM's own FlashInfer CUTLASS MXFP8 linear kernel (the backend
-    the sm_121 image selects for the DSpark draft's ModelOpt MXFP8 layers)
-    and instantiates it for ``weight_shape``. Both the platform gate
-    (``is_supported``) and the shape gate (``can_implement``) must admit
-    the shard; anything else is a clear error, never a BF16 fallback.
+    The run-1 GB10 receipt pinned the W8A8 route's failure: the FlashInfer
+    CUTLASS MXFP8 kernel that path bound quantizes the ACTIVATION to MXFP8
+    in-kernel, and the real indexer shards scored cosine ~0.9996 against
+    the BF16-dequant reference -- below the 0.9999 parity gate. The same
+    receipt's case D isolated the loss to that activation quantization:
+    the weight-only Marlin kernel scored 0.999999 on the same device.
+    The indexer drives top-k token selection, so the retained shards must
+    run a WEIGHT-ONLY (W8A16, bf16 activations) GEMM. This resolver binds
+    vLLM's own ``MarlinMxfp8LinearKernel`` and nothing else; both the
+    platform gate (``is_supported``) and the shape gate (``can_implement``)
+    must admit the shard. Anything else is a clear error naming the switch
+    -- never a BF16 fallback and never a silent return to a W8A8 kernel.
     """
     try:
         from vllm.model_executor.kernels.linear.mxfp8.Mxfp8LinearKernel import (
             Mxfp8LinearLayerConfig,
         )
-        from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
-            FlashInferCutlassMxfp8LinearKernel,
+        from vllm.model_executor.kernels.linear.mxfp8.marlin import (
+            MarlinMxfp8LinearKernel,
         )
     except Exception as exc:
         raise RuntimeError(
-            "VLLM_EXL3_INDEXER_MXFP8=1 requires vLLM's MXFP8 linear kernel "
-            "API (vllm.model_executor.kernels.linear.mxfp8) and it could "
+            "VLLM_EXL3_INDEXER_MXFP8=1 requires vLLM's weight-only Marlin "
+            "MXFP8 (W8A16) linear kernel "
+            "(vllm.model_executor.kernels.linear.mxfp8.marlin) and it could "
             f"not be imported: {exc!r}"
         ) from exc
-    supported, reason = FlashInferCutlassMxfp8LinearKernel.is_supported()
+    supported, reason = MarlinMxfp8LinearKernel.is_supported()
     if not supported:
         raise RuntimeError(
-            "VLLM_EXL3_INDEXER_MXFP8=1: vLLM's FlashInfer CUTLASS MXFP8 "
+            "VLLM_EXL3_INDEXER_MXFP8=1: vLLM's Marlin MXFP8 (W8A16) "
             f"linear kernel is unavailable on this platform: {reason}"
         )
     config = Mxfp8LinearLayerConfig(weight_shape=tuple(weight_shape))
-    implementable, reason = FlashInferCutlassMxfp8LinearKernel.can_implement(
-        config
-    )
+    implementable, reason = MarlinMxfp8LinearKernel.can_implement(config)
     if not implementable:
         raise RuntimeError(
-            "VLLM_EXL3_INDEXER_MXFP8=1: vLLM's FlashInfer CUTLASS MXFP8 "
+            "VLLM_EXL3_INDEXER_MXFP8=1: vLLM's Marlin MXFP8 (W8A16) "
             f"linear kernel refuses the indexer shard shape "
             f"{tuple(weight_shape)}: {reason}"
         )
-    return FlashInferCutlassMxfp8LinearKernel(config)
+    return MarlinMxfp8LinearKernel(config)
 
 
 def make_indexer_mxfp8_shim(
@@ -2005,20 +2012,27 @@ def make_indexer_mxfp8_shim(
     scales: "torch.Tensor",
     params_dtype: "torch.dtype" = torch.bfloat16,
 ):
-    """Build the parameter shim vLLM's MXFP8 kernel applies against.
+    """Build the parameter shim vLLM's Marlin MXFP8 kernel applies against.
 
-    The kernel's ``process_weights_after_loading`` / ``apply_weights``
-    read ``weight`` (F8_E4M3, ``[N, K]``), ``weight_scale`` (uint8 E8M0,
-    ``[N, K // 32]`` row-major before its own swizzle) and
-    ``params_dtype`` (the activation/output dtype the layer runs). The
-    indexer shards are the only consumers, so a shim per shard is kept
-    instead of registering vLLM parameters on the fused layer.
+    The kernel's ``process_weights_after_loading`` / ``apply_weights`` read
+    ``weight`` (F8_E4M3, ``[N, K]``), ``weight_scale`` (uint8 E8M0,
+    ``[N, K // 32]`` row-major before its own repack), the shard's true
+    ``output_size_per_partition`` / ``input_size_per_partition``, and
+    ``bias``. ``params_dtype`` documents the activation/output dtype the
+    layer runs (bf16 -- the Marlin path is weight-only and never
+    quantizes the activation). The indexer shards are the only consumers,
+    so a shim per shard is kept instead of registering vLLM parameters on
+    the fused layer.
     """
     from types import SimpleNamespace
 
+    out_rows, in_cols = int(payload_fp8.shape[0]), int(payload_fp8.shape[1])
     shim = SimpleNamespace()
     shim.weight = torch.nn.Parameter(payload_fp8, requires_grad=False)
     shim.weight_scale = torch.nn.Parameter(scales, requires_grad=False)
+    shim.output_size_per_partition = out_rows
+    shim.input_size_per_partition = in_cols
+    shim.bias = None
     shim.params_dtype = params_dtype
     return shim
 
@@ -6452,12 +6466,14 @@ class Exl3LinearMethod(LinearMethodBase):
         (F8_E4M3 + E8M0 block-32 scales) into their BF16 staging rows --
         byte-identical to the pre-switch loader. With
         VLLM_EXL3_INDEXER_MXFP8=1: retain each shard in its native MXFP8
-        form (payload fp8 + E8M0 scales in the layout vLLM's kernel
-        expects) and bind vLLM's own MXFP8 linear kernel, failing closed
-        if the kernel is unavailable; the stash is freed either way.
+        form (payload fp8 + E8M0 scales in the layout the kernel expects)
+        and bind vLLM's own weight-only Marlin MXFP8 kernel (W8A16, bf16
+        activations), failing closed if the kernel is unavailable; the
+        stash is freed either way.
         """
         if indexer_mxfp8:
             shims = []
+            kernel_names = []
             for slot, shard_idx in enumerate(indexer_shards):
                 payload = layer._exl3_indexer_payloads[slot]
                 scales = layer._exl3_indexer_scales[slot]
@@ -6470,14 +6486,18 @@ class Exl3LinearMethod(LinearMethodBase):
                 payload_fp8, scales_u8 = indexer_mxfp8_retain(payload, scales)
                 kernel = indexer_mxfp8_kernel(tuple(payload_fp8.shape))
                 shim = make_indexer_mxfp8_shim(payload_fp8, scales_u8)
-                # The kernel's own load-time step: it swizzles the E8M0
-                # block into the F8_128x4 order its GEMM reads; the fp8
-                # payload stays 1 byte/elem on device.
+                # The kernel's own load-time step: it repacks the fp8
+                # payload and the E8M0 scale block into its weight-only
+                # (W8A16) GEMM format -- a byte-preserving permutation at
+                # these shard shapes, so the retained footprint does not
+                # grow.
                 kernel.process_weights_after_loading(shim)
                 shims.append((kernel, shim))
+                kernel_names.append(type(kernel).__name__)
                 layer._exl3_indexer_payloads[slot] = None
                 layer._exl3_indexer_scales[slot] = None
             layer._exl3_indexer_mxfp8 = shims
+            layer._exl3_indexer_mxfp8_kernels = kernel_names
             return
         staging_in = int(layer.weight.data.shape[1])
         for slot, shard_idx in enumerate(indexer_shards):
