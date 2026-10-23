@@ -2109,3 +2109,215 @@ def test_decode_kernel_refuses_non_uint8_pool(monkeypatch) -> None:
             NKV, 0.08, torch.zeros(2, NQ, 128, dtype=torch.bfloat16), 1,
         )
     assert calls == []  # nothing launched
+
+
+# ---------------------------------------------------------------------------
+# GB10 val7 follow-up: the vendor kernels are the ground truth. The val7
+# harness handed the ORIGINAL prefill kernel a K/V-BLOCKED fp8 pool, so
+# the fp8 leg was uncorrelated (cos 0.0022) with both the q4 staging
+# path and the fp32 oracle -- a harness bug, not an overlay/oracle bug.
+# Every vendor invocation now goes through ONE mirrored-argument
+# builder, the fixtures build vendor-layout fp8 AND unquantized bf16
+# pools, and the units gate against the vendor kernel on the bf16 pool.
+# ---------------------------------------------------------------------------
+
+_HARNESS_MODULE = None
+
+
+def _harness_module():
+    """Load tools/gb10_q4kv_parity.py (importing it runs no unit; the
+    GPU units are only reachable through main())."""
+    global _HARNESS_MODULE
+    if _HARNESS_MODULE is None:
+        import importlib.util
+
+        root = Path(__file__).resolve().parents[1]
+        tools = root / "tools"
+        for name in ("q4kv_gates", "q4kv_harness_inputs"):
+            if name not in sys.modules:
+                spec = importlib.util.spec_from_file_location(
+                    name, tools / f"{name}.py"
+                )
+                assert spec is not None and spec.loader is not None
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules[name] = mod
+                spec.loader.exec_module(mod)
+        sys.path.insert(0, str(tools))
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "gb10_q4kv_parity", tools / "gb10_q4kv_parity.py"
+            )
+            assert spec is not None and spec.loader is not None
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["gb10_q4kv_parity"] = mod
+            spec.loader.exec_module(mod)
+        finally:
+            sys.path.remove(str(tools))
+        _HARNESS_MODULE = mod
+    return _HARNESS_MODULE
+
+
+def test_harness_pools_are_vendor_layout_and_val7_blocked_layout_fails():
+    """The fixtures must build the fp8 pool in the VENDOR layout
+    ([pages, num_kv_heads, 128, 256] with [K | V] in every token row --
+    what the ORIGINAL kernels read and the W1 op writes) plus an
+    UNQUANTIZED bf16 pool of the same K/V, and the validators must fail
+    closed on the val7 K/V-blocked geometry."""
+    hi = _harness_inputs_module()
+    dec = hi.decode_inputs()
+    hi.validate_decode_inputs(dec)
+    shape = (hi.NUM_PAGES, hi.NKV, hi.BLOCK, 256)
+    assert dec["fp8_pool"].shape == shape
+    assert dec["bf16_pool"].shape == shape
+    assert torch.equal(
+        dec["fp8_pool"].view(torch.uint8)[..., :128],
+        dec["k_vals"].to(torch.float8_e4m3fn).view(torch.uint8),
+    )
+    assert torch.equal(
+        dec["fp8_pool"].view(torch.uint8)[..., 128:],
+        dec["v_vals"].to(torch.float8_e4m3fn).view(torch.uint8),
+    )
+    assert torch.equal(
+        dec["bf16_pool"][..., :128], dec["k_vals"].to(torch.bfloat16)
+    )
+    assert torch.equal(
+        dec["bf16_pool"][..., 128:], dec["v_vals"].to(torch.bfloat16)
+    )
+    # The exact val7 geometry (K/V-blocked head slots) fails closed.
+    blocked = dec["fp8_pool"].reshape(hi.NUM_PAGES, 2 * hi.NKV, hi.BLOCK, 128)
+    with pytest.raises(ValueError, match="VENDOR-layout"):
+        hi.validate_decode_inputs({**dec, "fp8_pool": blocked})
+    with pytest.raises(ValueError, match="vendor layout"):
+        hi.validate_decode_inputs({**dec, "bf16_pool": None})
+    # The shipped prefill fixture (the exact bytes GB10 consumes) passes
+    # its own validator too.
+    pre = hi.prefill_inputs()
+    hi.validate_prefill_inputs(pre)
+    assert pre["fp8_pool"].shape == (
+        hi.PREFILL_NUM_PAGES, hi.NKV, hi.BLOCK, 256
+    )
+    assert pre["bf16_pool"].shape == (
+        hi.PREFILL_NUM_PAGES, hi.NKV, hi.BLOCK, 256
+    )
+    blocked = pre["fp8_pool"].reshape(
+        hi.PREFILL_NUM_PAGES, 2 * hi.NKV, hi.BLOCK, 128
+    )
+    with pytest.raises(ValueError, match="VENDOR-layout"):
+        hi.validate_prefill_inputs({**pre, "fp8_pool": blocked})
+
+
+def test_vendor_invocation_builder_is_one_fail_closed_mirror():
+    """The ONE builder must mirror the real impl call site
+    (sparse_attention.py:447-521): every tensor moved to the target,
+    the real positional order, the pinned unit scales ONLY for the fp8
+    pool, the output allocated on the target -- and it must refuse the
+    val7 blocked pool and every pool/key mismatch so the q4 container
+    can never reach the original kernel."""
+    harness = _harness_module()
+    hi = _harness_inputs_module()
+    dec = hi.decode_inputs()
+    hi.validate_decode_inputs(dec)
+    meta = torch.device("meta")
+    # (a) fp8 leg: every argument on the target in the real order, the
+    #     pinned unit scales, the output allocated there.
+    args, kwargs, out = harness._vendor_attention_args(
+        "decode", dec, "fp8_pool", meta
+    )
+    assert len(args) == 9
+    for i in (0, 1, 2, 3, 4):
+        assert args[i].device == meta
+    assert args[1] is not dec["fp8_pool"]  # moved, not the CPU tensor
+    assert args[1].shape == dec["fp8_pool"].shape
+    assert args[1].dtype == dec["fp8_pool"].dtype
+    assert args[7] is out and out.device == meta
+    assert args[8] == 1  # decode_query_len, as the fixture pins
+    _, kw_cpu, _ = harness._vendor_attention_args(
+        "decode", dec, "fp8_pool", "cpu"
+    )
+    assert kw_cpu["k_scale"].item() == 1.0
+    assert kw_cpu["v_scale"].item() == 1.0
+    # (b) bf16 leg: NO scales (the real impl passes none for an
+    #     unquantized cache).
+    _, kwargs, _ = harness._vendor_attention_args(
+        "decode", dec, "bf16_pool", meta
+    )
+    assert kwargs == {"k_scale": None, "v_scale": None}
+    # (c) the val7 blocked pool is refused naming the vendor layout.
+    blocked = dec["fp8_pool"].reshape(
+        hi.NUM_PAGES, 2 * hi.NKV, hi.BLOCK, 128
+    )
+    with pytest.raises(ValueError, match="sparse_attn.py:24-27"):
+        harness._vendor_attention_args(
+            "decode", {**dec, "fp8_pool": blocked}, "fp8_pool", meta
+        )
+    # (d) the q4 container is tied to the overlay-only 'pool' key: it
+    #     can never be handed to the original kernel as an fp8/bf16 leg.
+    with pytest.raises(ValueError, match="pool_key='fp8_pool'"):
+        harness._vendor_attention_args(
+            "decode", {**dec, "fp8_pool": dec["pool"]}, "fp8_pool", meta
+        )
+    with pytest.raises(ValueError):
+        harness._vendor_attention_args("nonsense", dec, "fp8_pool", meta)
+
+
+def test_units_gate_against_the_vendor_kernel_as_ground_truth():
+    """Source pins: units 2 and 5 must invoke the ORIGINAL kernels only
+    through the ONE builder ('fp8_pool'/'bf16_pool'), the overlay
+    wrapper only with the q4 pool ('pool'), the bf16 pool must be the
+    ground truth with the three cosine gates (q4/fp8/oracle vs
+    vendor-bf16) plus the loud ORACLE-DRIFT verdict, and the dry run
+    must audit the builder's structure."""
+    root = Path(__file__).resolve().parents[1]
+    harness = (root / "tools" / "gb10_q4kv_parity.py").read_text()
+
+    def body(marker: str, stop: str) -> str:
+        return harness[harness.index(marker):harness.index(stop)]
+
+    unit_2 = body("def unit_2", "def unit_3")
+    # The fp8 baseline and the bf16 ground truth are the REAL vendor
+    # kernel, invoked through the ONE builder -- never a hand-built call.
+    assert '_run_vendor(original_decode, "decode", inp, "bf16_pool"' in unit_2
+    assert '_run_vendor(original_decode, "decode", inp, "fp8_pool"' in unit_2
+    assert "minimax_m3_sparse_attn_decode(" not in unit_2  # no direct call
+    for needle in (
+        "cos_r2_truth >= 0.99",
+        "cos_fp8_truth >= 0.999",
+        "cos_oracle_truth >= 0.999",
+        "oracle_drift",
+        "ORACLE DRIFT",
+    ):
+        assert needle in unit_2, f"unit_2 missing gate {needle}"
+
+    unit_5 = body("def unit_5", "def _short_error")
+    # Ground truth: the original prefill kernel on the unquantized bf16
+    # pool; the fp8 leg is the same kernel on the real e4m3 pool; the
+    # overlay wrapper is invoked only with the q4 pool.
+    assert '_run_vendor(original, "prefill", inp, "bf16_pool"' in unit_5
+    assert '_run_vendor(original, "prefill", inp, "fp8_pool"' in unit_5
+    assert '_run_vendor(overlay, "prefill", inp, "pool"' in unit_5
+    assert '_run_vendor(original, "prefill", inp, "pool"' not in unit_5
+    for needle in (
+        "cos_q4_truth >= 0.99",
+        "cos_fp8_truth >= 0.999",
+        "cos_oracle_truth >= 0.999",
+        "oracle_drift",
+        "ORACLE DRIFT",
+        "capped_equals_uncapped",
+    ):
+        assert needle in unit_5, f"unit_5 missing gate {needle}"
+
+    # The ONE builder cites the real impl call site and the vendor layout.
+    builder = body("def _vendor_pool_gate", "def unit_2")
+    for needle in (
+        "sparse_attention.py:447-521",
+        "sparse_attn.py:24-27",
+        "fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu:890",
+        "v1/kv_cache_interface.py:557",
+    ):
+        assert needle in harness, f"missing citation {needle}"
+    assert "_VENDOR_POOL_KEYS = (\"fp8_pool\", \"bf16_pool\", \"pool\")" in (
+        harness
+    )
+    # The dry run audits the builder's structure as its own unit.
+    dry = body("def cpu_dry_run", "\ndef _frontend_check_unit")
+    assert '("dry/6-vendor-invocation-structure"' in dry

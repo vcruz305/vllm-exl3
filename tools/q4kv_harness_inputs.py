@@ -265,9 +265,20 @@ def decode_inputs() -> dict:
                 v_vals[page, head], 1
             )
     pool = pool.reshape(NUM_PAGES, 2 * NKV, BLOCK, 72)
-    fp8_pool = (
-        torch.cat([k_vals, v_vals], dim=1).to(torch.float8_e4m3fn)
-    )
+    # The fp8/bf16 pools are in the VENDOR layout the ORIGINAL kernels
+    # read and the W1 op writes: [pages, num_kv_heads, 128, 2*head_dim]
+    # with [K | V] in every token row (common/ops/sparse_attn.py:24-27
+    # and the V load at :206-215; csrc
+    # fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu:890; the
+    # allocator's per-token row is (head_size + head_size_v) wide,
+    # v1/kv_cache_interface.py:557). The GB10 val7 harness handed the
+    # original kernel a K/V-BLOCKED pool ([pages, 2*num_kv_heads, 128,
+    # 128]) instead and the fp8 leg came back uncorrelated (cos 0.0022):
+    # the kernel's V pointer landed one token row over, inside the K
+    # data. bf16_pool is the same K/V with NO quantization -- the ground
+    # truth the vendor kernel itself computes.
+    fp8_pool = torch.cat([k_vals, v_vals], dim=-1).to(torch.float8_e4m3fn)
+    bf16_pool = torch.cat([k_vals, v_vals], dim=-1).to(torch.bfloat16)
     block_table = (
         torch.arange(NUM_PAGES, dtype=torch.int64)
         .repeat(NUM_REQS, 1)
@@ -280,9 +291,67 @@ def decode_inputs() -> dict:
     seq_lens = torch.full((NUM_REQS,), TOPK * BLOCK, dtype=torch.int64)
     return dict(
         q=q, k_vals=k_vals, v_vals=v_vals, pool=pool, fp8_pool=fp8_pool,
-        block_table=block_table, topk=topk, seq_lens=seq_lens,
-        sm_scale=sm_scale,
+        bf16_pool=bf16_pool, block_table=block_table, topk=topk,
+        seq_lens=seq_lens, sm_scale=sm_scale,
     )
+
+
+def _validate_vendor_kv_pools(inp: dict, pages: int, errors: list) -> None:
+    """Fail closed unless the fp8/bf16 pools are the vendor-layout
+    encodings of the fixture's own k_vals/v_vals.
+
+    The ORIGINAL kernels read -- and the W1 op writes -- the pool as
+    [pages, num_kv_heads, 128, 2*head_dim] with [K | V] in every token
+    row (common/ops/sparse_attn.py:24-27 and the V load at :206-215;
+    csrc fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu:890; the
+    allocator's per-token row is (head_size + head_size_v) wide,
+    v1/kv_cache_interface.py:557). The GB10 val7 harness built a
+    K/V-BLOCKED pool instead ([pages, 2*num_kv_heads, 128, 128]) and the
+    fp8 leg came back uncorrelated (cos 0.0022): the kernel's V pointer
+    landed one token row over, inside the K data. Any other geometry --
+    including that one -- must fail closed here.
+    """
+    vendor_shape = (pages, NKV, BLOCK, 256)
+    fp8_pool = inp.get("fp8_pool")
+    if (
+        not isinstance(fp8_pool, torch.Tensor)
+        or fp8_pool.shape != vendor_shape
+        or fp8_pool.dtype != torch.float8_e4m3fn
+    ):
+        errors.append(
+            "fp8 baseline pool must be the VENDOR-layout e4m3 encoding of "
+            f"the same K/V: [{pages}, {NKV}, {BLOCK}, 256] with [K | V] in "
+            f"every token row, got {tuple(fp8_pool.shape) if isinstance(fp8_pool, torch.Tensor) else fp8_pool} "
+            f"{fp8_pool.dtype if isinstance(fp8_pool, torch.Tensor) else type(fp8_pool).__name__}"
+        )
+    elif not (
+        torch.equal(
+            fp8_pool.view(torch.uint8)[..., :128],
+            inp["k_vals"].to(torch.float8_e4m3fn).view(torch.uint8),
+        )
+        and torch.equal(
+            fp8_pool.view(torch.uint8)[..., 128:],
+            inp["v_vals"].to(torch.float8_e4m3fn).view(torch.uint8),
+        )
+    ):
+        errors.append("fp8 pool halves must be the e4m3 encodings of k_vals/v_vals")
+    bf16_pool = inp.get("bf16_pool")
+    if (
+        not isinstance(bf16_pool, torch.Tensor)
+        or bf16_pool.shape != vendor_shape
+        or bf16_pool.dtype != torch.bfloat16
+    ):
+        errors.append(
+            "bf16 ground-truth pool must be the same K/V unquantized in "
+            f"the vendor layout [{pages}, {NKV}, {BLOCK}, 256] bfloat16"
+        )
+    elif not (
+        torch.equal(bf16_pool[..., :128], inp["k_vals"].to(torch.bfloat16))
+        and torch.equal(bf16_pool[..., 128:], inp["v_vals"].to(torch.bfloat16))
+    ):
+        errors.append(
+            "bf16 pool halves must be k_vals/v_vals unquantized"
+        )
 
 
 def validate_decode_inputs(inp: dict) -> None:
@@ -307,15 +376,7 @@ def validate_decode_inputs(inp: dict) -> None:
         pool.stride(2) != 72 or pool.stride(1) != 9216 or pool.stride(3) != 1
     ):
         errors.append("pool slot regions must be contiguous")
-    fp8_pool = inp["fp8_pool"]
-    if fp8_pool.shape != (NUM_PAGES, 2 * NKV, BLOCK, 128) or (
-        fp8_pool.dtype != torch.float8_e4m3fn
-    ):
-        errors.append(
-            f"fp8 baseline pool must be [{NUM_PAGES}, {2 * NKV}, {BLOCK}, "
-            f"128] float8_e4m3fn, got {tuple(fp8_pool.shape)} "
-            f"{fp8_pool.dtype}"
-        )
+    _validate_vendor_kv_pools(inp, NUM_PAGES, errors)
     bt = inp["block_table"]
     max_blocks = bt.shape[1] if bt.dim() == 2 else -1
     if bt.dim() != 2 or bt.shape[0] != NUM_REQS or not _integral(bt):
@@ -458,7 +519,11 @@ def prefill_inputs() -> dict:
                 v_vals[page, head], 1
             )
     pool = flat.reshape(pages, 2 * nkv, BLOCK, 72)
-    fp8_pool = torch.cat((k_vals, v_vals), dim=1).to(torch.float8_e4m3fn)
+    # fp8_pool is the real e4m3 encoding of the SAME post-W1 K/V in the
+    # VENDOR layout (see decode_inputs); bf16_pool is the same K/V with no
+    # quantization -- the vendor kernel's own ground truth.
+    fp8_pool = torch.cat((k_vals, v_vals), dim=-1).to(torch.float8_e4m3fn)
+    bf16_pool = torch.cat((k_vals, v_vals), dim=-1).to(torch.bfloat16)
     # --- block tables: shared physical prefix + distinct page spans ---
     shared = [0, 1]
     rows = []
@@ -511,10 +576,11 @@ def prefill_inputs() -> dict:
     prefix_lens = torch.tensor(PREFILL_PREFIX, dtype=torch.int32)
     sm_scale = 1.0 / math.sqrt(128.0)
     return dict(
-        q=q, pool=pool, fp8_pool=fp8_pool, index_cache=index_cache,
-        k_vals=k_vals, v_vals=v_vals, block_table=block_table, topk=topk,
-        cu_seqlens_q=cu, seq_lens=seq_lens, prefix_lens=prefix_lens,
-        sm_scale=sm_scale, max_query_len=max(PREFILL_QLENS),
+        q=q, pool=pool, fp8_pool=fp8_pool, bf16_pool=bf16_pool,
+        index_cache=index_cache, k_vals=k_vals, v_vals=v_vals,
+        block_table=block_table, topk=topk, cu_seqlens_q=cu,
+        seq_lens=seq_lens, prefix_lens=prefix_lens, sm_scale=sm_scale,
+        max_query_len=max(PREFILL_QLENS),
     )
 
 
@@ -559,15 +625,7 @@ def validate_prefill_inputs(inp: dict) -> None:
         pool.stride(2) != 72 or pool.stride(1) != 9216 or pool.stride(3) != 1
     ):
         errors.append("pool slot regions must be contiguous")
-    fp8_pool = inp["fp8_pool"]
-    if fp8_pool.shape != (
-        PREFILL_NUM_PAGES, 2 * NKV, BLOCK, 128
-    ) or fp8_pool.dtype != torch.float8_e4m3fn:
-        errors.append(
-            "fp8 baseline pool must be the real e4m3 encoding of the same "
-            f"K/V: [{PREFILL_NUM_PAGES}, {2 * NKV}, {BLOCK}, 128] "
-            f"float8_e4m3fn, got {tuple(fp8_pool.shape)} {fp8_pool.dtype}"
-        )
+    _validate_vendor_kv_pools(inp, PREFILL_NUM_PAGES, errors)
     ic = inp["index_cache"]
     if ic.shape != (PREFILL_NUM_PAGES * BLOCK, 128) or (
         ic.dtype != torch.float8_e4m3fn

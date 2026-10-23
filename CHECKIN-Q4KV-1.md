@@ -777,3 +777,131 @@ original Triton prefill kernel on real pages), the real allocator's
 pool geometry at the prefill boundary, and the end-to-end serve
 progression past warm-up; the prefill tok/s number above is a
 bandwidth model, not a measurement.
+
+## Post-val7 fix: verdict A — harness bug; the vendor kernel is now the ground truth (this commit)
+
+GB10 val7 result: units 0-4 PASS as before, but case 5/prefill-staging
+FAILed with cos(q4 prefill, fp8 ORIGINAL kernel)=0.002229 (uncorrelated,
+finite) while cos(q4 prefill, fp32 oracle)=0.995208 and
+capped==uncapped stayed bit-identical.
+
+**Verdict A: the harness's fp8-original invocation was wrong; the
+overlay, the staging path and the oracle were right.** The harness had
+built the fp8 pool K/V-BLOCKED — `[pages, 2*num_kv_heads, 128, 128]`
+(one head-slot per side) — while every ORIGINAL kernel reads the vendor
+layout `[pages, num_kv_heads, 128, 2*head_dim]` with **[K | V] in every
+token row**:
+
+- `common/ops/sparse_attn.py:24-27` documents the layout
+  (`(num_blocks, num_kv_heads, 128, 2*head_dim)`; `K=[..., :head_dim]`,
+  `V=[..., head_dim:]`); the K load at `:161-169` uses `off_d` while
+  the V load at `:206-215` uses `head_dim + off_d` — the same row.
+- The writer csrc `fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu:890`
+  writes exactly that logical shape for the fp8/auto branch; only the
+  nvfp4 branch (`:881-882`) is slot-per-side — the harness author
+  conflated the two.
+- The allocator's per-token pool row is `(head_size + head_size_v)`
+  bytes wide (`v1/kv_cache_interface.py:557`).
+- The overlay itself already knew this: its staging buffer is
+  `[pages, num_kv_heads, 128, 256]` bf16 (minimax_q4kv.py
+  `_staging_buffer`), which is why the staged path matched the oracle.
+
+With the blocked pool, the kernel's "V" pointer (`head_dim + off_d` into
+a 128-wide row) landed one token row over, inside the K data — the
+output was finite but uncorrelated: cos 0.002. The q4 pool
+(slot-per-side by design) was never affected, and the fp32 oracle was
+never affected; serving was never at risk from this bug (it is a
+harness-only input).
+
+**Fixes:**
+
+1. `tools/q4kv_harness_inputs.py`: both fixtures now build the fp8 pool
+   in the VENDOR layout (`cat(k, v, dim=-1)` -> `[pages, H, 128, 256]`)
+   plus an UNQUANTIZED bf16 pool of the same K/V (the ground truth), and
+   `_validate_vendor_kv_pools` fail-closes unless each pool is exactly
+   the vendor-layout encoding of the fixture's own K/V halves — the
+   val7 blocked geometry is refused by name.
+2. `tools/gb10_q4kv_parity.py`: ONE vendor-invocation builder
+   (`_vendor_attention_args` + `_run_vendor`) mirrors the real impl
+   call site `common/sparse_attention.py:447-521`
+   (MiniMaxM3SparseTritonImpl.forward): the per-kv-head topk form, the
+   q view, the decode call (`:486-499`) and the prefill call
+   (`:502-521`, `context_lens` as `prefix_lens`), and the pinned unit
+   k/v scales passed ONLY for a quantized cache (`:463-465`; the
+   production values are 1.0 per `set_default_quant_scales`). The
+   builder is used by the fp8 baseline, the bf16 ground truth AND the
+   overlay wrapper (which shares the vendor signature), and its pool
+   gate ties each geometry to its leg key so the q4 container can never
+   reach the original kernel.
+3. **Case 5** now gates against the vendor kernel as ground truth: the
+   ORIGINAL prefill kernel runs on the unquantized bf16 pool (same K/V)
+   and on the real e4m3 pool, both through the ONE builder. Gates:
+   cos(q4 staged, vendor-bf16) >= 0.99; cos(fp8-original,
+   vendor-bf16) >= 0.999; cos(fp32 oracle, vendor-bf16) >= 0.999 —
+   the oracle must agree with the vendor or the case FAILs loudly as
+   "ORACLE DRIFT"; capped==uncapped bit-identical; finite outputs.
+4. **Case 2** (decode) audited the same way: its fp8 baseline is no
+   longer a pure-torch emulation — it is the ORIGINAL vendor decode
+   kernel (split-K + the unchanged vLLM merge) invoked through the same
+   ONE builder on the vendor-layout fp8 pool, and a vendor-bf16 decode
+   truth leg was added. Gates: cos(R2, vendor-bf16) >= 0.99,
+   cos(vendor-fp8, vendor-bf16) >= 0.999, cos(oracle, vendor-bf16)
+   >= 0.999 (oracle drift), finite. The R2 launch path itself is
+   unchanged (units 2/4 still reach R2 only through the static-bundle
+   rules).
+5. `--cpu-dry-run`: the vendor legs are GPU-only; the new unit
+   `dry/6-vendor-invocation-structure` audits the builder's structure on
+   the meta device — every argument moved with the one bundle mover,
+   shapes/dtypes preserved, the real positional order, the output
+   allocated on the target, the pinned unit scales only for the fp8
+   pool, the val7 blocked pool refused by builder AND validator, and
+   the q4-container/key mismatch refused. The reference paths were
+   re-pointed at the vendor layout and their numerics are UNCHANGED
+   (cos(fp8 baseline, oracle) = 0.999628 decode / 0.999656 prefill;
+   cos(q4 staged prefill, oracle) = 0.995209), which independently
+   confirms verdict A: only the vendor invocation, not the values, was
+   wrong. CPU dry run: 9/9 units PASS.
+
+**Tests:** 3 new (61/61 green in tests/test_minimax_q4kv.py): the
+fixtures build vendor-layout fp8 + unquantized bf16 pools whose halves
+are exactly the encodings of the fixture's own K/V, and the val7
+blocked geometry fails closed in both validators; the ONE builder
+behaves as the mirrored call site on the meta device (moved arguments,
+real order, pinned fp8 scales, no scales for bf16/q4, blocked pool and
+pool/key mismatches refused); source pins that units 2/5 invoke the
+original kernels only through the builder, the overlay wrapper only
+with the q4 pool, all three vendor-bf16 gates plus the ORACLE-DRIFT
+verdict are present, the citations are in the source, and the dry run
+registers the structure audit. Full suite: **632 passed, 39 skipped,
+the same 8 pre-existing failures** (tests/test_compact_safetensors*.py,
+tests/test_compact_source_verification_window.py) — failure set
+identical to the baseline.
+
+**Exact GB10 command (parent executes; the worktree is mounted
+read-only, the toolchain lives in the image, and the receipt must be
+written to the mounted receipts volume):**
+
+```
+docker run <minimax-m3.1-flash vllm image, vLLM 0.1.dev23341+g8744dd2fb> \
+  -v <this worktree>:/plugin:ro -v <receipts dir>:/receipts \
+  -w /plugin -e PYTHONPATH=/plugin/src \
+  python3 tools/gb10_q4kv_parity.py --json /receipts/val8/q4kv.json
+```
+
+Unit 5 must now report cos(q4 staged, vendor-bf16) >= 0.99,
+cos(fp8-original, vendor-bf16) >= 0.999 and
+cos(oracle, vendor-bf16) >= 0.999 with oracle_drift=true; unit 2 must
+report cos(R2, vendor-bf16) >= 0.99, cos(vendor-fp8, vendor-bf16)
+>= 0.999 and oracle_drift=true; units 0/1/3/4 must keep their val7
+numerics.
+
+Unverified on this VPS (no GPU, no triton, no vLLM install): every GPU
+numerics claim above — in particular the actual cosines of the three
+vendor legs (the fp8-vs-bf16 and oracle-vs-bf16 gates are calibrated
+from the CPU reference measurements 0.9996/0.9952 and could still fail
+on hardware for a real, unspecified reason), the sm_121 execution of
+the ORIGINAL prefill kernel on a bf16 pool outside the overlay's
+staging path (the overlay's staged bf16 invocation is the same code
+path and ran in val7, but the direct bf16-pool leg has never executed),
+the vendor decode kernel's behavior on a bf16 pool (never executed
+anywhere), and the end-to-end serve.

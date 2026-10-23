@@ -46,9 +46,16 @@ Units:
       place; the Q, V and index_q rows must be bit-identical to the
       input (nothing downstream consumes an in-place Q on the q4 path —
       the sparse layer reads its query from the dedicated q_out buffer).
-  2.  R2 decode accuracy: on real-shaped random data, the q4 decode
-      attention output has cosine >= 0.99 against the fp8 baseline AND
-      against the fp32 oracle, with no NaN/Inf.
+  2.  R2 decode accuracy, with the VENDOR kernel as ground truth: on
+      real-shaped random data, the original vendor decode kernel runs on
+      (a) the real e4m3 fp8 pool (the production baseline) and (b) an
+      UNQUANTIZED bf16 pool built from the same K/V (the ground truth),
+      both invoked through the ONE mirrored-argument builder. Gates:
+      cos(R2, vendor-bf16) >= 0.99 (the q4 quantization floor),
+      cos(vendor-fp8, vendor-bf16) >= 0.999 (the invocation itself is
+      sound -- the GB10 val7 prefill failure was exactly this class),
+      cos(fp32 oracle, vendor-bf16) >= 0.999 (oracle drift fails
+      loudly), no NaN/Inf.
   3.  Pool bytes: the allocated pool is 73728 B/page and 576
       B/token/layer for 4 KV heads (spec arithmetic).
   4.  CUDA-graph capture of R2 under the static-buffer rules: every
@@ -61,14 +68,19 @@ Units:
       table, real e4m3 fp8 index cache, real per-(kv-head, query) top-k
       with sentinels). The overlay's prefill path on the q4 pool under a
       2 MiB page cap must be bit-identical to the same path under the
-      default cap (the capped slice plan equals the uncapped staging),
-      and must stay within 0.99 cosine of the ORIGINAL prefill kernel
-      on the real e4m3 fp8 pool built from the same K/V and of the fp32
-      prefill oracle, with finite outputs. --cpu-dry-run runs every
-      reference part of the case (the capped==uncapped equality proof at
-      the attention level, the slice-plan coverage checks, and a
-      meta-device audit of the prefill bundle and the staging
-      primitives).
+      default cap (the capped slice plan equals the uncapped staging).
+      Ground truth is the ORIGINAL prefill kernel: it runs on (a) the
+      real e4m3 fp8 pool built from the same K/V and (b) an UNQUANTIZED
+      bf16 pool built from the same K/V, both through the ONE
+      mirrored-argument builder. Gates: cos(q4 staged, vendor-bf16)
+      >= 0.99, cos(fp8-original, vendor-bf16) >= 0.999, cos(fp32
+      oracle, vendor-bf16) >= 0.999 (oracle drift fails loudly),
+      finite outputs. --cpu-dry-run runs every reference part of the
+      case (the capped==uncapped equality proof at the attention level,
+      the slice-plan coverage checks, a meta-device audit of the
+      staging primitives, and a structure audit of the ONE
+      vendor-invocation builder -- the vendor legs themselves are
+      GPU-only).
 
 Every unit builds its inputs from tools/q4kv_harness_inputs.py and runs
 that module's input-consistency validator BEFORE any kernel or reference
@@ -156,16 +168,12 @@ def _iter_tensors(bundle, prefix=""):
 # Exactly the tensors each Triton kernel (plus, for R2, the unchanged
 # vLLM merge kernel) receives, by harness bundle key. Everything else
 # in a case bundle is a reference-path input and stays on the CPU
-# bundle, where the pure-torch oracles consume it.
+# bundle, where the pure-torch oracles consume them.
 _W1_KERNEL_KEYS = (
     "qkv", "norm_ws", "cos_sin", "positions", "slot_mapping",
     "index_slot_mapping", "pool", "index_cache", "q_out", "index_q_out",
 )
 _R2_KERNEL_KEYS = ("q", "pool", "topk", "block_table", "seq_lens")
-_PREFILL_KERNEL_KEYS = (
-    "q", "pool", "topk", "block_table", "cu_seqlens_q", "seq_lens",
-    "prefix_lens", "fp8_pool",
-)
 
 
 def _kernel_bundle(inp: dict, keys, device) -> dict:
@@ -417,10 +425,12 @@ def _fp8_baseline(fp8_pool, block_table, topk, q, sm_scale):
                 f"{t.device}"
             )
     total_q = q.shape[0]
-    values = fp8_pool.view(NUM_PAGES, 2 * NKV, BLOCK, 128).to(torch.float32)
-    # The fp8 pool is blocked [K | V], NOT interleaved like the q4 slots.
-    k_pages = values[:, :NKV].contiguous()
-    v_pages = values[:, NKV:].contiguous()
+    # The VENDOR pool layout keeps [K | V] in every token row
+    # (sparse_attn.py:24-27): K = [..., :128], V = [..., 128:]. The val7
+    # harness misread this pool as K/V-blocked head slots.
+    values = fp8_pool.view(NUM_PAGES, NKV, BLOCK, 256).to(torch.float32)
+    k_pages = values[..., :128].contiguous()
+    v_pages = values[..., 128:].contiguous()
     # seq_lens = TOPK*BLOCK in R2, so the causal past ends at
     # TOPK*BLOCK - 1 for baseline and oracle alike.
     query_pos = torch.full((total_q,), TOPK * BLOCK - 1)
@@ -474,15 +484,177 @@ def _run_r2_bundle(gpu: dict) -> torch.Tensor:
     return gpu["output"].cpu()
 
 
+# ---------------------------------------------------------------------------
+# ONE vendor-invocation builder (the GB10 val7 lesson)
+# ---------------------------------------------------------------------------
+# val7 measured cos(q4 staged prefill, fp8 ORIGINAL kernel) = 0.0022 while
+# the staged path matched the fp32 oracle at 0.9952 and capped==uncapped
+# was bit-identical: the HARNESS, not the overlay or the oracle, was
+# wrong (verdict A). It had built the fp8 pool K/V-BLOCKED
+# ([pages, 2*num_kv_heads, 128, 128]), while every ORIGINAL kernel reads
+# the vendor layout [pages, num_kv_heads, 128, 2*head_dim] with [K | V]
+# in every token row -- so the kernel's "V" pointer landed one token row
+# over, inside the K data:
+#   - sparse_attn.py:24-27 (the layout comment) and the K load at :161-169
+#     vs the V load at :206-215 (offset head_dim + off_d);
+#   - the writer csrc fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu:890
+#     ("kv_cache logical shape [num_blocks, nkv, block_size,
+#     2*head_dim]"; only the nvfp4 branch at :881-882 is slot-per-side);
+#   - the allocator's per-token row is (head_size + head_size_v) wide,
+#     v1/kv_cache_interface.py:557.
+#
+# Every invocation of a vendor kernel in this harness -- the fp8 baseline,
+# the bf16 ground truth and the overlay wrapper (which shares the vendor
+# signature) -- therefore goes through ONE argument builder that mirrors
+# the REAL impl call site,
+# vllm/models/minimax_m3/common/sparse_attention.py:447-521
+# (MiniMaxM3SparseTritonImpl.forward):
+#   :458-462  q viewed [-1, num_heads, head_dim];
+#   :463-465  topk = topk_buffer[:num_tokens].transpose(0, 1), i.e. the
+#             per-kv-head form [num_kv_heads, total_q, topk]; k/v scales
+#             are passed ONLY for a quantized (fp8) cache, and the
+#             production values are pinned to 1.0 by
+#             set_default_quant_scales (nvidia/model.py:1078-79);
+#   :486-499  the decode call (block_table, seq_lens, decode_query_len);
+#   :502-521  the prefill call (cu_seqlens_q, seq_lens, context_lens as
+#             prefix_lens, max_query_len).
+# The builder refuses any pool outside the three geometries the wrappers
+# accept -- vendor-layout fp8, vendor-layout bf16, or the q4 container
+# for the overlay -- so the val7 layout bug can never recur, and it
+# ties the pool to its invocation key so the q4 container can never
+# reach the original kernel.
+
+_VENDOR_POOL_KEYS = ("fp8_pool", "bf16_pool", "pool")
+_VENDOR_ARG_KEYS = {
+    # Every tensor slot a vendor (or overlay) wrapper receives, by
+    # bundle key; the "pool" slot is filled from the pool_key argument
+    # after the geometry gate.
+    "prefill": ("q", "pool", "topk", "block_table", "cu_seqlens_q",
+                "seq_lens", "prefix_lens"),
+    "decode": ("q", "pool", "topk", "block_table", "seq_lens"),
+}
+_FP8_POOL_DTYPES = (
+    torch.float8_e4m3fn, torch.float8_e4m3fnuz,
+    torch.float8_e5m2, torch.float8_e5m2fnuz,
+)
+
+
+def _vendor_pool_gate(pool, pool_key: str) -> str:
+    """Accept only a pool geometry the wrappers actually serve, tied to
+    the pool_key that names which leg of the case it belongs to."""
+    if pool_key not in _VENDOR_POOL_KEYS:
+        raise ValueError(f"unknown vendor pool key {pool_key!r}")
+    vendor_shape = tuple(pool.shape[1:]) == (NKV, BLOCK, 2 * 128)
+    if pool.dtype in _FP8_POOL_DTYPES:
+        if vendor_shape and pool_key == "fp8_pool":
+            return "vendor-fp8"
+    elif pool.dtype == torch.bfloat16:
+        if vendor_shape and pool_key == "bf16_pool":
+            return "vendor-bf16"
+    elif pool.dtype == torch.uint8:
+        if (
+            pool_key == "pool"
+            and tuple(pool.shape[1:]) == (2 * NKV, BLOCK, 72)
+        ):
+            return "q4-container"
+    raise ValueError(
+        "vendor invocation pool must be the vendor layout "
+        f"[pages, {NKV}, {BLOCK}, 256] fp8/bf16 (pool_key 'fp8_pool' / "
+        f"'bf16_pool') or the q4 container [pages, {2 * NKV}, {BLOCK}, "
+        "72] uint8 (pool_key 'pool') -- the ORIGINAL kernels keep [K | "
+        "V] in every token row (sparse_attn.py:24-27); "
+        f"pool_key={pool_key!r} got {tuple(pool.shape)} {pool.dtype}"
+    )
+
+
+def _vendor_attention_args(kind: str, inp: dict, pool_key: str, device):
+    """Build the COMPLETE vendor-invocation arguments (positional tuple,
+    scale kwargs, output buffer) for the fp8 baseline, the bf16 ground
+    truth and the overlay alike -- ONE builder, mirroring the real impl
+    call site cited above. Returns (args, kwargs, out)."""
+    if kind not in _VENDOR_ARG_KEYS:
+        raise ValueError(f"unknown vendor call kind {kind!r}")
+    pool_kind = _vendor_pool_gate(inp[pool_key], pool_key)
+    src = {
+        k: (inp[pool_key] if k == "pool" else inp[k])
+        for k in _VENDOR_ARG_KEYS[kind]
+    }
+    moved = _bundle_to_device(src, device)
+    assert isinstance(moved, dict)  # a dict in is a dict out
+
+    def _t(key: str) -> torch.Tensor:
+        v = moved[key]
+        assert isinstance(v, torch.Tensor), f"{key} is not a tensor"
+        return v
+
+    out = torch.zeros_like(_t("q"))
+    if kind == "prefill":
+        # sparse_attention.py:502-521: (q, kv_cache, topk, block_table,
+        # cu_seqlens_q, seq_lens, context_lens, max_query_len,
+        # num_kv_heads, scale, out, k_scale, v_scale).
+        args = (
+            _t("q"), _t("pool"), _t("topk"), _t("block_table"),
+            _t("cu_seqlens_q"), _t("seq_lens"), _t("prefix_lens"),
+            inp["max_query_len"], NKV, inp["sm_scale"], out,
+        )
+    else:
+        # sparse_attention.py:486-499: (q, kv_cache, topk, block_table,
+        # seq_lens, num_kv_heads, scale, out, decode_query_len, k_scale,
+        # v_scale). decode_query_len is 1 in this harness (one query
+        # token per request, as the fixture pins).
+        args = (
+            _t("q"), _t("pool"), _t("topk"), _t("block_table"),
+            _t("seq_lens"), NKV, inp["sm_scale"], out, 1,
+        )
+    if pool_kind == "vendor-fp8":
+        # The real impl passes layer._k_scale/_v_scale for a quantized
+        # cache; set_default_quant_scales pins them to 1.0, so the
+        # production scale path is the unit scalar exercised here.
+        kwargs = {
+            "k_scale": torch.ones((), device=device),
+            "v_scale": torch.ones((), device=device),
+        }
+    else:
+        # :463-465: no scales for an unquantized (bf16) cache; the
+        # overlay's wrappers additionally fail closed on non-unit scales.
+        kwargs = {"k_scale": None, "v_scale": None}
+    return args, kwargs, out
+
+
+def _run_vendor(wrapper, kind: str, inp: dict, pool_key: str, device):
+    """Invoke ``wrapper`` -- the ORIGINAL vendor kernel wrapper, or the
+    overlay wrapper (which shares the vendor signature and routes a q4
+    pool to the staged/R2 path) -- with arguments from the ONE builder,
+    and return the raw output buffer on CPU."""
+    args, kwargs, out = _vendor_attention_args(kind, inp, pool_key, device)
+    wrapper(*args, **kwargs)
+    torch.cuda.synchronize()
+    return out.cpu()
+
+
 def unit_2() -> dict:
-    """R2 decode cosine >= 0.99 vs fp8 baseline and fp32 oracle."""
+    """R2 decode accuracy, with the VENDOR kernel as ground truth.
+
+    The fp8 baseline is the ORIGINAL vendor decode kernel invoked through
+    the ONE mirrored-argument builder (no pure-torch emulation), and the
+    ground truth is the same kernel on an UNQUANTIZED bf16 pool built
+    from the same K/V. Gates: cos(R2, vendor-bf16) >= 0.99 (the q4
+    quantization floor -- a shared-assumption error in the fixture's
+    conventions collapses this cosine), cos(vendor-fp8, vendor-bf16)
+    >= 0.999 (the invocation itself is sound; the val7 prefill failure
+    was exactly this class), cos(fp32 oracle, vendor-bf16) >= 0.999
+    (oracle drift fails loudly), no NaN/Inf.
+    """
     inp = _decode_fixture()
     gpu = _r2_static_bundle(inp, "cuda")
-    out = _run_r2_bundle(gpu)
-    base = _fp8_baseline(
-        inp["fp8_pool"], inp["block_table"], inp["topk"], inp["q"],
-        inp["sm_scale"],
+    out_r2 = _run_r2_bundle(gpu)
+    del gpu
+    from vllm.models.minimax_m3.common.ops.sparse_attn import (
+        minimax_m3_sparse_attn_decode as original_decode,
     )
+
+    out_truth = _run_vendor(original_decode, "decode", inp, "bf16_pool", "cuda")
+    out_fp8 = _run_vendor(original_decode, "decode", inp, "fp8_pool", "cuda")
     oracle = ref.reference_sparse_attention(
         inp["q"].to(torch.float32),
         inp["k_vals"].contiguous(),
@@ -491,18 +663,35 @@ def unit_2() -> dict:
         torch.full((inp["q"].shape[0],), TOPK * BLOCK - 1),
         inp["sm_scale"],
     )
-    cos_base = _cos(out, base)
-    cos_oracle = _cos(out, oracle)
-    finite = bool(torch.isfinite(out).all())
-    passed = finite and cos_base >= 0.99 and cos_oracle >= 0.99
+    cos_r2_truth = _cos(out_r2, out_truth)
+    cos_fp8_truth = _cos(out_fp8, out_truth)
+    cos_oracle_truth = _cos(oracle, out_truth)
+    cos_r2_oracle = _cos(out_r2, oracle)
+    finite = bool(
+        torch.isfinite(out_r2).all()
+        and torch.isfinite(out_truth).all()
+        and torch.isfinite(out_fp8).all()
+    )
+    oracle_drift = cos_oracle_truth >= 0.999
+    passed = (
+        finite and oracle_drift
+        and cos_r2_truth >= 0.99 and cos_fp8_truth >= 0.999
+    )
     return {
         "passed": passed,
-        "cos_vs_fp8_baseline": cos_base,
-        "cos_vs_fp32_oracle": cos_oracle,
+        "cos_r2_vs_vendor_bf16_truth": cos_r2_truth,
+        "cos_vendor_fp8_vs_vendor_bf16_truth": cos_fp8_truth,
+        "cos_oracle_vs_vendor_bf16_truth": cos_oracle_truth,
+        "oracle_drift": oracle_drift,
+        "cos_r2_vs_fp32_oracle": cos_r2_oracle,
         "output_finite": finite,
         "summary": (
-            f"cos(R2, fp8 baseline)={cos_base:.6f} "
-            f"cos(R2, fp32 oracle)={cos_oracle:.6f} finite={finite}"
+            f"cos(R2, vendor-bf16)={cos_r2_truth:.6f}; "
+            f"cos(vendor-fp8, vendor-bf16)={cos_fp8_truth:.6f}; "
+            f"cos(oracle, vendor-bf16)={cos_oracle_truth:.6f}; "
+            + ("ORACLE DRIFT: the fp32 oracle disagrees with the vendor "
+               "kernel; " if not oracle_drift else "")
+            + f"finite={finite}"
         ),
     }
 
@@ -588,12 +777,17 @@ def unit_4() -> dict:
 # ---------------------------------------------------------------------------
 
 def _prefill_reference_outputs(inp: dict) -> tuple[torch.Tensor, torch.Tensor]:
-    """(fp8-baseline, fp32-oracle) prefill outputs, CPU-only reference."""
+    """(fp8-baseline, fp32-oracle) prefill outputs, CPU-only reference
+    (the --cpu-dry-run fixture-consistency check; the GB10 unit's fp8
+    leg is the real vendor kernel, not this emulation)."""
     fp8_vals = inp["fp8_pool"].view(
-        hi.PREFILL_NUM_PAGES, 2 * NKV, hi.BLOCK, 128
+        hi.PREFILL_NUM_PAGES, NKV, hi.BLOCK, 256
     ).to(torch.float32)
-    k8 = fp8_vals[:, :NKV].contiguous()
-    v8 = fp8_vals[:, NKV:].contiguous()
+    # The VENDOR pool layout keeps [K | V] in every token row
+    # (sparse_attn.py:24-27): K = [..., :128], V = [..., 128:]. The val7
+    # harness misread this pool as K/V-blocked head slots.
+    k8 = fp8_vals[..., :128].contiguous()
+    v8 = fp8_vals[..., 128:].contiguous()
     base = ref.reference_prefill_attention(
         inp["q"].to(torch.float32), k8, v8, inp["block_table"],
         inp["topk"], inp["cu_seqlens_q"], inp["seq_lens"],
@@ -607,80 +801,81 @@ def _prefill_reference_outputs(inp: dict) -> tuple[torch.Tensor, torch.Tensor]:
     return base, oracle
 
 
-def _run_overlay_prefill(inp: dict, original, device) -> torch.Tensor:
-    """The overlay's prefill wrapper on the q4 pool, on ``device``."""
-    from vllm_exl3 import minimax_q4kv as q4ov
-
-    gpu = _kernel_bundle(inp, _PREFILL_KERNEL_KEYS, device)
-    gpu["output"] = torch.zeros_like(gpu["q"])
-    wrapper = q4ov._make_prefill_wrapper(original)
-    wrapper(
-        gpu["q"], gpu["pool"], gpu["topk"], gpu["block_table"],
-        gpu["cu_seqlens_q"], gpu["seq_lens"], gpu["prefix_lens"],
-        inp["max_query_len"], NKV, inp["sm_scale"], gpu["output"],
-    )
-    torch.cuda.synchronize()
-    return gpu["output"].cpu()
-
-
 def unit_5() -> dict:
     """Prefill staging accuracy + memory bound (the boot18 crash path).
 
-    A realistic multi-sequence chunk over W1-derived pool bytes: the
+    A realistic multi-sequence chunk over W1-derived pool bytes. The
     overlay's prefill path on the q4 pool (page-capped slices under a
     2 MiB cap override, then the default cap) must (a) produce
-    bit-identical outputs capped and uncapped, (b) stay within 0.99
-    cosine of the ORIGINAL prefill kernel on the real e4m3 fp8 pool built
-    from the same K/V and of the fp32 oracle, and (c) be finite.
+    bit-identical outputs capped and uncapped. Ground truth is the
+    ORIGINAL prefill kernel, invoked through the ONE mirrored-argument
+    builder on (b) an UNQUANTIZED bf16 pool built from the same K/V and
+    (c) the real e4m3 fp8 pool built from the same K/V. Gates:
+    cos(q4 staged, vendor-bf16) >= 0.99, cos(fp8-original, vendor-bf16)
+    >= 0.999, cos(fp32 oracle, vendor-bf16) >= 0.999 (oracle drift fails
+    loudly), finite outputs.
     """
     inp = hi.prefill_inputs()
     hi.validate_prefill_inputs(inp)
-    base, oracle = _prefill_reference_outputs(inp)
-    assert torch.isfinite(base).all() and torch.isfinite(oracle).all()
-    cos_fixture = _cos(base, oracle)
     from vllm.models.minimax_m3.common.ops.sparse_attn import (
         minimax_m3_sparse_attn as original,
     )
+    from vllm_exl3 import minimax_q4kv as q4ov
 
-    # The real fp8 baseline: the original kernel on the real e4m3 pool.
-    gpu8 = _kernel_bundle(inp, _PREFILL_KERNEL_KEYS, "cuda")
-    gpu8["output"] = torch.zeros_like(gpu8["q"])
-    original(
-        gpu8["q"], gpu8["fp8_pool"], gpu8["topk"], gpu8["block_table"],
-        gpu8["cu_seqlens_q"], gpu8["seq_lens"], gpu8["prefix_lens"],
-        inp["max_query_len"], NKV, inp["sm_scale"], gpu8["output"],
-    )
-    torch.cuda.synchronize()
-    out_fp8 = gpu8["output"].cpu()
-    del gpu8
+    overlay = q4ov._make_prefill_wrapper(original)
+    # Ground truth: the ORIGINAL prefill kernel on the UNQUANTIZED bf16
+    # pool built from the same K/V -- exactly the code path the overlay's
+    # staging buffer feeds it, with no quantization noise at all.
+    out_truth = _run_vendor(original, "prefill", inp, "bf16_pool", "cuda")
+    # The production fp8 baseline: the ORIGINAL kernel on the real e4m3
+    # pool (the val7 leg whose blocked pool produced cos 0.0022).
+    out_fp8 = _run_vendor(original, "prefill", inp, "fp8_pool", "cuda")
     # (a) capped (2 MiB -> 8 pages) vs uncapped (default 48 MiB): the
     # sliced execution must equal the single-call staging bit-for-bit.
     import os
 
     os.environ["VLLM_EXL3_Q4KV_STAGING_MAX_MB"] = "2"
-    out_capped = _run_overlay_prefill(inp, original, "cuda")
+    out_capped = _run_vendor(overlay, "prefill", inp, "pool", "cuda")
     os.environ.pop("VLLM_EXL3_Q4KV_STAGING_MAX_MB", None)
-    out_uncapped = _run_overlay_prefill(inp, original, "cuda")
+    out_uncapped = _run_vendor(overlay, "prefill", inp, "pool", "cuda")
     bit_equal = bool(torch.equal(out_capped, out_uncapped))
     out = out_capped
-    cos_fp8 = _cos(out, out_fp8)
-    cos_oracle = _cos(out, oracle)
+    oracle = ref.reference_prefill_attention(
+        inp["q"].to(torch.float32), inp["k_vals"].contiguous(),
+        inp["v_vals"].contiguous(), inp["block_table"], inp["topk"],
+        inp["cu_seqlens_q"], inp["seq_lens"], inp["prefix_lens"],
+        inp["sm_scale"],
+    )
+    assert torch.isfinite(oracle).all()
+    cos_q4_truth = _cos(out, out_truth)
+    cos_fp8_truth = _cos(out_fp8, out_truth)
+    cos_oracle_truth = _cos(oracle, out_truth)
+    cos_q4_oracle = _cos(out, oracle)
+    cos_q4_fp8 = _cos(out, out_fp8)
     finite = bool(torch.isfinite(out).all())
+    oracle_drift = cos_oracle_truth >= 0.999
     passed = (
-        bit_equal and finite and cos_fp8 >= 0.99 and cos_oracle >= 0.99
-        and cos_fixture >= 0.99
+        bit_equal and finite and oracle_drift
+        and cos_q4_truth >= 0.99 and cos_fp8_truth >= 0.999
     )
     return {
         "passed": passed,
         "capped_equals_uncapped": bit_equal,
-        "cos_vs_fp8_original_kernel": cos_fp8,
-        "cos_vs_fp32_oracle": cos_oracle,
-        "cos_fp8_baseline_vs_oracle": cos_fixture,
+        "cos_q4_staged_vs_vendor_bf16_truth": cos_q4_truth,
+        "cos_fp8_original_vs_vendor_bf16_truth": cos_fp8_truth,
+        "cos_oracle_vs_vendor_bf16_truth": cos_oracle_truth,
+        "oracle_drift": oracle_drift,
+        "cos_q4_staged_vs_fp32_oracle": cos_q4_oracle,
+        "cos_q4_staged_vs_fp8_original": cos_q4_fp8,
         "output_finite": finite,
         "summary": (
             f"capped==uncapped bit-identical={bit_equal}; "
-            f"cos(q4 prefill, fp8 original)={cos_fp8:.6f}; "
-            f"cos(q4 prefill, fp32 oracle)={cos_oracle:.6f}; finite={finite}"
+            f"cos(q4 staged, vendor-bf16)={cos_q4_truth:.6f}; "
+            f"cos(fp8 original, vendor-bf16)={cos_fp8_truth:.6f}; "
+            f"cos(oracle, vendor-bf16)={cos_oracle_truth:.6f}; "
+            + ("ORACLE DRIFT: the fp32 oracle disagrees with the vendor "
+               "kernel; " if not oracle_drift else "")
+            + f"finite={finite}"
         ),
     }
 
@@ -1185,32 +1380,12 @@ def _dry_prefill() -> dict:
     cos_q4 = _cos(out_uncapped, oracle)
     if cos_q4 < 0.99:
         problems.append(f"cos(q4 staged prefill, fp32 oracle)={cos_q4:.6f}")
-    # (b) meta-device audit of the prefill bundle and the staging
-    # primitives: nothing serve-reachable may stay on (or silently move
-    # back to) the CPU when the pool is on the accelerator.
+    # (b) meta-device audit of the staging primitives: nothing
+    # serve-reachable may stay on (or silently move back to) the CPU
+    # when the pool is on the accelerator. (The vendor-invocation
+    # builder's own structure audit is dry/6.)
     device = torch.device("meta")
-    before = dict(
-        _iter_tensors({k: inp[k] for k in _PREFILL_KERNEL_KEYS})
-    )
-    moved = _kernel_bundle(inp, _PREFILL_KERNEL_KEYS, device)
-    after = dict(_iter_tensors(moved))
-    if set(before) != set(after):
-        problems.append("prefill: mover dropped/duplicated tensors")
-    for path, b in before.items():
-        a = after.get(path)
-        if a is None:
-            continue
-        if a.device != device:
-            problems.append(f"prefill/{path} stayed on {a.device}")
-        if a.shape != b.shape or a.dtype != b.dtype:
-            problems.append(f"prefill/{path} changed shape/dtype")
-    # the output buffer must be allocated on the target
-    out_m = torch.zeros_like(moved["q"])
-    if out_m.device != device:
-        problems.append("prefill: output buffer not allocated on the target")
-    # the staging primitives follow the pool's device on meta (the
-    # boot18 crash class was the CPU-resident dequant LUT)
-    pool_m = moved["pool"]
+    pool_m = inp["pool"].to(device)
     try:
         for side in (0, 1):
             t = ref._scale_offset_table(side, ref.POOL_BLOCK_SIZE, device=device)
@@ -1231,13 +1406,14 @@ def _dry_prefill() -> dict:
         if n != 2 or not buf_m[2].shape == (NKV, 128, 256):
             problems.append("fill_staging_buffer misbehaved on meta")
         fake_m = ref.slice_fake_block_table(
-            moved["block_table"], [0], pages_m, n, inp["pool"].shape[0]
+            inp["block_table"].to(device), [0], pages_m, n,
+            inp["pool"].shape[0],
         )
         if fake_m.device != device:
             problems.append(f"slice fake table on {fake_m.device}")
         bm, phys, roq = ref._selected_page_bitmap(
-            pool_m, moved["block_table"], moved["topk"],
-            moved["cu_seqlens_q"],
+            pool_m, inp["block_table"].to(device), inp["topk"].to(device),
+            inp["cu_seqlens_q"].to(device),
         )
         for name, t in (
             ("request bitmap", bm), ("phys", phys), ("req_of_q", roq)
@@ -1293,6 +1469,144 @@ def _dry_prefill() -> dict:
     }
 
 
+def _dry_vendor_args_audit() -> dict:
+    """Structure audit of the ONE vendor-invocation builder (the vendor
+    kernels themselves are GPU-only; this is the --cpu-dry-run share of
+    the val7 follow-up). On the meta device the builder must move EVERY
+    argument, preserve shapes/dtypes, allocate the output buffer on the
+    target, pass the pinned unit scales only for the vendor fp8 pool and
+    none for the bf16/q4 pools, put the arguments in exactly the real
+    impl's positional order, and refuse the val7 K/V-blocked pool and
+    every pool/key mismatch."""
+    device = torch.device("meta")
+    problems: list[str] = []
+
+    def audit(kind: str, build, validate) -> None:
+        inp = build()
+        validate(inp)
+        # The positional order the real impl passes
+        # (sparse_attention.py:486-499 decode, :502-521 prefill).
+        if kind == "prefill":
+            order = ("q", "pool", "topk", "block_table", "cu_seqlens_q",
+                     "seq_lens", "prefix_lens")
+            arity = 11
+            out_pos = 10
+        else:
+            order = ("q", "pool", "topk", "block_table", "seq_lens")
+            arity = 9
+            out_pos = 7
+        originals = {k: inp[k] for k in order}
+        for pool_key in ("fp8_pool", "bf16_pool", "pool"):
+            args, kwargs, out = _vendor_attention_args(
+                kind, inp, pool_key, device
+            )
+            if len(args) != arity:
+                problems.append(f"{kind}: wrong positional arity {len(args)}")
+                continue
+            # the pool slot must carry exactly the pool this leg named
+            originals["pool"] = inp[pool_key]
+            for pos, key in enumerate(order):
+                got = args[pos]
+                want = originals[key]
+                if not isinstance(got, torch.Tensor):
+                    problems.append(f"{kind}/{key} is not a tensor")
+                    continue
+                if got.device != device:
+                    problems.append(
+                        f"{kind}/{key} ({pool_key}) stayed on {got.device}"
+                    )
+                if got.shape != want.shape or got.dtype != want.dtype:
+                    problems.append(
+                        f"{kind}/{key} ({pool_key}) changed shape/dtype"
+                    )
+            if (
+                out.device != device
+                or out.shape != inp["q"].shape
+                or out.dtype != inp["q"].dtype
+            ):
+                problems.append(f"{kind}: output buffer wrong on {device}")
+            if args[out_pos] is not out:
+                problems.append(f"{kind}: output is not the last tensor arg")
+            scales_fp8 = pool_key == "fp8_pool"
+            for name in ("k_scale", "v_scale"):
+                scale = kwargs[name]
+                if scales_fp8:
+                    if (
+                        not isinstance(scale, torch.Tensor)
+                        or scale.device != device
+                        or tuple(scale.shape) != ()
+                    ):
+                        problems.append(
+                            f"{kind}/{pool_key}: {name} is not a scalar on "
+                            "the target"
+                        )
+                elif scale is not None:
+                    problems.append(
+                        f"{kind}/{pool_key}: {name} must be None for an "
+                        "unquantized pool"
+                    )
+        # The pinned unit scale VALUE (meta tensors carry no data to
+        # read, so the value check runs on a cpu build of the args).
+        _, kw_cpu, _ = _vendor_attention_args(kind, inp, "fp8_pool", "cpu")
+        for name in ("k_scale", "v_scale"):
+            scale = kw_cpu[name]
+            if (
+                not isinstance(scale, torch.Tensor)
+                or scale.numel() != 1
+                or scale.item() != 1.0
+            ):
+                problems.append(
+                    f"{kind}: fp8 {name} is not the pinned unit scalar"
+                )
+        # The val7 layout bug must fail closed: a K/V-blocked pool is
+        # refused by the builder AND by the fixture validator.
+        blocked = inp["fp8_pool"].reshape(
+            inp["fp8_pool"].shape[0], 2 * NKV, BLOCK, 128
+        )
+        try:
+            _vendor_attention_args(
+                kind, {**inp, "fp8_pool": blocked}, "fp8_pool", device
+            )
+            problems.append(f"{kind}: builder accepted the val7 blocked pool")
+        except ValueError as exc:
+            if "sparse_attn.py:24-27" not in str(exc):
+                problems.append(
+                    f"{kind}: blocked-pool refusal does not name the "
+                    f"vendor layout: {exc}"
+                )
+        try:
+            validate({**inp, "fp8_pool": blocked})
+            problems.append(f"{kind}: validator accepted the val7 blocked pool")
+        except ValueError as exc:
+            if "VENDOR-layout" not in str(exc):
+                problems.append(
+                    f"{kind}: blocked-pool validator refusal unnamed: {exc}"
+                )
+        # The q4 container must never reach the original kernel: it is
+        # tied to the 'pool' key, which only the overlay leg uses.
+        try:
+            _vendor_attention_args(
+                kind, {**inp, "fp8_pool": inp["pool"]}, "fp8_pool", device
+            )
+            problems.append(f"{kind}: q4 container accepted under fp8_pool")
+        except ValueError:
+            pass
+
+    audit("decode", hi.decode_inputs, hi.validate_decode_inputs)
+    audit("prefill", hi.prefill_inputs, hi.validate_prefill_inputs)
+    return {
+        "passed": not problems,
+        "problems": problems,
+        "summary": (
+            "the ONE vendor-invocation builder moves every argument, "
+            "keeps the real impl's positional order, pins the fp8 unit "
+            "scales, and refuses the val7 blocked pool"
+            if not problems
+            else "; ".join(problems)
+        ),
+    }
+
+
 def cpu_dry_run() -> int:
     units = [
         ("dry/0-w1-reference-runs", _dry_w1_reference),
@@ -1303,6 +1617,7 @@ def cpu_dry_run() -> int:
         ("dry/3-pool-bytes", unit_3),
         ("dry/4-device-audit", _dry_device_audit),
         ("dry/5-prefill-staging", _dry_prefill),
+        ("dry/6-vendor-invocation-structure", _dry_vendor_args_audit),
     ]
     return run_units(
         units,
