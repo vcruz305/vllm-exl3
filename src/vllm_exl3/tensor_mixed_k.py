@@ -267,7 +267,7 @@ def require_eager_execution(*, compiling: bool, capturing: bool):
 
 
 def apply_mixed_reference(x, ids, weights, layer, *, limit=None):
-    from .exl3 import apply_exl3_python_loop, pin_exl3_expert_map
+    from .exl3 import apply_exl3_python_loop, pin_exl3_expert_map, resolve_moe_act
 
     require_eager_execution(
         compiling=torch.compiler.is_compiling(),
@@ -292,6 +292,9 @@ def apply_mixed_reference(x, ids, weights, layer, *, limit=None):
             "EXL3 mixed-K requires [tokens,hidden] input and matching integer IDs/float weights"
         )
     store.check_expert_map(getattr(layer, "expert_map", None))
+    moe_act = getattr(layer, "_exl3_moe_act", None)
+    if moe_act is None:
+        moe_act = resolve_moe_act(layer)
     result = apply_exl3_python_loop(
         x,
         ids.to(torch.long),
@@ -299,6 +302,7 @@ def apply_mixed_reference(x, ids, weights, layer, *, limit=None):
         layer._exl3_inners,
         pin_exl3_expert_map(layer, x.device),
         limit,
+        act=moe_act,
     )
     layer._exl3_last_apply = "mixed_k_reference"
     return result.to(x.dtype)

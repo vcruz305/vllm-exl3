@@ -81,7 +81,10 @@ except ImportError:
         pass
 
     class FusedMoEMethodBase:  # type: ignore[no-redef]
-        pass
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            # Real base: FusedMoEMethodBase.__init__(self, moe) sets self.moe;
+            # the CPU test shim accepts and drops the argument.
+            pass
 
     class LinearBase:  # type: ignore[no-redef]
         pass
@@ -126,6 +129,61 @@ MOE_ACT_SILU = 0
 # lane is set to relu(u) so the gate multiply yields relu(u) * u = relu^2(u)
 # exactly (exllamav3 hadamard_inner.cuh ACT_RELU2_NOGATE).
 MOE_ACT_RELU2_NOGATE = 2
+# Clamped SwiGLU-OAI (gpt-oss / MiniMax-M3): exllamav3's coop kernel activation
+# index 3 (exllamav3_ext MOE_COOP_ACT_SILU_OAI,
+# exl3_moe_coop.cuh:15). The kernel hardcodes alpha = 1.702 and the (up + 1)
+# beta = 1.0 term inside act_oai_swiglu (exl3_moe_coop_kernel.cuh:98-107); the
+# only runtime parameter is the symmetric clamp limit.
+MOE_ACT_SWIGLU_OAI = 3
+
+# Checkpoint expert-directory families the prescan/per-expert loader may see.
+# Historical layout is layers.N.ffn.experts; NemotronH uses ...mixer.experts,
+# Qwen3.5/Ornith ...mlp.experts, MiniMax-M3 ...block_sparse_moe.experts.
+EXPERT_CKPT_PREFIX_FAMILIES = (
+    "ffn.experts",
+    "mixer.experts",
+    "mlp.experts",
+    "block_sparse_moe.experts",
+)
+
+# MiniMax-M3 model constants (transformers_utils/configs/minimax_m3.py):
+# swiglu_alpha 1.702, swiglu_limit 7.0; swiglu_beta defaults to 1.0 and the
+# pack omits it. These are FALLBACKS ONLY (with a logged warning) when the
+# layer does not carry its own attributes; the layer/config values win.
+MINIMAX_SWIGLU_ALPHA_DEFAULT = 1.702
+MINIMAX_SWIGLU_LIMIT_DEFAULT = 7.0
+
+# MSA lightning-indexer shards fused into MinimaxM3QKVParallelLinearWithIndexer
+# (vllm linear.py:1365; output layout [q | k | v | index_q | index_k]). These
+# two shards are MXFP8 (F8_E4M3 + E8M0 block-32 scales) in the pack and are
+# dequantized to a BF16 side weight at load; q/k/v stay EXL3 trellis.
+MINIMAX_INDEXER_SHARDS = ("index_q", "index_k")
+MINIMAX_MXFP8_BLOCK = 32
+
+# EXL3-covered non-routed module suffixes for the MiniMax-M3 pack, derived from
+# the architecture (the pack's quantization_config carries no ledger). The
+# integer is the config-level K fallback; the per-shard K is read from each
+# shard's own trellis at load. Indexer/router/embed/norm families are
+# deliberately absent: they are not EXL3.
+MINIMAX_NON_ROUTED_FAMILIES = {
+    "self_attn.qkv_proj": 5,
+    "self_attn.o_proj": 5,
+    "mlp.gate_proj": 4,
+    "mlp.up_proj": 4,
+    "mlp.down_proj": 5,
+    "block_sparse_moe.shared_experts.gate_proj": 4,
+    "block_sparse_moe.shared_experts.up_proj": 4,
+    "block_sparse_moe.shared_experts.down_proj": 5,
+    "lm_head": 6,
+}
+
+# Process-wide marker set by Exl3Config.override_quantization_method when vLLM
+# hands it a MiniMax-M3 hf_config. vLLM resolves override_quantization_method
+# at config time (config/model.py:1418) and Exl3Config.from_config at model
+# load time (model_loader/weight_utils.py:236), so the marker always precedes
+# from_config in the same process.
+_MINIMAX_M3_PACK_REQUESTED = False
+
 # Shared fused scratch: decode is sequential across layers.
 _FUSED_TEMP_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 _COOP_TEMP_CACHE: dict[tuple, Any] = {}
@@ -712,7 +770,7 @@ def _try_prescan_trellis_shapes(
     # NemotronH packs store experts under ...mixer.experts (up/down only,
     # gateless relu2); Qwen3.5/Ornith uses ...mlp.experts; historical layout is ...ffn.experts.
     base_name = layer_name
-    for cand in ("ffn.experts", "mixer.experts", "mlp.experts"):
+    for cand in EXPERT_CKPT_PREFIX_FAMILIES:
         if cand in base_name:
             prefix = f"layers.{layer_id}.{cand}."
             break
@@ -741,7 +799,9 @@ def _try_prescan_trellis_shapes(
         "up": {},
         "down": {},
     }
-    raw_prefixes = ("", "backbone.") if "mtp.layers." in base_name else ("", "backbone.", "model.language_model.", "model.")
+    # MiniMax-M3's text stack lives under language_model.model.* in the VL
+    # wrapper's checkpoint; the mtp.* entries keep their historical prefixes.
+    raw_prefixes = ("", "backbone.", "model.language_model.", "model.", "language_model.model.") if "mtp.layers." in base_name or "block_sparse_moe." in base_name else ("", "backbone.", "model.language_model.", "model.")
     for local_e in range(int(num_experts)):
         global_e = offset + local_e
         for proj, ckpt_cands in ckpt_names.items():
@@ -1487,23 +1547,250 @@ def resolve_moe_act(layer: torch.nn.Module) -> int:
     """Kernel activation index for this layer, from vLLM's MoE activation.
 
     vLLM 0.31.0 exposes ``layer.moe_config.activation`` as a ``MoEActivation``
-    enum. Gated activations (silu/gelu/...) keep the historical SILU index 0.
-    Non-gated relu2 (``relu2_no_mul``, NemotronH) maps to the fork's
-    ``ACT_RELU2_NOGATE`` so the fused kernels skip the gate GEMM and compute
-    relu(u) * u = relu^2(u) exactly. Any other non-gated activation has no
-    kernel instance and must not take the fused path.
+    enum. Known activations map to the exllamav3 kernel's ``MOE_COOP_ACT_*``
+    instances: silu -> 0, relu2_no_mul -> 2 (NemotronH, gateless) and
+    swigluoai[_uninterleave] -> 3 (clamped SwiGLU-OAI, gpt-oss / MiniMax-M3).
+    Any OTHER activation has no kernel instance: silently mapping it to the
+    SILU index would compute the wrong activation, so it raises.
     """
     act = getattr(getattr(layer, "moe_config", None), "activation", None)
     value = getattr(act, "value", None)
     if value is None:
         return MOE_ACT_SILU
+    if value == "silu":
+        return MOE_ACT_SILU
     if value == "relu2_no_mul":
         return MOE_ACT_RELU2_NOGATE
+    if value in ("swigluoai", "swigluoai_uninterleave"):
+        return MOE_ACT_SWIGLU_OAI
     if value.endswith("_no_mul"):
         raise ValueError(
             f"EXL3 fused MoE has no kernel instance for non-gated activation {value!r}"
         )
-    return MOE_ACT_SILU
+    raise ValueError(
+        f"EXL3 fused MoE has no kernel instance for activation {value!r}; "
+        "known activations are silu, relu2_no_mul and swigluoai[_uninterleave]"
+    )
+
+
+def _layer_float_attr(layer: torch.nn.Module, name: str, default: float) -> float:
+    """Layer attribute as a finite float, else ``default`` (with a warning)."""
+    raw = getattr(layer, name, None)
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        parsed = None
+    if parsed is not None and math.isfinite(parsed):
+        return parsed
+    logger.warning(
+        "EXL3 MoE %s=%r is absent/invalid; falling back to the model constant %s",
+        name,
+        raw,
+        default,
+    )
+    return default
+
+
+def resolve_moe_gate_params(layer: torch.nn.Module) -> tuple[float | None, float | None]:
+    """(alpha, limit) gate parameters for this layer's kernel launch.
+
+    - SwiGLU-OAI (act index 3): the exllamav3 kernel hardcodes alpha = 1.702
+      and the beta = 1.0 ``(up + 1)`` term (exl3_moe_coop_kernel.cuh:98-107),
+      so the layer's alpha must agree with 1.702 and its beta must be absent
+      or 1.0; anything else raises instead of silently computing a different
+      activation. The clamp limit is a real kernel argument.
+    - Silu (DSV4.1): no alpha term; the historical swiglu_limit passes
+      through unchanged (or None when the layer carries no limit).
+    - Gateless relu2: no alpha; the symmetric up-clamp limit passes through.
+    """
+    act = resolve_moe_act(layer)
+    if act == MOE_ACT_SWIGLU_OAI:
+        alpha = _layer_float_attr(
+            layer, "swiglu_alpha", MINIMAX_SWIGLU_ALPHA_DEFAULT
+        )
+        if alpha != MINIMAX_SWIGLU_ALPHA_DEFAULT:
+            raise ValueError(
+                f"EXL3 swiglu_oai kernel hardcodes alpha={MINIMAX_SWIGLU_ALPHA_DEFAULT}; "
+                f"layer requests swiglu_alpha={alpha!r}"
+            )
+        beta = getattr(layer, "swiglu_beta", None)
+        if beta is not None:
+            try:
+                beta = float(beta)
+            except (TypeError, ValueError, OverflowError):
+                beta = None
+        if beta is not None and beta != 1.0:
+            raise ValueError(
+                f"EXL3 swiglu_oai kernel computes (up + 1) (beta=1.0); "
+                f"layer requests swiglu_beta={beta!r}"
+            )
+        limit = _layer_float_attr(
+            layer, "swiglu_limit", MINIMAX_SWIGLU_LIMIT_DEFAULT
+        )
+        return alpha, limit
+    if act == MOE_ACT_SILU:
+        raw = getattr(layer, "swiglu_limit", None)
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            parsed = None
+        limit = (
+            parsed
+            if parsed is not None and math.isfinite(parsed) and parsed > 0
+            else None
+        )
+        return None, limit
+    # Gateless relu2: the symmetric up-clamp limit, if the layer carries one.
+    raw = getattr(layer, "swiglu_limit", None)
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        parsed = None
+    limit = (
+        parsed
+        if parsed is not None and math.isfinite(parsed) and parsed > 0
+        else None
+    )
+    return None, limit
+
+
+def expert_k_census_supported(census: dict[tuple[int, ...], int]) -> bool:
+    """Whether a per-expert K census is servable by the EXL3 expert machinery.
+
+    ``census`` maps (w1, w2, w3) K-bit tuples to expert counts. Every K in
+    every tuple must be inside exllamav3's EXL3 K family (1..8, the kernel
+    instances exl3_moe_coop_inst_k1..k8) and the census must be non-empty;
+    the mixed-K arena/pointer-table machinery handles the rest per expert.
+    """
+    if not isinstance(census, dict) or not census:
+        return False
+    for k_tuple, count in census.items():
+        try:
+            ks = [int(k) for k in k_tuple]
+            n = int(count)
+        except (TypeError, ValueError):
+            return False
+        if n <= 0:
+            return False
+        if any(not 1 <= k <= 8 for k in ks):
+            return False
+    return True
+
+
+def _hf_config_is_minimax_m3(hf_config: Any) -> bool:
+    """Whether vLLM's hf_config names the MiniMax-M3 sparse architecture."""
+    if hf_config is None:
+        return False
+    model_type = str(getattr(hf_config, "model_type", "") or "")
+    if model_type in ("minimax_m3_vl", "minimax_m3"):
+        return True
+    try:
+        archs = list(getattr(hf_config, "architectures", None) or [])
+    except Exception:
+        archs = []
+    return any(
+        "MiniMaxM3Sparse" in str(a) for a in archs
+    )
+
+
+def minimax_pack_detected(cfg: "Exl3Config") -> bool:
+    """Whether this Exl3Config serves the MiniMax-M3 sparse-attention pack.
+
+    The pack's quantization_config is {quant_method: exl3, version: 0.0.2}
+    with no coverage ledger, so detection is by model architecture: the
+    override_quantization_method marker (set from vLLM's hf_config) plus the
+    derived non-routed coverage.
+    """
+    if _MINIMAX_M3_PACK_REQUESTED:
+        return True
+    layers = getattr(getattr(cfg, "non_routed_exl3", None), "layers", {}) or {}
+    modules = getattr(getattr(cfg, "non_routed_exl3", None), "modules", []) or []
+    covered = set(layers) | set(modules)
+    return bool(covered & set(MINIMAX_NON_ROUTED_FAMILIES))
+
+
+def _derive_minimax_non_routed_coverage() -> dict[str, Any]:
+    """non_routed_exl3 block for the MiniMax-M3 pack, from the architecture.
+
+    The 9 EXL3-covered module suffixes become the ``modules`` list (suffix
+    matching, like the tensor_storage-derived block); per-family K fallbacks
+    go to ``layer_bits``. The per-shard K is still read from each shard's own
+    trellis at load, so the fallback only feeds config-level logging.
+    """
+    return {
+        "modules": list(MINIMAX_NON_ROUTED_FAMILIES),
+        "layer_bits": dict(MINIMAX_NON_ROUTED_FAMILIES),
+        "bits": max(MINIMAX_NON_ROUTED_FAMILIES.values()),
+        "codebook": "mcg",
+    }
+
+
+def _e4m3_bits_to_float(bits: "torch.Tensor") -> "torch.Tensor":
+    """Decode E4M3FN bit patterns (uint8) to float32 without a float8 dtype.
+
+    E4M3FN: 1-4-3 split, no inf; 0x7F/0xFF are NaN. Pure integer math so the
+    decode also runs where torch.float8_e4m3fn kernels are unavailable (CPU).
+    """
+    bits = bits.to(torch.int32) & 0xFF
+    sign = torch.where(bits & 0x80 != 0, -1.0, 1.0)
+    exp = (bits >> 3) & 0xF
+    man = bits & 0x7
+    # exponent bias 7; subnormals (exp == 0) scale mantissa by 2^-9;
+    # normals are ((8 + man) / 8) * 2**(exp - 7) == (8 + man) * 2**(exp - 10)
+    # (max finite 448 at exp=15/man=6; 0x7F/0xFF are NaN).
+    val = torch.where(
+        exp == 0,
+        man.to(torch.float32) * (2.0 ** -9),
+        (man.to(torch.float32) + 8.0) * torch.pow(
+            2.0, exp.to(torch.float32) - 10.0
+        ),
+    )
+    val = torch.where((bits & 0x7F) == 0x7F, float("nan"), val)
+    return sign * val
+
+
+def dequant_minimax_indexer(
+    packed: "torch.Tensor",
+    scales: "torch.Tensor",
+    block: int = MINIMAX_MXFP8_BLOCK,
+) -> "torch.Tensor":
+    """Dequantize an MXFP8 indexer projection (F8_E4M3 + E8M0 block scales).
+
+    ``packed`` is the F8 payload viewed as uint8, shape (out, in); ``scales``
+    holds one E8M0 exponent byte per ``block``-wide slice along the INPUT dim,
+    shape (out, in // block). The E8M0 byte decodes as 2**(byte - 127) and is
+    MULTIPLIED with the payload — the same semantics as vLLM's own MXFP8 path
+    (``dequant_mxfp8_to_bf16``, quantization/utils/mxfp8_utils.py:232-245:
+    ``descale = exp2(scales - 127.0)``; consumed by the load-time dequant in
+    kernels/linear/mxfp8/emulation.py:48). Despite the checkpoint's
+    ``weight_scale_inv`` name the stored byte is the direct descale exponent,
+    not a reciprocal.
+
+    Returns a BF16 weight of shape (out, in).
+    """
+    out_rows, in_cols = int(packed.shape[0]), int(packed.shape[1])
+    if in_cols % block:
+        raise ValueError(
+            f"MXFP8 indexer dequant: input dim {in_cols} is not a multiple of "
+            f"the {block}-wide scale block"
+        )
+    if tuple(scales.shape) != (out_rows, in_cols // block):
+        raise ValueError(
+            f"MXFP8 indexer dequant: scales shape {tuple(scales.shape)} does "
+            f"not match ({out_rows}, {in_cols // block})"
+        )
+    if scales.dtype == torch.uint8:
+        exp_byte = scales.to(torch.int32)
+    else:
+        exp_byte = scales.to(torch.int32) & 0xFF
+    descale = torch.pow(
+        2.0, exp_byte.to(torch.float32) - 127.0
+    )
+    payload = _e4m3_bits_to_float(packed.reshape(-1))
+    payload = payload.reshape(out_rows, in_cols // block, block)
+    weight = payload * descale.unsqueeze(-1)
+    return weight.reshape(out_rows, in_cols).to(torch.bfloat16)
+
 
 
 def moe_layer_is_gateless(layer: torch.nn.Module) -> bool:
@@ -1739,6 +2026,7 @@ def apply_exl3_python_loop(
     *,
     only_experts: set[int] | None = None,
     out: torch.Tensor | None = None,
+    act: int = MOE_ACT_SILU,
 ) -> torch.Tensor:
     """Unique-expert LinearEXL3 loop. `only_experts` is local ids (fat-expert fallback)."""
     tokens, hidden = x2d.shape
@@ -1762,15 +2050,26 @@ def apply_exl3_python_loop(
             up_out = pack["up"].forward(h.contiguous().half(), {}, out_dtype=torch.float32)
             if limit is not None and limit > 0:
                 up_out = up_out.clamp(min=-limit, max=limit)
-            act = torch.square(torch.relu(up_out))
+            act_out = torch.square(torch.relu(up_out))
+        elif act == MOE_ACT_SWIGLU_OAI:
+            # Clamped SwiGLU-OAI, the loop twin of the coop kernel's
+            # act_oai_swiglu (exl3_moe_coop_kernel.cuh:98-107): gate clamped
+            # from above only, up clamped symmetrically, alpha hardcoded 1.702,
+            # beta = 1.0 as the (up + 1) term.
+            gate = pack["gate"].forward(h.contiguous().half(), {}, out_dtype=torch.float32)
+            up = pack["up"].forward(h.contiguous().half(), {}, out_dtype=torch.float32)
+            if limit is not None and limit > 0:
+                gate = gate.clamp(max=limit)
+                up = up.clamp(min=-limit, max=limit)
+            act_out = (up + 1.0) * gate * torch.sigmoid(1.702 * gate)
         else:
             gate = pack["gate"].forward(h.contiguous().half(), {}, out_dtype=torch.float32)
             up = pack["up"].forward(h.contiguous().half(), {}, out_dtype=torch.float32)
             if limit is not None and limit > 0:
                 gate = gate.clamp(max=limit)
                 up = up.clamp(min=-limit, max=limit)
-            act = F.silu(gate) * up
-        down = pack["down"].forward(act.contiguous().half(), {}, out_dtype=torch.float32)
+            act_out = F.silu(gate) * up
+        down = pack["down"].forward(act_out.contiguous().half(), {}, out_dtype=torch.float32)
         scale = weights[token_idx, k_pos].unsqueeze(-1).to(dtype=torch.float32)
         out.index_add_(0, token_idx, down * scale)
     return out
@@ -2515,8 +2814,11 @@ def apply_exl3_fused_moe(
     except Exception:
         # Direct callers may use this helper without installing ExLlamaV3.
         # Keep the same graceful fallback contract as ``apply_exl3_experts``.
+        _moe_act = getattr(layer, "_exl3_moe_act", None)
+        if _moe_act is None:
+            _moe_act = resolve_moe_act(layer)
         return apply_exl3_python_loop(
-            x2d, ids, weights, inners, expert_map, limit
+            x2d, ids, weights, inners, expert_map, limit, act=_moe_act
         )
 
     ptrs = getattr(layer, "_exl3_ptrs", None)
@@ -2567,13 +2869,16 @@ def apply_exl3_fused_moe(
             # indexes pointer tables by raw sel. Plugin sentinels are
             # n_exp (non-local / EP). Pass [0, n_exp) so those routes
             # contribute zero instead of OOB.
+            moe_act = getattr(layer, "_exl3_moe_act", None)
+            if moe_act is None:
+                moe_act = resolve_moe_act(layer)
             exllamav3_ext.exl3_moe_coop(
                 xh, sel_c, rw_c, 0, int(n_exp), hidden,
                 ptrs["gate_trellis"], ptrs["gate_suh"], ptrs["gate_svh"],
                 ptrs["up_trellis"], ptrs["up_suh"], ptrs["up_svh"],
                 ptrs["down_trellis"], ptrs["down_suh"], ptrs["down_svh"],
                 None, None, None,
-                kg, ku, kd, mcg, mul1, MOE_ACT_SILU,
+                kg, ku, kd, mcg, mul1, moe_act,
                 float(limit) if (limit is not None and limit > 0) else 0.0,
                 True,
                 had_g, had_u, gu_g, gu_u, act_out, d_out, ctr, out,
@@ -2960,7 +3265,12 @@ def apply_exl3_experts(
         out = apply_exl3_fused_moe(x2d, ids, weights, layer, inners, expert_map, limit)
         layer._exl3_last_apply = "fused"
     else:
-        out = apply_exl3_python_loop(x2d, ids, weights, inners, expert_map, limit)
+        _moe_act = getattr(layer, "_exl3_moe_act", None)
+        if _moe_act is None:
+            _moe_act = resolve_moe_act(layer)
+        out = apply_exl3_python_loop(
+            x2d, ids, weights, inners, expert_map, limit, act=_moe_act
+        )
         layer._exl3_last_apply = "loop"
     return out.to(dtype=x.dtype)
 
@@ -3320,6 +3630,17 @@ class Exl3Config(QuantizationConfig):
                     len(derived.get("layers", {})),
                     derived.get("codebook"),
                 )
+        # MiniMax-M3 pack: no ledger anywhere (the public card is only
+        # {quant_method: exl3, version: 0.0.2}); the coverage comes from the
+        # architecture via the override_quantization_method marker instead.
+        if not inst.non_routed_exl3 and _MINIMAX_M3_PACK_REQUESTED:
+            derived = _derive_minimax_non_routed_coverage()
+            inst.non_routed_exl3 = derived
+            logger.info(
+                "EXL3 derived MiniMax-M3 non-routed coverage from the model "
+                "architecture: %d module families",
+                len(derived.get("modules", [])),
+            )
         return inst
 
     @classmethod
@@ -3331,6 +3652,11 @@ class Exl3Config(QuantizationConfig):
     ) -> str | None:
         method = str((hf_quant_cfg or {}).get("quant_method", "")).lower()
         if method == "exl3":
+            # Architecture-level MiniMax-M3 marker (see minimax_pack_detected):
+            # vLLM calls this at config time, strictly before from_config.
+            global _MINIMAX_M3_PACK_REQUESTED
+            if _hf_config_is_minimax_m3(hf_config):
+                _MINIMAX_M3_PACK_REQUESTED = True
             return "exl3"
         return None
 
@@ -3563,6 +3889,16 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
     def get_fused_moe_quant_config(self, layer: "RoutedExperts") -> FusedMoEQuantConfig | None:
         return None
+
+    @property
+    def is_monolithic(self) -> bool:
+        # vLLM's RoutedExperts.forward_modular asserts
+        # ``not quant_method.is_monolithic`` (routed_experts.py:1387) and the
+        # FusedMoEMethodBase property falls through to ``self.moe_kernel``
+        # (fused_moe_method_base.py:135-141), which EXL3 does not have. EXL3
+        # is a modular method: routing is selected by vLLM's runner and this
+        # method's apply() consumes (x, topk_weights, topk_ids).
+        return False
 
     def prepare_workspace(self, hidden_states, shared_workspace_size: int):
         """Reserve the shared-expert scratch; the EXL3 routed path needs none.
@@ -4144,6 +4480,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         n_exp = int(len(layer.gate_trellis))
         gateless = moe_layer_is_gateless(layer)
         layer._exl3_moe_act = resolve_moe_act(layer)
+        # Resolve (alpha, limit) at LOAD time so a bad alpha/beta fails the
+        # load instead of the first forward (resolve_moe_gate_params raises
+        # on any alpha != 1.702 or beta not in {None, 1.0}).
+        layer._exl3_swiglu_alpha, layer._exl3_swiglu_limit = (
+            resolve_moe_gate_params(layer)
+        )
         layer._exl3_gateless = gateless
         inners: list[dict[str, Any]] = []
         k_values: list[int] = []
@@ -4356,22 +4698,41 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         shared_experts: "SharedExperts | None",
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
+        # Shared experts are computed by vLLM's runner through the model's own
+        # MiniMaxM3MLP modules (each projection under Exl3LinearMethod), BEFORE
+        # this call (moe_runner.py:_maybe_apply_shared_experts -> SharedExperts
+        # .forward -> self._layer(input)), and are combined with the routed
+        # output exactly once at the model level (model.py MoEOutput(routed,
+        # shared_output)). This method therefore never computes, fuses or
+        # drops them: it returns the routed contribution only, and EXL3 never
+        # reports staged/fused shared experts.
         del shared_experts, shared_experts_input
-        raw_limit = getattr(self.moe, "swiglu_limit", None)
-        try:
-            parsed_limit = float(raw_limit)
-        except (TypeError, ValueError, OverflowError):
-            parsed_limit = None
-        limit = (
-            parsed_limit
-            if parsed_limit is not None
-            and math.isfinite(parsed_limit)
-            and parsed_limit > 0
-            else None
-        )
+        # resolve_moe_gate_params validates alpha (kernel-hardcoded 1.702 for
+        # act 3) and beta (must be None/1.0) and returns the clamp limit.
+        _alpha, limit = resolve_moe_gate_params(self._gate_param_source(layer))
+        del _alpha
         return apply_exl3_experts(
             x, topk_ids, topk_weights, layer, limit=limit
         )
+
+    def _gate_param_source(self, layer):
+        # vLLM invokes quant_method.apply(self.moe, ...), so `layer` and
+        # self.moe are the same object in production; accept either carrier
+        # for the gate attributes (the DSV4.1 harness sets them on .moe).
+        moe = getattr(self, "moe", None)
+        if moe is None or moe is layer:
+            return layer
+        gate_attrs = (
+            "moe_config", "_exl3_moe_act",
+            "swiglu_alpha", "swiglu_beta", "swiglu_limit",
+        )
+
+        def _carries(obj) -> bool:
+            return any(hasattr(obj, a) for a in gate_attrs)
+
+        if _carries(layer) or not _carries(moe):
+            return layer
+        return moe
 
 
 # ---------------------------------------------------------------------------
