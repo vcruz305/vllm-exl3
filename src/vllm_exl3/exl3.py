@@ -5391,6 +5391,20 @@ class Exl3LinearMethod(LinearMethodBase):
         self.bits = int(bits) if bits is not None else quant_config.bits
         self._logged = False
 
+    def _indexer_shards(self, layer, n_shards: int) -> tuple[int, ...]:
+        """BF16-staging shard indices of the MiniMax-M3 MSA indexer projections.
+
+        Only MinimaxM3QKVParallelLinearWithIndexer carries them, as the last
+        two of its five fused shards ([q | k | v | index_q | index_k],
+        vllm linear.py:1365); any other layer gets none.
+        """
+        if (
+            n_shards != len(MINIMAX_INDEXER_SHARDS) + 3
+            or type(layer).__name__ != "MinimaxM3QKVParallelLinearWithIndexer"
+        ):
+            return ()
+        return (n_shards - len(MINIMAX_INDEXER_SHARDS), n_shards - 1)
+
     def create_weights(
         self,
         layer,
@@ -5433,6 +5447,25 @@ class Exl3LinearMethod(LinearMethodBase):
                 raise RuntimeError(
                     f"EXL3 bf16 shards are not supported with TP size > 1; tp_size={tp_size}"
                 )
+
+        # MiniMax-M3 fused qkv+indexer: shards 3/4 (index_q/index_k) are
+        # MXFP8 (F8_E4M3 + E8M0 block-32 scales), not EXL3 trellis. They are
+        # stashed at load and dequantized into the BF16 staging rows in
+        # process_weights_after_loading, then run as a plain BF16 GEMM whose
+        # output slice lands in the fused [q | k | v | index_q | index_k]
+        # layout (vllm linear.py MinimaxM3QKVParallelLinearWithIndexer).
+        indexer_shards = self._indexer_shards(layer, n_shards)
+        if indexer_shards:
+            _, tp_size = _resolve_tp_geometry(layer)
+            if tp_size > 1:
+                raise RuntimeError(
+                    "EXL3 MiniMax indexer shards are not supported with "
+                    f"TP size > 1; tp_size={tp_size}"
+                )
+        # Unified BF16-staging shard list: config bf16 shards plus the
+        # dequantized indexer shards, in ascending order (the apply-side row
+        # offsets and the staging allocation must agree on this ordering).
+        bf16_shards = sorted(set(bf16_shards) | set(indexer_shards))
 
         # K words per shard
         k_words = self.bits * 16
@@ -5566,6 +5599,26 @@ class Exl3LinearMethod(LinearMethodBase):
             is_qkv_parallel,
         )
 
+        # MiniMax indexer MXFP8 staging: the F8 payload (shard ids
+        # index_q/index_k) arrives through the "weight" loader and the E8M0
+        # scale block through a dedicated "weight_scale" parameter (the
+        # model's load_weights rewrites the checkpoint's weight_scale_inv to
+        # weight_scale before the params_dict lookup, nvidia/model.py
+        # stacked_params_mapping); both are stashed per shard and
+        # dequantized in process_weights_after_loading.
+        if indexer_shards:
+            indexer_scale_param = Parameter(
+                torch.empty(0, dtype=torch.uint8), requires_grad=False
+            )
+            layer.register_parameter("weight_scale", indexer_scale_param)
+            set_weight_attrs(indexer_scale_param, extra)
+            indexer_scale_param.weight_loader = self._make_indexer_scale_loader(
+                indexer_shards, output_partition_sizes, layer
+            )
+            layer._exl3_indexer_payloads = [None] * len(indexer_shards)
+            layer._exl3_indexer_scales = [None] * len(indexer_shards)
+            layer._exl3_indexer_shards = tuple(indexer_shards)
+
         # Store metadata
         layer._exl3_linear_n_shards = n_shards
         layer._exl3_linear_output_partition_sizes = output_partition_sizes
@@ -5661,8 +5714,16 @@ class Exl3LinearMethod(LinearMethodBase):
             shard_idx = 0
             if loaded_shard_id is not None:
                 if isinstance(loaded_shard_id, str):
-                    # "q", "k", "v" for QKV layers
+                    # "q", "k", "v" for QKV layers; the MiniMax fused
+                    # qkv+indexer layer adds "index_q"/"index_k" as shards 3/4.
                     shard_map = {"q": 0, "k": 1, "v": 2}
+                    if n_shards == len(MINIMAX_INDEXER_SHARDS) + 3:
+                        shard_map.update(
+                            {
+                                name: 3 + i
+                                for i, name in enumerate(MINIMAX_INDEXER_SHARDS)
+                            }
+                        )
                     if loaded_shard_id not in shard_map:
                         raise ValueError(
                             f"unknown shard_id={loaded_shard_id} for EXL3 linear"
@@ -5674,6 +5735,25 @@ class Exl3LinearMethod(LinearMethodBase):
                 raise ValueError(
                     f"shard_idx={shard_idx} out of range for n_shards={n_shards}"
                 )
+
+            # MiniMax indexer MXFP8 payload: stash per shard (the E8M0 scale
+            # block arrives through the weight_scale loader); dequantized
+            # into the BF16 staging rows in process_weights_after_loading.
+            indexer_shards = getattr(layer, "_exl3_indexer_shards", ())
+            if shard_idx in indexer_shards:
+                if suffix != "weight":
+                    raise ValueError(
+                        f"EXL3 indexer shard {shard_idx} payload arrived via "
+                        f"suffix {suffix!r}, expected 'weight'"
+                    )
+                slot = indexer_shards.index(shard_idx)
+                payload = loaded_weight.detach().contiguous()
+                if layer._exl3_indexer_payloads[slot] is not None:
+                    raise RuntimeError(
+                        f"EXL3 indexer shard {shard_idx} payload loaded twice"
+                    )
+                layer._exl3_indexer_payloads[slot] = payload
+                return
 
             # Special handling for weight (bf16 staging) and markers
             if suffix in ("weight", "mcg", "mul1"):
@@ -5796,6 +5876,45 @@ class Exl3LinearMethod(LinearMethodBase):
             _madv_dontneed_cpu_tensor(sharded)
 
         return weight_loader
+
+    def _make_indexer_scale_loader(
+        self,
+        indexer_shards: tuple[int, ...],
+        output_partition_sizes: list[int],
+        layer=None,
+    ):
+        """Loader for the MiniMax indexer E8M0 scale block (weight_scale).
+
+        The checkpoint stores one U8 exponent byte per 32-wide input slice
+        (weight_scale_inv, renamed weight_scale by the model's load_weights);
+        each shard's block is stashed for the load-time dequant and never
+        becomes a model parameter.
+        """
+
+        def scale_loader(
+            param: Parameter,
+            loaded_weight: torch.Tensor,
+            loaded_shard_id: str | int | None = None,
+        ) -> None:
+            shard_idx = None
+            if isinstance(loaded_shard_id, str):
+                if loaded_shard_id in MINIMAX_INDEXER_SHARDS:
+                    shard_idx = 3 + MINIMAX_INDEXER_SHARDS.index(loaded_shard_id)
+            elif isinstance(loaded_shard_id, int):
+                shard_idx = loaded_shard_id
+            if shard_idx not in indexer_shards:
+                raise ValueError(
+                    f"EXL3 indexer scale shard_id={loaded_shard_id!r} is not an "
+                    f"indexer shard {indexer_shards}"
+                )
+            slot = indexer_shards.index(shard_idx)
+            if layer._exl3_indexer_scales[slot] is not None:
+                raise RuntimeError(
+                    f"EXL3 indexer shard {shard_idx} scale loaded twice"
+                )
+            layer._exl3_indexer_scales[slot] = loaded_weight.detach().contiguous()
+
+        return scale_loader
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if not hasattr(layer, "trellis"):
@@ -5925,6 +6044,38 @@ class Exl3LinearMethod(LinearMethodBase):
         layer._exl3_opaque_name = _exl3_register_opaque_layer(layer, "linear", self)
 
         # Keep bf16 weights if present, remove weight staging param if all loaded
+        # MiniMax indexer shards first: dequantize the stashed MXFP8 payloads
+        # (F8_E4M3 + E8M0 block-32 scales) into their BF16 staging rows; the
+        # bf16 handling below then carries them into _exl3_bf16_weight and
+        # apply() runs the plain BF16 GEMM for these two slices of the fused
+        # [q | k | v | index_q | index_k] output.
+        indexer_shards = getattr(layer, "_exl3_indexer_shards", ())
+        if indexer_shards:
+            staging_in = int(layer.weight.data.shape[1])
+            for slot, shard_idx in enumerate(indexer_shards):
+                payload = layer._exl3_indexer_payloads[slot]
+                scales = layer._exl3_indexer_scales[slot]
+                if payload is None or scales is None:
+                    raise RuntimeError(
+                        f"EXL3 indexer shard {shard_idx} incomplete at load end "
+                        f"(payload={'set' if payload is not None else 'missing'}, "
+                        f"scales={'set' if scales is not None else 'missing'})"
+                    )
+                if payload.dtype != torch.uint8:
+                    payload = payload.view(torch.uint8)
+                weight_bf16 = dequant_minimax_indexer(payload, scales)
+                bf16_idx = bf16_shards.index(shard_idx)
+                row_start = sum(output_sizes[j] for j in bf16_shards[:bf16_idx])
+                row_end = row_start + output_sizes[shard_idx]
+                if tuple(weight_bf16.shape) != (row_end - row_start, staging_in):
+                    raise RuntimeError(
+                        f"EXL3 indexer shard {shard_idx} dequant shape "
+                        f"{tuple(weight_bf16.shape)} does not match its staging "
+                        f"rows ({row_end - row_start}, {staging_in})"
+                    )
+                layer.weight.data[row_start:row_end].copy_(weight_bf16)
+                layer._exl3_indexer_payloads[slot] = None
+                layer._exl3_indexer_scales[slot] = None
         if bf16_shards and hasattr(layer, "weight"):
             bf16_rows = sum(output_sizes[i] for i in bf16_shards)
             if bf16_rows > 0:
@@ -5943,7 +6094,7 @@ class Exl3LinearMethod(LinearMethodBase):
                 pass
 
         # Free fused parameters to avoid memory doubling
-        for param_name in ("trellis", "suh", "svh", "mcg", "mul1"):
+        for param_name in ("trellis", "suh", "svh", "mcg", "mul1", "weight_scale"):
             if hasattr(layer, param_name):
                 try:
                     delattr(layer, param_name)
