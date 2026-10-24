@@ -28,12 +28,16 @@ draft pool stay fp8 and are untouched):
   (``VLLM_EXL3_Q4KV_STAGING_MAX_MB``, default 48 MiB), and the sliced
   result equals the uncapped staging bit-for-bit (pinned by tests and the
   harness dry run against the fp32 prefill oracle).
-  ``VLLM_EXL3_Q4KV_PREFILL_FAST=1`` (default off) replaces both halves of
-  that path with single-pass equivalents -- one Triton launch per slice
-  over the q4 pool instead of one launch group per 2 pages through an
-  int32/float32 chain, and O(1) host syncs per slice instead of one per
-  row. Same slice plan, same staged bytes, ~8x less traffic; see
-  ``lanes/research/q4-prefill-notes.md`` for the cost model.
+  ``VLLM_EXL3_Q4KV_PREFILL_FAST`` (default ON; ``=0`` opts out) replaces
+  both halves of that path with single-pass equivalents -- one Triton
+  launch per slice over the q4 pool instead of one launch group per 2
+  pages through an int32/float32 chain, and O(1) host syncs per slice
+  instead of one per row. Same slice plan, same staged bytes, ~8x less
+  traffic. Measured on GB10: 4.42/4.45/5.89 ms per layer at 8K/16K/30K
+  prefixes vs 14.9/26.0/102.0 ms for the milestone-1 path, and 338/324/
+  276 -> 378/381/378 tok/s end to end with the needles intact
+  (``CHECKIN-Q4KV-1.md``, "GB10 validation"). ``=0`` keeps the
+  milestone-1 path byte for byte.
 
 All wrappers fail closed: they raise on any unsupported combination rather
 than silently miscomputing.
@@ -531,26 +535,34 @@ def _make_decode_wrapper(original):
 def _prefill_fast_enabled() -> bool:
     """VLLM_EXL3_Q4KV_PREFILL_FAST: single-pass q4 prefill staging.
 
-    Default off (0): the milestone-1 staging path, byte for byte. On (1):
+    Default ON (unset or empty): single-pass staging via
     :func:`vllm_exl3.minimax_q4kv_reference.plan_prefill_slices_fast` +
     ``q4_stage_pages``, which produce the SAME slice plan and the SAME
-    staged bf16 bytes at ~8x less memory traffic and O(1) host syncs per
-    slice instead of one per row. Read per call (an ``os.environ`` lookup
-    on the prefill path, which never runs under capture).
+    staged bf16 bytes as the milestone-1 path at ~8x less memory traffic
+    and O(1) host syncs per slice instead of one per row. Validated on
+    GB10 (staged bytes bit-identical per slice at 8K/16K/30K, needles
+    intact end to end, 378 tok/s vs 338 at 24.8K; see
+    ``CHECKIN-Q4KV-1.md``).
+
+    ``=0`` (or false/off/no) is the explicit opt-out and selects the
+    milestone-1 staging path byte for byte. Read per call (an
+    ``os.environ`` lookup on the prefill path, which never runs under
+    capture).
 
     Any other value fails closed: a typo must not silently select a path
     the operator did not ask for.
     """
     raw = os.environ.get("VLLM_EXL3_Q4KV_PREFILL_FAST")
     if raw is None:
-        return False
-    val = raw.strip().lower()
-    if val in ("1", "true", "on", "yes"):
         return True
-    if val in ("0", "false", "off", "no", ""):
+    val = raw.strip().lower()
+    if val in ("1", "true", "on", "yes", ""):
+        return True
+    if val in ("0", "false", "off", "no"):
         return False
     raise ValueError(
-        "VLLM_EXL3_Q4KV_PREFILL_FAST must be 0 or 1, got " f"{raw!r}"
+        "VLLM_EXL3_Q4KV_PREFILL_FAST must be unset or one of "
+        f"0/1/true/false/on/off/yes/no, got {raw!r}"
     )
 
 
@@ -621,10 +633,12 @@ def _make_prefill_wrapper(original):
         # sliced so every call's staged union fits the cap and the result
         # equals the uncapped staging (see the reference module).
         #
-        # VLLM_EXL3_Q4KV_PREFILL_FAST=1 swaps both halves of the staging
-        # path for their single-pass equivalents (same slice plan, same
-        # staged bytes, see the two docstrings below). Default off: the
-        # GPU timing gate in tools/gb10_q4kv_parity.py must run first.
+        # VLLM_EXL3_Q4KV_PREFILL_FAST (default ON) swaps both halves of
+        # the staging path for their single-pass equivalents (same slice
+        # plan, same staged bytes, see the two docstrings below). ``=0``
+        # is the explicit opt-out and keeps the milestone-1 path byte for
+        # byte; GB10 validation of the fast path (staged bytes, unit 7
+        # timing, 32K serve needles) is in CHECKIN-Q4KV-1.md.
         fast = _prefill_fast_enabled()
         if fast:
             plan = ref.plan_prefill_slices_fast

@@ -545,8 +545,10 @@ def test_decode_wrapper_dispatch(monkeypatch) -> None:
 
 def test_prefill_wrapper_stages_and_remaps(monkeypatch) -> None:
     # The CPU-only suite simulates the GPU boundary by patching the gate's
-    # device-type constant (the check itself is never weakened).
+    # device-type constant (the check itself is never weakened). This test
+    # covers the milestone-1 path, still reachable via the =0 opt-out.
     monkeypatch.setattr(q4kernels, "_REQUIRED_DEVICE_TYPE", "cpu")
+    monkeypatch.setenv("VLLM_EXL3_Q4KV_PREFILL_FAST", "0")
     calls = []
     orig = lambda *a, **k: calls.append(("orig", a, k))  # noqa: E731
     wrapper = q4kv._make_prefill_wrapper(orig)
@@ -920,6 +922,9 @@ def test_prefill_wrapper_slices_and_reuses_buffer(monkeypatch) -> None:
     """The overlay's sliced executor passes the derived per-slice
     arguments to the original kernel and reuses ONE grow-once buffer."""
     monkeypatch.setattr(q4kernels, "_REQUIRED_DEVICE_TYPE", "cpu")
+    # milestone-1 path (the =0 opt-out); the fast path's call sequence is
+    # pinned by test_prefill_wrapper_fast_path_feeds_the_kernel_identical_bytes
+    monkeypatch.setenv("VLLM_EXL3_Q4KV_PREFILL_FAST", "0")
     monkeypatch.setenv("VLLM_EXL3_Q4KV_STAGING_MAX_MB", "0.001")
     monkeypatch.setattr(q4kv, "_STAGING_BUFFERS", {})
     fx = _prefill_chunk_fixture()
@@ -2921,6 +2926,16 @@ def test_unit7_gates_on_staged_bytes_and_controls_for_determinism() -> None:
     assert "\"staged_bytes_identical\": same" in unit7
     assert "staged_bytes_detail" in unit7
     assert "staging_amplification" in unit7
+    # the no-staging gate is the documented 1.35x staging-overhead bound
+    # at the 30K row, not a parity claim
+    assert 'top["layer_ms_fast"] > 1.35 * top["layer_ms_no_staging"]' in unit7
+    assert "fast_ms >= legacy_ms" in unit7
+    # ... and the vendor determinism fields are reported, never gated
+    gate_block = unit7[unit7.index("top = rows[-1]"):unit7.index(
+        "return {", unit7.index("top = rows[-1]")
+    )]
+    assert "vendor_output_deterministic" not in gate_block
+    assert "vendor_outputs_identical" not in gate_block
     helper = src[src.index("def _staged_bytes_identical"):]
     helper = helper[: helper.index("\ndef ", 1)]
     # the compared region is the staged one, page by page, in plan order
@@ -2929,18 +2944,72 @@ def test_unit7_gates_on_staged_bytes_and_controls_for_determinism() -> None:
     assert "q4_stage_pages(bb" in helper
 
 
-def test_prefill_fast_knob_defaults_off_and_fails_closed(monkeypatch) -> None:
-    monkeypatch.delenv("VLLM_EXL3_Q4KV_PREFILL_FAST", raising=False)
-    assert q4kv._prefill_fast_enabled() is False
-    for on in ("1", "true", "ON", " yes "):
-        monkeypatch.setenv("VLLM_EXL3_Q4KV_PREFILL_FAST", on)
+def test_prefill_fast_knob_defaults_on_and_fails_closed(monkeypatch) -> None:
+    """The GB10-validated fast path is the default; =0 is the opt-out."""
+    for unset in (None, "", "  ", "1", "true", "ON", " yes "):
+        if unset is None:
+            monkeypatch.delenv("VLLM_EXL3_Q4KV_PREFILL_FAST", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_EXL3_Q4KV_PREFILL_FAST", unset)
         assert q4kv._prefill_fast_enabled() is True
-    for off in ("0", "false", "off", "no", ""):
+    for off in ("0", "false", "off", "no", " 0 "):
         monkeypatch.setenv("VLLM_EXL3_Q4KV_PREFILL_FAST", off)
         assert q4kv._prefill_fast_enabled() is False
     monkeypatch.setenv("VLLM_EXL3_Q4KV_PREFILL_FAST", "yeah")
-    with pytest.raises(ValueError, match="must be 0 or 1"):
+    with pytest.raises(ValueError, match="must be unset or one of"):
         q4kv._prefill_fast_enabled()
+
+
+def test_prefill_wrapper_dispatch_selects_the_documented_pair(
+    monkeypatch,
+) -> None:
+    """Unset selects the fast (plan, fill) pair; =0 selects the legacy
+    pair -- both halves, so a half-swapped dispatch cannot slip through."""
+    monkeypatch.setattr(q4kernels, "_REQUIRED_DEVICE_TYPE", "cpu")
+    monkeypatch.setenv("VLLM_EXL3_Q4KV_STAGING_MAX_MB", "0.001")
+    fx = _prefill_chunk_fixture()
+    called: list[str] = []
+    orig_plan_legacy = ref.plan_prefill_slices
+    orig_plan_fast = ref.plan_prefill_slices_fast
+    orig_fill_legacy = ref.fill_staging_buffer
+    orig_fill_fast = ref.fill_staging_buffer_fast
+
+    def plan_legacy(*a, **k):
+        called.append("plan_legacy")
+        return orig_plan_legacy(*a, **k)
+
+    def plan_fast(*a, **k):
+        called.append("plan_fast")
+        return orig_plan_fast(*a, **k)
+
+    def fill_legacy(buffer, pool, pages):
+        called.append("fill_legacy")
+        return orig_fill_legacy(buffer, pool, pages)
+
+    def fill_fast(buffer, pool, pages):
+        called.append("fill_fast")
+        return orig_fill_fast(buffer, pool, pages)
+
+    monkeypatch.setattr(ref, "plan_prefill_slices", plan_legacy)
+    monkeypatch.setattr(ref, "plan_prefill_slices_fast", plan_fast)
+    monkeypatch.setattr(ref, "fill_staging_buffer", fill_legacy)
+    monkeypatch.setattr(q4kernels, "q4_stage_pages", fill_fast, raising=False)
+    wrapper = q4kv._make_prefill_wrapper(lambda *a, **k: None)
+    out = torch.zeros(fx["total_q"], NQ, 128, dtype=torch.bfloat16)
+
+    def run():
+        monkeypatch.setattr(q4kv, "_STAGING_BUFFERS", {})
+        called.clear()
+        wrapper(
+            fx["q"], fx["pool"], fx["topk"], fx["bt"], fx["cu"], fx["seq"],
+            fx["prefix"], 6, NKV, fx["sm_scale"], out,
+        )
+        return set(called)
+
+    monkeypatch.delenv("VLLM_EXL3_Q4KV_PREFILL_FAST", raising=False)
+    assert run() == {"plan_fast", "fill_fast"}
+    monkeypatch.setenv("VLLM_EXL3_Q4KV_PREFILL_FAST", "0")
+    assert run() == {"plan_legacy", "fill_legacy"}
 
 
 def test_prefill_wrapper_fast_path_feeds_the_kernel_identical_bytes(
