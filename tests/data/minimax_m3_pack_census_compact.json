@@ -1,0 +1,669 @@
+{
+ "_comment": "Compact per-family digest of the MiniMax-M3.1-Flash EXL3 SAGE pack header census (vcruz305/MiniMax-M3.1-Flash-EXL3-SAGE-2.15bpw, rev e2682d0; the repo history was squashed 2026-10-23 and all 16 shard LFS sha256 oids are IDENTICAL across the squash, so this census is exact at the new revision). N = layer or expert index. Generated from the parent's census_tensors.json (89952 tensors); counts and shapes are exact.",
+ "_total_tensors": 89952,
+ "families": {
+  "language_model.lm_head.mul1": [
+   {
+    "count": 1,
+    "dtype": "I32",
+    "shape": []
+   }
+  ],
+  "language_model.lm_head.suh": [
+   {
+    "count": 1,
+    "dtype": "F16",
+    "shape": [
+     6144
+    ]
+   }
+  ],
+  "language_model.lm_head.svh": [
+   {
+    "count": 1,
+    "dtype": "F16",
+    "shape": [
+     200064
+    ]
+   }
+  ],
+  "language_model.lm_head.trellis": [
+   {
+    "count": 1,
+    "dtype": "I16",
+    "shape": [
+     384,
+     12504,
+     96
+    ]
+   }
+  ],
+  "language_model.model.embed_tokens.weight": [
+   {
+    "count": 1,
+    "dtype": "BF16",
+    "shape": [
+     200064,
+     6144
+    ]
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.e_score_correction_bias": [
+   {
+    "count": 57,
+    "dtype": "F32",
+    "shape": [
+     128
+    ]
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.experts.N.w1.mul1": [
+   {
+    "count": 7296,
+    "dtype": "I32",
+    "shape": []
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.experts.N.w1.suh": [
+   {
+    "count": 7296,
+    "dtype": "F16",
+    "shape": [
+     6144
+    ]
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.experts.N.w1.svh": [
+   {
+    "count": 7296,
+    "dtype": "F16",
+    "shape": [
+     3072
+    ]
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.experts.N.w1.trellis": [
+   {
+    "count": 7176,
+    "dtype": "I16",
+    "shape": [
+     384,
+     192,
+     32
+    ]
+   },
+   {
+    "count": 120,
+    "dtype": "I16",
+    "shape": [
+     384,
+     192,
+     48
+    ]
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.experts.N.w2.mul1": [
+   {
+    "count": 7296,
+    "dtype": "I32",
+    "shape": []
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.experts.N.w2.suh": [
+   {
+    "count": 7296,
+    "dtype": "F16",
+    "shape": [
+     3072
+    ]
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.experts.N.w2.svh": [
+   {
+    "count": 7296,
+    "dtype": "F16",
+    "shape": [
+     6144
+    ]
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.experts.N.w2.trellis": [
+   {
+    "count": 6096,
+    "dtype": "I16",
+    "shape": [
+     192,
+     384,
+     32
+    ]
+   },
+   {
+    "count": 1200,
+    "dtype": "I16",
+    "shape": [
+     192,
+     384,
+     48
+    ]
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.experts.N.w3.mul1": [
+   {
+    "count": 7296,
+    "dtype": "I32",
+    "shape": []
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.experts.N.w3.suh": [
+   {
+    "count": 7296,
+    "dtype": "F16",
+    "shape": [
+     6144
+    ]
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.experts.N.w3.svh": [
+   {
+    "count": 7296,
+    "dtype": "F16",
+    "shape": [
+     3072
+    ]
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.experts.N.w3.trellis": [
+   {
+    "count": 7176,
+    "dtype": "I16",
+    "shape": [
+     384,
+     192,
+     32
+    ]
+   },
+   {
+    "count": 120,
+    "dtype": "I16",
+    "shape": [
+     384,
+     192,
+     48
+    ]
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.gate.weight": [
+   {
+    "count": 57,
+    "dtype": "F32",
+    "shape": [
+     128,
+     6144
+    ]
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.shared_experts.down_proj.mul1": [
+   {
+    "count": 57,
+    "dtype": "I32",
+    "shape": []
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.shared_experts.down_proj.suh": [
+   {
+    "count": 57,
+    "dtype": "F16",
+    "shape": [
+     3072
+    ]
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.shared_experts.down_proj.svh": [
+   {
+    "count": 57,
+    "dtype": "F16",
+    "shape": [
+     6144
+    ]
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.shared_experts.down_proj.trellis": [
+   {
+    "count": 57,
+    "dtype": "I16",
+    "shape": [
+     192,
+     384,
+     80
+    ]
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.shared_experts.gate_proj.mul1": [
+   {
+    "count": 57,
+    "dtype": "I32",
+    "shape": []
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.shared_experts.gate_proj.suh": [
+   {
+    "count": 57,
+    "dtype": "F16",
+    "shape": [
+     6144
+    ]
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.shared_experts.gate_proj.svh": [
+   {
+    "count": 57,
+    "dtype": "F16",
+    "shape": [
+     3072
+    ]
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.shared_experts.gate_proj.trellis": [
+   {
+    "count": 57,
+    "dtype": "I16",
+    "shape": [
+     384,
+     192,
+     64
+    ]
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.shared_experts.up_proj.mul1": [
+   {
+    "count": 57,
+    "dtype": "I32",
+    "shape": []
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.shared_experts.up_proj.suh": [
+   {
+    "count": 57,
+    "dtype": "F16",
+    "shape": [
+     6144
+    ]
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.shared_experts.up_proj.svh": [
+   {
+    "count": 57,
+    "dtype": "F16",
+    "shape": [
+     3072
+    ]
+   }
+  ],
+  "language_model.model.layers.N.block_sparse_moe.shared_experts.up_proj.trellis": [
+   {
+    "count": 57,
+    "dtype": "I16",
+    "shape": [
+     384,
+     192,
+     64
+    ]
+   }
+  ],
+  "language_model.model.layers.N.input_layernorm.weight": [
+   {
+    "count": 60,
+    "dtype": "BF16",
+    "shape": [
+     6144
+    ]
+   }
+  ],
+  "language_model.model.layers.N.mlp.down_proj.mul1": [
+   {
+    "count": 3,
+    "dtype": "I32",
+    "shape": []
+   }
+  ],
+  "language_model.model.layers.N.mlp.down_proj.suh": [
+   {
+    "count": 3,
+    "dtype": "F16",
+    "shape": [
+     12288
+    ]
+   }
+  ],
+  "language_model.model.layers.N.mlp.down_proj.svh": [
+   {
+    "count": 3,
+    "dtype": "F16",
+    "shape": [
+     6144
+    ]
+   }
+  ],
+  "language_model.model.layers.N.mlp.down_proj.trellis": [
+   {
+    "count": 3,
+    "dtype": "I16",
+    "shape": [
+     768,
+     384,
+     80
+    ]
+   }
+  ],
+  "language_model.model.layers.N.mlp.gate_proj.mul1": [
+   {
+    "count": 3,
+    "dtype": "I32",
+    "shape": []
+   }
+  ],
+  "language_model.model.layers.N.mlp.gate_proj.suh": [
+   {
+    "count": 3,
+    "dtype": "F16",
+    "shape": [
+     6144
+    ]
+   }
+  ],
+  "language_model.model.layers.N.mlp.gate_proj.svh": [
+   {
+    "count": 3,
+    "dtype": "F16",
+    "shape": [
+     12288
+    ]
+   }
+  ],
+  "language_model.model.layers.N.mlp.gate_proj.trellis": [
+   {
+    "count": 3,
+    "dtype": "I16",
+    "shape": [
+     384,
+     768,
+     64
+    ]
+   }
+  ],
+  "language_model.model.layers.N.mlp.up_proj.mul1": [
+   {
+    "count": 3,
+    "dtype": "I32",
+    "shape": []
+   }
+  ],
+  "language_model.model.layers.N.mlp.up_proj.suh": [
+   {
+    "count": 3,
+    "dtype": "F16",
+    "shape": [
+     6144
+    ]
+   }
+  ],
+  "language_model.model.layers.N.mlp.up_proj.svh": [
+   {
+    "count": 3,
+    "dtype": "F16",
+    "shape": [
+     12288
+    ]
+   }
+  ],
+  "language_model.model.layers.N.mlp.up_proj.trellis": [
+   {
+    "count": 3,
+    "dtype": "I16",
+    "shape": [
+     384,
+     768,
+     64
+    ]
+   }
+  ],
+  "language_model.model.layers.N.post_attention_layernorm.weight": [
+   {
+    "count": 60,
+    "dtype": "BF16",
+    "shape": [
+     6144
+    ]
+   }
+  ],
+  "language_model.model.layers.N.self_attn.index_k_norm.weight": [
+   {
+    "count": 60,
+    "dtype": "BF16",
+    "shape": [
+     128
+    ]
+   }
+  ],
+  "language_model.model.layers.N.self_attn.index_k_proj.weight": [
+   {
+    "count": 60,
+    "dtype": "F8_E4M3",
+    "shape": [
+     128,
+     6144
+    ]
+   }
+  ],
+  "language_model.model.layers.N.self_attn.index_k_proj.weight_scale_inv": [
+   {
+    "count": 60,
+    "dtype": "U8",
+    "shape": [
+     128,
+     192
+    ]
+   }
+  ],
+  "language_model.model.layers.N.self_attn.index_q_norm.weight": [
+   {
+    "count": 60,
+    "dtype": "BF16",
+    "shape": [
+     128
+    ]
+   }
+  ],
+  "language_model.model.layers.N.self_attn.index_q_proj.weight": [
+   {
+    "count": 60,
+    "dtype": "F8_E4M3",
+    "shape": [
+     512,
+     6144
+    ]
+   }
+  ],
+  "language_model.model.layers.N.self_attn.index_q_proj.weight_scale_inv": [
+   {
+    "count": 60,
+    "dtype": "U8",
+    "shape": [
+     512,
+     192
+    ]
+   }
+  ],
+  "language_model.model.layers.N.self_attn.k_norm.weight": [
+   {
+    "count": 60,
+    "dtype": "BF16",
+    "shape": [
+     128
+    ]
+   }
+  ],
+  "language_model.model.layers.N.self_attn.k_proj.mul1": [
+   {
+    "count": 60,
+    "dtype": "I32",
+    "shape": []
+   }
+  ],
+  "language_model.model.layers.N.self_attn.k_proj.suh": [
+   {
+    "count": 60,
+    "dtype": "F16",
+    "shape": [
+     6144
+    ]
+   }
+  ],
+  "language_model.model.layers.N.self_attn.k_proj.svh": [
+   {
+    "count": 60,
+    "dtype": "F16",
+    "shape": [
+     512
+    ]
+   }
+  ],
+  "language_model.model.layers.N.self_attn.k_proj.trellis": [
+   {
+    "count": 60,
+    "dtype": "I16",
+    "shape": [
+     384,
+     32,
+     80
+    ]
+   }
+  ],
+  "language_model.model.layers.N.self_attn.o_proj.mul1": [
+   {
+    "count": 60,
+    "dtype": "I32",
+    "shape": []
+   }
+  ],
+  "language_model.model.layers.N.self_attn.o_proj.suh": [
+   {
+    "count": 60,
+    "dtype": "F16",
+    "shape": [
+     8192
+    ]
+   }
+  ],
+  "language_model.model.layers.N.self_attn.o_proj.svh": [
+   {
+    "count": 60,
+    "dtype": "F16",
+    "shape": [
+     6144
+    ]
+   }
+  ],
+  "language_model.model.layers.N.self_attn.o_proj.trellis": [
+   {
+    "count": 60,
+    "dtype": "I16",
+    "shape": [
+     512,
+     384,
+     80
+    ]
+   }
+  ],
+  "language_model.model.layers.N.self_attn.q_norm.weight": [
+   {
+    "count": 60,
+    "dtype": "BF16",
+    "shape": [
+     128
+    ]
+   }
+  ],
+  "language_model.model.layers.N.self_attn.q_proj.mul1": [
+   {
+    "count": 60,
+    "dtype": "I32",
+    "shape": []
+   }
+  ],
+  "language_model.model.layers.N.self_attn.q_proj.suh": [
+   {
+    "count": 60,
+    "dtype": "F16",
+    "shape": [
+     6144
+    ]
+   }
+  ],
+  "language_model.model.layers.N.self_attn.q_proj.svh": [
+   {
+    "count": 60,
+    "dtype": "F16",
+    "shape": [
+     8192
+    ]
+   }
+  ],
+  "language_model.model.layers.N.self_attn.q_proj.trellis": [
+   {
+    "count": 60,
+    "dtype": "I16",
+    "shape": [
+     384,
+     512,
+     64
+    ]
+   }
+  ],
+  "language_model.model.layers.N.self_attn.v_proj.mul1": [
+   {
+    "count": 60,
+    "dtype": "I32",
+    "shape": []
+   }
+  ],
+  "language_model.model.layers.N.self_attn.v_proj.suh": [
+   {
+    "count": 60,
+    "dtype": "F16",
+    "shape": [
+     6144
+    ]
+   }
+  ],
+  "language_model.model.layers.N.self_attn.v_proj.svh": [
+   {
+    "count": 60,
+    "dtype": "F16",
+    "shape": [
+     512
+    ]
+   }
+  ],
+  "language_model.model.layers.N.self_attn.v_proj.trellis": [
+   {
+    "count": 60,
+    "dtype": "I16",
+    "shape": [
+     384,
+     32,
+     80
+    ]
+   }
+  ],
+  "language_model.model.norm.weight": [
+   {
+    "count": 1,
+    "dtype": "BF16",
+    "shape": [
+     6144
+    ]
+   }
+  ]
+ }
+}

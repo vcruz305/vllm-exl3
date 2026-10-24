@@ -1,0 +1,142 @@
+{
+ "_comment": "Pinned census digest for the GB10 parity tool Case E (layer-0 fused qkv + indexer). Provenance: Hub repo vcruz305/MiniMax-M3.1-Flash-EXL3-SAGE-2.15bpw at revision e2682d076e220e71e2a7ea7b9885e70390c27698 (the repo history was squashed on 2026-10-23; the pre-squash revision 687cbff2c210b7514d18c5f6a4d1db3417b316c4 now returns 404). The shard LFS identity below is IDENTICAL in the Hub tree listings of both revisions (verified from the tree API listings of 687cbff and e2682d0), so the shard bytes -- and every offset cross-checked live against the shard header -- are unchanged.",
+ "_revision": "e2682d076e220e71e2a7ea7b9885e70390c27698",
+ "_shard_lfs": {
+  "model-00001-of-00016.safetensors": {
+   "size": 7580232304,
+   "sha256": "430b5d545955d2dc4d42ba7e0129c691a0a27673456ec5e694d047758674d3f3"
+  }
+ },
+ "language_model.model.layers.0.self_attn.index_k_proj.weight": {
+  "bytes": 786432,
+  "dtype": "F8_E4M3",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   128,
+   6144
+  ]
+ },
+ "language_model.model.layers.0.self_attn.index_k_proj.weight_scale_inv": {
+  "bytes": 24576,
+  "dtype": "U8",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   128,
+   192
+  ]
+ },
+ "language_model.model.layers.0.self_attn.index_q_proj.weight": {
+  "bytes": 3145728,
+  "dtype": "F8_E4M3",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   512,
+   6144
+  ]
+ },
+ "language_model.model.layers.0.self_attn.index_q_proj.weight_scale_inv": {
+  "bytes": 98304,
+  "dtype": "U8",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   512,
+   192
+  ]
+ },
+ "language_model.model.layers.0.self_attn.k_proj.mul1": {
+  "bytes": 4,
+  "dtype": "I32",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": []
+ },
+ "language_model.model.layers.0.self_attn.k_proj.suh": {
+  "bytes": 12288,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   6144
+  ]
+ },
+ "language_model.model.layers.0.self_attn.k_proj.svh": {
+  "bytes": 1024,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   512
+  ]
+ },
+ "language_model.model.layers.0.self_attn.k_proj.trellis": {
+  "bytes": 1966080,
+  "dtype": "I16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   384,
+   32,
+   80
+  ]
+ },
+ "language_model.model.layers.0.self_attn.q_proj.mul1": {
+  "bytes": 4,
+  "dtype": "I32",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": []
+ },
+ "language_model.model.layers.0.self_attn.q_proj.suh": {
+  "bytes": 12288,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   6144
+  ]
+ },
+ "language_model.model.layers.0.self_attn.q_proj.svh": {
+  "bytes": 16384,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   8192
+  ]
+ },
+ "language_model.model.layers.0.self_attn.q_proj.trellis": {
+  "bytes": 25165824,
+  "dtype": "I16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   384,
+   512,
+   64
+  ]
+ },
+ "language_model.model.layers.0.self_attn.v_proj.mul1": {
+  "bytes": 4,
+  "dtype": "I32",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": []
+ },
+ "language_model.model.layers.0.self_attn.v_proj.suh": {
+  "bytes": 12288,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   6144
+  ]
+ },
+ "language_model.model.layers.0.self_attn.v_proj.svh": {
+  "bytes": 1024,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   512
+  ]
+ },
+ "language_model.model.layers.0.self_attn.v_proj.trellis": {
+  "bytes": 1966080,
+  "dtype": "I16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   384,
+   32,
+   80
+  ]
+ }
+}

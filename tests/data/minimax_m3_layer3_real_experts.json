@@ -1,0 +1,298 @@
+{
+ "_comment": "Pinned census digest for the GB10 parity tool Case F (layer-3 routed experts). Provenance: Hub repo vcruz305/MiniMax-M3.1-Flash-EXL3-SAGE-2.15bpw at revision e2682d076e220e71e2a7ea7b9885e70390c27698 (the repo history was squashed on 2026-10-23; the pre-squash revision 687cbff2c210b7514d18c5f6a4d1db3417b316c4 now returns 404). The shard LFS identity below is IDENTICAL in the Hub tree listings of both revisions (verified from the tree API listings of 687cbff and e2682d0), so the shard bytes -- and every offset cross-checked live against the shard header -- are unchanged.",
+ "_revision": "e2682d076e220e71e2a7ea7b9885e70390c27698",
+ "_shard_lfs": {
+  "model-00001-of-00016.safetensors": {
+   "size": 7580232304,
+   "sha256": "430b5d545955d2dc4d42ba7e0129c691a0a27673456ec5e694d047758674d3f3"
+  }
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.0.w1.mul1": {
+  "bytes": 4,
+  "dtype": "I32",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": []
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.0.w1.suh": {
+  "bytes": 12288,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   6144
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.0.w1.svh": {
+  "bytes": 6144,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   3072
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.0.w1.trellis": {
+  "bytes": 4718592,
+  "dtype": "I16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   384,
+   192,
+   32
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.0.w2.mul1": {
+  "bytes": 4,
+  "dtype": "I32",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": []
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.0.w2.suh": {
+  "bytes": 6144,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   3072
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.0.w2.svh": {
+  "bytes": 12288,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   6144
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.0.w2.trellis": {
+  "bytes": 7077888,
+  "dtype": "I16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   192,
+   384,
+   48
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.0.w3.mul1": {
+  "bytes": 4,
+  "dtype": "I32",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": []
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.0.w3.suh": {
+  "bytes": 12288,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   6144
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.0.w3.svh": {
+  "bytes": 6144,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   3072
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.0.w3.trellis": {
+  "bytes": 4718592,
+  "dtype": "I16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   384,
+   192,
+   32
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.1.w1.mul1": {
+  "bytes": 4,
+  "dtype": "I32",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": []
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.1.w1.suh": {
+  "bytes": 12288,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   6144
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.1.w1.svh": {
+  "bytes": 6144,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   3072
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.1.w1.trellis": {
+  "bytes": 7077888,
+  "dtype": "I16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   384,
+   192,
+   48
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.1.w2.mul1": {
+  "bytes": 4,
+  "dtype": "I32",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": []
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.1.w2.suh": {
+  "bytes": 6144,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   3072
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.1.w2.svh": {
+  "bytes": 12288,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   6144
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.1.w2.trellis": {
+  "bytes": 7077888,
+  "dtype": "I16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   192,
+   384,
+   48
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.1.w3.mul1": {
+  "bytes": 4,
+  "dtype": "I32",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": []
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.1.w3.suh": {
+  "bytes": 12288,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   6144
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.1.w3.svh": {
+  "bytes": 6144,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   3072
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.1.w3.trellis": {
+  "bytes": 7077888,
+  "dtype": "I16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   384,
+   192,
+   48
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.2.w1.mul1": {
+  "bytes": 4,
+  "dtype": "I32",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": []
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.2.w1.suh": {
+  "bytes": 12288,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   6144
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.2.w1.svh": {
+  "bytes": 6144,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   3072
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.2.w1.trellis": {
+  "bytes": 4718592,
+  "dtype": "I16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   384,
+   192,
+   32
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.2.w2.mul1": {
+  "bytes": 4,
+  "dtype": "I32",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": []
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.2.w2.suh": {
+  "bytes": 6144,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   3072
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.2.w2.svh": {
+  "bytes": 12288,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   6144
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.2.w2.trellis": {
+  "bytes": 4718592,
+  "dtype": "I16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   192,
+   384,
+   32
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.2.w3.mul1": {
+  "bytes": 4,
+  "dtype": "I32",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": []
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.2.w3.suh": {
+  "bytes": 12288,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   6144
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.2.w3.svh": {
+  "bytes": 6144,
+  "dtype": "F16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   3072
+  ]
+ },
+ "language_model.model.layers.3.block_sparse_moe.experts.2.w3.trellis": {
+  "bytes": 4718592,
+  "dtype": "I16",
+  "file": "model-00001-of-00016.safetensors",
+  "shape": [
+   384,
+   192,
+   32
+  ]
+ }
+}

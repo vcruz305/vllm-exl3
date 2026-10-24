@@ -53,8 +53,12 @@ def _mtp_layer_offset(model_dir: str) -> int | None:
     return None
 
 
+# Checkpoint expert-projection families: the historical layout is
+# layers.N.ffn.experts (DSV4.1); MiniMax-M3 stores its routed experts under
+# layers.N.block_sparse_moe.experts. Both must resolve for the
+# routing-histogram cold-set path (--select-npz) and the byte scan.
 _TRELLIS_RE = re.compile(
-    r"(?:^|\.)((?:layers|mtp)\.\d+)\.ffn\.experts\.(\d+)\.(w1|w2|w3)\.trellis$"
+    r"(?:^|\.)((?:layers|mtp)\.\d+)\.(ffn|block_sparse_moe)\.experts\.(\d+)\.(w1|w2|w3)\.trellis$"
 )
 
 
@@ -73,8 +77,9 @@ def _scan_expert_bytes(model_dir: str, weight_map: dict[str, str]):
         n, hdr = header(os.path.join(model_dir, shard))
         for k in keys:
             m = _TRELLIS_RE.search(k)
+            assert m is not None, k
             b, e = hdr[k]["data_offsets"]
-            ent = out.setdefault((m.group(1), int(m.group(2))), [0, []])
+            ent = out.setdefault((m.group(1), int(m.group(3))), [0, []])
             ent[0] += e - b
             ent[1].append(k)
     return {k: (v[0], v[1]) for k, v in out.items()}
@@ -241,24 +246,38 @@ def main() -> int:
     # pack has it at 8 mod 16 and the ATS view rejects that).
     embed_key = None
     if a.embed:
-        if "embed.weight" not in weight_map:
-            print("--embed: embed.weight not in the index", file=sys.stderr)
+        from vllm_exl3.ats_alias import MINIMAX_EMBED_KEY
+
+        if "embed.weight" in weight_map:
+            embed_key = "embed.weight"
+        elif MINIMAX_EMBED_KEY in weight_map:
+            # MiniMax-M3 VL wrapper: the text embedding lives under its
+            # language_model.model.* checkpoint name.
+            embed_key = MINIMAX_EMBED_KEY
+        else:
+            print("--embed: no embedding tensor found in the index", file=sys.stderr)
             return 2
-        embed_key = "embed.weight"
 
     if not prefixes and embed_key is None and sel is None:
         print("nothing selected", file=sys.stderr)
         return 2
 
     if sel is not None:
+        from vllm_exl3.ats_alias import EXPERT_CKPT_PREFIXES
+
         keys = []
         missing = []
         for lay, eids in sel.items():
             for eid in eids:
                 for p in _PROJ:
-                    k = f"{lay}.ffn.experts.{eid}.{p}.trellis"
-                    if k not in weight_map:
-                        missing.append(k)
+                    k = None
+                    for fam in EXPERT_CKPT_PREFIXES:
+                        cand = f"{lay}.{fam}.{eid}.{p}.trellis"
+                        if cand in weight_map:
+                            k = cand
+                            break
+                    if k is None:
+                        missing.append(f"{lay}.ffn.experts.{eid}.{p}.trellis")
                     else:
                         keys.append(k)
         if missing:

@@ -81,7 +81,10 @@ except ImportError:
         pass
 
     class FusedMoEMethodBase:  # type: ignore[no-redef]
-        pass
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            # Real base: FusedMoEMethodBase.__init__(self, moe) sets self.moe;
+            # the CPU test shim accepts and drops the argument.
+            pass
 
     class LinearBase:  # type: ignore[no-redef]
         pass
@@ -113,7 +116,24 @@ MUL1_MULTIPLIER = 0x83DCD12D
 MUL1_MARKER_SIGNED_INT32 = -2082680531
 EXL3_SUFFIXES = ("trellis", "suh", "svh", "mcg", "mul1")
 SWIGLU_LIMIT_DEFAULT = 10.0
-TEMP_ROWS_FUSED = 2048
+def _temp_rows_fused() -> int:
+    """Row capacity of the shared fused-MoE temp buffers.
+
+    The buffers are [concurrency, rows, hidden|intermediate] fp16 x4 (432 MiB
+    at concurrency 6, rows 2048, hidden 6144, intermediate 3072). One expert
+    never sees more rows than tokens in a step, so rows = max_num_batched_tokens
+    loses nothing; smaller values are still exact (the caller slices any step
+    whose busiest expert exceeds the capacity).
+    """
+    raw = os.environ.get("VLLM_EXL3_MOE_TEMP_ROWS", "")
+    try:
+        rows = int(raw) if raw else 2048
+    except ValueError:
+        rows = 2048
+    return max(256, ((rows + 15) // 16) * 16)
+
+
+TEMP_ROWS_FUSED = _temp_rows_fused()
 _COOP = os.environ.get("VLLM_EXL3_COOP", "1") == "1"
 _COOP_SLOTS_MAX = 256
 _COOP_ROWS_MAX = 32
@@ -126,6 +146,77 @@ MOE_ACT_SILU = 0
 # lane is set to relu(u) so the gate multiply yields relu(u) * u = relu^2(u)
 # exactly (exllamav3 hadamard_inner.cuh ACT_RELU2_NOGATE).
 MOE_ACT_RELU2_NOGATE = 2
+# Clamped SwiGLU-OAI (gpt-oss / MiniMax-M3): exllamav3's coop kernel activation
+# index 3 (exllamav3_ext MOE_COOP_ACT_SILU_OAI,
+# exl3_moe_coop.cuh:15). The kernel hardcodes alpha = 1.702 and the (up + 1)
+# beta = 1.0 term inside act_oai_swiglu (exl3_moe_coop_kernel.cuh:98-107); the
+# only runtime parameter is the symmetric clamp limit.
+MOE_ACT_SWIGLU_OAI = 3
+
+# Checkpoint expert-directory families the prescan/per-expert loader may see.
+# Historical layout is layers.N.ffn.experts; NemotronH uses ...mixer.experts,
+# Qwen3.5/Ornith ...mlp.experts, MiniMax-M3 ...block_sparse_moe.experts.
+EXPERT_CKPT_PREFIX_FAMILIES = (
+    "ffn.experts",
+    "mixer.experts",
+    "mlp.experts",
+    "block_sparse_moe.experts",
+)
+
+# MiniMax-M3 model constants (transformers_utils/configs/minimax_m3.py):
+# swiglu_alpha 1.702, swiglu_limit 7.0; swiglu_beta defaults to 1.0 and the
+# pack omits it. These are FALLBACKS ONLY (with a logged warning) when the
+# layer does not carry its own attributes; the layer/config values win.
+MINIMAX_SWIGLU_ALPHA_DEFAULT = 1.702
+MINIMAX_SWIGLU_LIMIT_DEFAULT = 7.0
+
+# MSA lightning-indexer shards fused into MinimaxM3QKVParallelLinearWithIndexer
+# (vllm linear.py:1365; output layout [q | k | v | index_q | index_k]). These
+# two shards are MXFP8 (F8_E4M3 + E8M0 block-32 scales) in the pack and are
+# dequantized to a BF16 side weight at load; q/k/v stay EXL3 trellis.
+MINIMAX_INDEXER_SHARDS = ("index_q", "index_k")
+MINIMAX_MXFP8_BLOCK = 32
+
+# EXL3-covered non-routed module suffixes for the MiniMax-M3 pack, derived from
+# the architecture (the pack's quantization_config carries no ledger). The
+# integer is the config-level K fallback; the per-shard K is read from each
+# shard's own trellis at load. Indexer/router/embed/norm families are
+# deliberately absent: they are not EXL3.
+MINIMAX_NON_ROUTED_FAMILIES = {
+    "self_attn.qkv_proj": 5,
+    "self_attn.o_proj": 5,
+    "mlp.gate_proj": 4,
+    "mlp.up_proj": 4,
+    "mlp.down_proj": 5,
+    "block_sparse_moe.shared_experts.gate_proj": 4,
+    "block_sparse_moe.shared_experts.up_proj": 4,
+    "block_sparse_moe.shared_experts.down_proj": 5,
+    "lm_head": 6,
+}
+
+# vLLM builds the MiniMax-M3 dense MLP and shared-expert MLP with one fused
+# MergedColumnParallelLinear named ``gate_up_proj`` (stacked_params_mapping
+# routes the pack's gate_proj -> shard 0 and up_proj -> shard 1), so
+# get_quant_method is queried with the FUSED prefix. The coverage families
+# above are pack-side (unfused) names; these fused names must be covered too,
+# otherwise the layer falls back to UnquantizedLinearMethod, the model's
+# load_weights drops the gate/up trellis tensors ("name not in params_dict:
+# continue") and the MLP runs on an uninitialized BF16 weight.
+MINIMAX_FUSED_LINEAR_MODULES = {
+    "mlp.gate_up_proj": ("mlp.gate_proj", "mlp.up_proj"),
+    "block_sparse_moe.shared_experts.gate_up_proj": (
+        "block_sparse_moe.shared_experts.gate_proj",
+        "block_sparse_moe.shared_experts.up_proj",
+    ),
+}
+
+# Process-wide marker set by Exl3Config.override_quantization_method when vLLM
+# hands it a MiniMax-M3 hf_config. vLLM resolves override_quantization_method
+# at config time (config/model.py:1418) and Exl3Config.from_config at model
+# load time (model_loader/weight_utils.py:236), so the marker always precedes
+# from_config in the same process.
+_MINIMAX_M3_PACK_REQUESTED = False
+
 # Shared fused scratch: decode is sequential across layers.
 _FUSED_TEMP_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 _COOP_TEMP_CACHE: dict[tuple, Any] = {}
@@ -712,7 +803,7 @@ def _try_prescan_trellis_shapes(
     # NemotronH packs store experts under ...mixer.experts (up/down only,
     # gateless relu2); Qwen3.5/Ornith uses ...mlp.experts; historical layout is ...ffn.experts.
     base_name = layer_name
-    for cand in ("ffn.experts", "mixer.experts", "mlp.experts"):
+    for cand in EXPERT_CKPT_PREFIX_FAMILIES:
         if cand in base_name:
             prefix = f"layers.{layer_id}.{cand}."
             break
@@ -741,7 +832,9 @@ def _try_prescan_trellis_shapes(
         "up": {},
         "down": {},
     }
-    raw_prefixes = ("", "backbone.") if "mtp.layers." in base_name else ("", "backbone.", "model.language_model.", "model.")
+    # MiniMax-M3's text stack lives under language_model.model.* in the VL
+    # wrapper's checkpoint; the mtp.* entries keep their historical prefixes.
+    raw_prefixes = ("", "backbone.", "model.language_model.", "model.", "language_model.model.") if "mtp.layers." in base_name or "block_sparse_moe." in base_name else ("", "backbone.", "model.language_model.", "model.")
     for local_e in range(int(num_experts)):
         global_e = offset + local_e
         for proj, ckpt_cands in ckpt_names.items():
@@ -1416,6 +1509,70 @@ def shard_exl3_row(
     return loaded.contiguous()
 
 
+def coerce_checkpoint_region(
+    raw: torch.Tensor, dtype: torch.dtype, shape: Any
+) -> torch.Tensor:
+    """Reinterpret a flat checkpoint byte region as the checkpoint tensor.
+
+    The loader never reshapes EXL3 payloads: safetensors hands it the stored
+    tensor with its checkpoint shape, and every slot adopts that exact shape.
+    The one in-tree place that rebuilds a checkpoint-shaped tensor from flat
+    bytes is the ATS aliasing path (``ats_alias._ats_view``), which
+    reinterprets an element-aligned byte slice into the checkpoint dtype and
+    shape. This is that reinterpretation factored out, so tooling that reads
+    raw checkpoint regions builds tensors through the loader's own helper
+    instead of re-implementing the layout (a hand-rolled reshape produced
+    the run-3 Case E failure: a flat 1-D trellis can never reach
+    LinearEXL3, which asserts the 3-D tile layout).
+    """
+    if torch is None:
+        raise RuntimeError("torch required for checkpoint region coercion")
+    if raw.dtype != torch.uint8:
+        raise ValueError("coerce_checkpoint_region takes a flat uint8 region")
+    itemsize = torch.tensor([], dtype=dtype).element_size()
+    if int(raw.numel()) % itemsize:
+        raise ValueError(
+            f"checkpoint region of {int(raw.numel())} bytes is not "
+            f"{itemsize}-byte aligned for dtype {dtype}"
+        )
+    return raw.view(dtype).view(tuple(int(x) for x in shape))
+
+
+def assert_exl3_trellis_3d(
+    trellis: torch.Tensor, in_features: int, out_features: int
+) -> int:
+    """Assert the loader's trellis geometry and return K.
+
+    Every loader slot that adopts an EXL3 trellis holds the checkpoint's
+    exact 3-D ``[in/16, out/16, 16*K]`` int16 tensor: the mixed-K expert
+    store rejects any other geometry at load (``tensor_mixed_k.load``), and
+    the fused linear's per-shard slots adopt only the exact-shape payload
+    (``_make_weight_loader``). Centralizing the assertion here keeps
+    tooling from building a layout the loader would refuse -- and gives
+    the parity tool the same check the loader performs, before any kernel
+    call.
+    """
+    if torch is None:
+        raise RuntimeError("torch required for the trellis geometry check")
+    if getattr(trellis, "ndim", 0) != 3 or trellis.dtype != torch.int16:
+        raise ValueError(
+            "EXL3 trellis must be the 3-D int16 [in/16, out/16, 16*K] "
+            f"checkpoint layout, got ndim={getattr(trellis, 'ndim', 0)} "
+            f"dtype={getattr(trellis, 'dtype', None)}"
+        )
+    in_tiles, out_tiles, words = (int(x) for x in trellis.shape)
+    if (in_tiles, out_tiles) != (in_features // 16, out_features // 16):
+        raise ValueError(
+            f"EXL3 trellis tile shape {(in_tiles, out_tiles, words)} does "
+            f"not cover {in_features}x{out_features} (16-wide tiles)"
+        )
+    if words % 16 or not 2 <= words // 16 <= 8:
+        raise ValueError(
+            f"EXL3 trellis width {words} is not 16*K with K in 2..8"
+        )
+    return words // 16
+
+
 def _install_exllamav3_namespace() -> None:
     """Validate that the native ExLlamaV3 package and extension are importable."""
     import exllamav3_ext  # noqa: F401  — compiled extension must exist
@@ -1487,23 +1644,491 @@ def resolve_moe_act(layer: torch.nn.Module) -> int:
     """Kernel activation index for this layer, from vLLM's MoE activation.
 
     vLLM 0.31.0 exposes ``layer.moe_config.activation`` as a ``MoEActivation``
-    enum. Gated activations (silu/gelu/...) keep the historical SILU index 0.
-    Non-gated relu2 (``relu2_no_mul``, NemotronH) maps to the fork's
-    ``ACT_RELU2_NOGATE`` so the fused kernels skip the gate GEMM and compute
-    relu(u) * u = relu^2(u) exactly. Any other non-gated activation has no
-    kernel instance and must not take the fused path.
+    enum. Known activations map to the exllamav3 kernel's ``MOE_COOP_ACT_*``
+    instances: silu -> 0, relu2_no_mul -> 2 (NemotronH, gateless) and
+    swigluoai[_uninterleave] -> 3 (clamped SwiGLU-OAI, gpt-oss / MiniMax-M3).
+    Any OTHER activation has no kernel instance: silently mapping it to the
+    SILU index would compute the wrong activation, so it raises.
     """
     act = getattr(getattr(layer, "moe_config", None), "activation", None)
     value = getattr(act, "value", None)
     if value is None:
         return MOE_ACT_SILU
+    if value == "silu":
+        return MOE_ACT_SILU
     if value == "relu2_no_mul":
         return MOE_ACT_RELU2_NOGATE
+    if value in ("swigluoai", "swigluoai_uninterleave"):
+        return MOE_ACT_SWIGLU_OAI
     if value.endswith("_no_mul"):
         raise ValueError(
             f"EXL3 fused MoE has no kernel instance for non-gated activation {value!r}"
         )
-    return MOE_ACT_SILU
+    raise ValueError(
+        f"EXL3 fused MoE has no kernel instance for activation {value!r}; "
+        "known activations are silu, relu2_no_mul and swigluoai[_uninterleave]"
+    )
+
+
+def _layer_float_attr(layer: torch.nn.Module, name: str, default: float) -> float:
+    """Layer attribute as a finite float, else ``default`` (with a warning)."""
+    raw = getattr(layer, name, None)
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        parsed = None
+    if parsed is not None and math.isfinite(parsed):
+        return parsed
+    logger.warning(
+        "EXL3 MoE %s=%r is absent/invalid; falling back to the model constant %s",
+        name,
+        raw,
+        default,
+    )
+    return default
+
+
+def resolve_moe_gate_params(layer: torch.nn.Module) -> tuple[float | None, float | None]:
+    """(alpha, limit) gate parameters for this layer's kernel launch.
+
+    - SwiGLU-OAI (act index 3): the exllamav3 kernel hardcodes alpha = 1.702
+      and the beta = 1.0 ``(up + 1)`` term (exl3_moe_coop_kernel.cuh:98-107),
+      so the layer's alpha must agree with 1.702 and its beta must be absent
+      or 1.0; anything else raises instead of silently computing a different
+      activation. The clamp limit is a real kernel argument.
+    - Silu (DSV4.1): no alpha term; the historical swiglu_limit passes
+      through unchanged (or None when the layer carries no limit).
+    - Gateless relu2: no alpha; the symmetric up-clamp limit passes through.
+    """
+    act = resolve_moe_act(layer)
+    if act == MOE_ACT_SWIGLU_OAI:
+        alpha = _layer_float_attr(
+            layer, "swiglu_alpha", MINIMAX_SWIGLU_ALPHA_DEFAULT
+        )
+        if alpha != MINIMAX_SWIGLU_ALPHA_DEFAULT:
+            raise ValueError(
+                f"EXL3 swiglu_oai kernel hardcodes alpha={MINIMAX_SWIGLU_ALPHA_DEFAULT}; "
+                f"layer requests swiglu_alpha={alpha!r}"
+            )
+        beta = getattr(layer, "swiglu_beta", None)
+        if beta is not None:
+            try:
+                beta = float(beta)
+            except (TypeError, ValueError, OverflowError):
+                beta = None
+        if beta is not None and beta != 1.0:
+            raise ValueError(
+                f"EXL3 swiglu_oai kernel computes (up + 1) (beta=1.0); "
+                f"layer requests swiglu_beta={beta!r}"
+            )
+        limit = _layer_float_attr(
+            layer, "swiglu_limit", MINIMAX_SWIGLU_LIMIT_DEFAULT
+        )
+        return alpha, limit
+    if act == MOE_ACT_SILU:
+        raw = getattr(layer, "swiglu_limit", None)
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            parsed = None
+        limit = (
+            parsed
+            if parsed is not None and math.isfinite(parsed) and parsed > 0
+            else None
+        )
+        return None, limit
+    # Gateless relu2: the symmetric up-clamp limit, if the layer carries one.
+    raw = getattr(layer, "swiglu_limit", None)
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        parsed = None
+    limit = (
+        parsed
+        if parsed is not None and math.isfinite(parsed) and parsed > 0
+        else None
+    )
+    return None, limit
+
+
+def expert_k_census_supported(census: dict[tuple[int, ...], int]) -> bool:
+    """Whether a per-expert K census is servable by the EXL3 expert machinery.
+
+    ``census`` maps (w1, w2, w3) K-bit tuples to expert counts. Every K in
+    every tuple must be inside exllamav3's EXL3 K family (1..8, the kernel
+    instances exl3_moe_coop_inst_k1..k8) and the census must be non-empty;
+    the mixed-K arena/pointer-table machinery handles the rest per expert.
+    """
+    if not isinstance(census, dict) or not census:
+        return False
+    for k_tuple, count in census.items():
+        try:
+            ks = [int(k) for k in k_tuple]
+            n = int(count)
+        except (TypeError, ValueError):
+            return False
+        if n <= 0:
+            return False
+        if any(not 1 <= k <= 8 for k in ks):
+            return False
+    return True
+
+
+def _hf_config_is_minimax_m3(hf_config: Any) -> bool:
+    """Whether vLLM's hf_config names the MiniMax-M3 sparse architecture."""
+    if hf_config is None:
+        return False
+    model_type = str(getattr(hf_config, "model_type", "") or "")
+    if model_type in ("minimax_m3_vl", "minimax_m3"):
+        return True
+    try:
+        archs = list(getattr(hf_config, "architectures", None) or [])
+    except Exception:
+        archs = []
+    return any(
+        "MiniMaxM3Sparse" in str(a) for a in archs
+    )
+
+
+def minimax_pack_detected(cfg: "Exl3Config") -> bool:
+    """Whether this Exl3Config serves the MiniMax-M3 sparse-attention pack.
+
+    The pack's quantization_config is {quant_method: exl3, version: 0.0.2}
+    with no coverage ledger, so detection is by model architecture: the
+    override_quantization_method marker (set from vLLM's hf_config) plus the
+    derived non-routed coverage.
+    """
+    if _MINIMAX_M3_PACK_REQUESTED:
+        return True
+    layers = getattr(getattr(cfg, "non_routed_exl3", None), "layers", {}) or {}
+    modules = getattr(getattr(cfg, "non_routed_exl3", None), "modules", []) or []
+    covered = set(layers) | set(modules)
+    return bool(covered & set(MINIMAX_NON_ROUTED_FAMILIES))
+
+
+def _derive_minimax_non_routed_coverage() -> dict[str, Any]:
+    """non_routed_exl3 block for the MiniMax-M3 pack, from the architecture.
+
+    The 9 EXL3-covered module suffixes plus the two fused ``gate_up_proj``
+    names vLLM queries (MINIMAX_FUSED_LINEAR_MODULES) become the ``modules``
+    list (suffix matching, like the tensor_storage-derived block); per-family K fallbacks
+    go to ``layer_bits``. The per-shard K is still read from each shard's own
+    trellis at load, so the fallback only feeds config-level logging.
+    """
+    layer_bits = dict(MINIMAX_NON_ROUTED_FAMILIES)
+    for fused, members in MINIMAX_FUSED_LINEAR_MODULES.items():
+        layer_bits[fused] = max(MINIMAX_NON_ROUTED_FAMILIES[m] for m in members)
+    return {
+        "modules": list(MINIMAX_NON_ROUTED_FAMILIES) + list(MINIMAX_FUSED_LINEAR_MODULES),
+        "layer_bits": layer_bits,
+        "bits": max(MINIMAX_NON_ROUTED_FAMILIES.values()),
+        "codebook": "mcg",
+    }
+
+
+def _e4m3_bits_to_float(bits: "torch.Tensor") -> "torch.Tensor":
+    """Decode E4M3FN bit patterns (uint8) to float32 without a float8 dtype.
+
+    E4M3FN: 1-4-3 split, no inf; 0x7F/0xFF are NaN. Pure integer math so the
+    decode also runs where torch.float8_e4m3fn kernels are unavailable (CPU).
+    """
+    bits = bits.to(torch.int32) & 0xFF
+    sign = torch.where(bits & 0x80 != 0, -1.0, 1.0)
+    exp = (bits >> 3) & 0xF
+    man = bits & 0x7
+    # exponent bias 7; subnormals (exp == 0) scale mantissa by 2^-9;
+    # normals are ((8 + man) / 8) * 2**(exp - 7) == (8 + man) * 2**(exp - 10)
+    # (max finite 448 at exp=15/man=6; 0x7F/0xFF are NaN).
+    val = torch.where(
+        exp == 0,
+        man.to(torch.float32) * (2.0 ** -9),
+        (man.to(torch.float32) + 8.0) * torch.pow(
+            2.0, exp.to(torch.float32) - 10.0
+        ),
+    )
+    val = torch.where((bits & 0x7F) == 0x7F, float("nan"), val)
+    return sign * val
+
+
+def dequant_minimax_indexer(
+    packed: "torch.Tensor",
+    scales: "torch.Tensor",
+    block: int = MINIMAX_MXFP8_BLOCK,
+) -> "torch.Tensor":
+    """Dequantize an MXFP8 indexer projection (F8_E4M3 + E8M0 block scales).
+
+    ``packed`` is the F8 payload viewed as uint8, shape (out, in); ``scales``
+    holds one E8M0 exponent byte per ``block``-wide slice along the INPUT dim,
+    shape (out, in // block). The E8M0 byte decodes as 2**(byte - 127) and is
+    MULTIPLIED with the payload — the same semantics as vLLM's own MXFP8 path
+    (``dequant_mxfp8_to_bf16``, quantization/utils/mxfp8_utils.py:232-245:
+    ``descale = exp2(scales - 127.0)``; consumed by the load-time dequant in
+    kernels/linear/mxfp8/emulation.py:48). Despite the checkpoint's
+    ``weight_scale_inv`` name the stored byte is the direct descale exponent,
+    not a reciprocal.
+
+    Returns a BF16 weight of shape (out, in).
+    """
+    out_rows, in_cols = int(packed.shape[0]), int(packed.shape[1])
+    if in_cols % block:
+        raise ValueError(
+            f"MXFP8 indexer dequant: input dim {in_cols} is not a multiple of "
+            f"the {block}-wide scale block"
+        )
+    if tuple(scales.shape) != (out_rows, in_cols // block):
+        raise ValueError(
+            f"MXFP8 indexer dequant: scales shape {tuple(scales.shape)} does "
+            f"not match ({out_rows}, {in_cols // block})"
+        )
+    if scales.dtype == torch.uint8:
+        exp_byte = scales.to(torch.int32)
+    else:
+        exp_byte = scales.to(torch.int32) & 0xFF
+    descale = torch.pow(
+        2.0, exp_byte.to(torch.float32) - 127.0
+    )
+    payload = _e4m3_bits_to_float(packed.reshape(-1))
+    payload = payload.reshape(out_rows, in_cols // block, block)
+    weight = payload * descale.unsqueeze(-1)
+    return weight.reshape(out_rows, in_cols).to(torch.bfloat16)
+
+
+def _indexer_mxfp8_enabled() -> bool:
+    """Whether VLLM_EXL3_INDEXER_MXFP8 keeps the indexer shards in MXFP8.
+
+    Default OFF: the indexer projections are dequantized to BF16 at load,
+    exactly as before this switch existed. When ON, the two shards stay
+    (F8_E4M3 payload, E8M0 block-32 scales) on device and their GEMM runs
+    vLLM's own MXFP8 linear kernel; the kernel must be available or the
+    load fails closed (no silent BF16 fallback).
+    """
+    return os.environ.get("VLLM_EXL3_INDEXER_MXFP8", "").strip() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _validate_indexer_mxfp8_geometry(
+    packed: "torch.Tensor",
+    scales: "torch.Tensor",
+    block: int = MINIMAX_MXFP8_BLOCK,
+) -> tuple[int, int]:
+    out_rows, in_cols = int(packed.shape[0]), int(packed.shape[1])
+    if packed.dim() != 2 or in_cols % block:
+        raise ValueError(
+            f"MXFP8 indexer retention: payload must be 2D with an input dim "
+            f"divisible by the {block}-wide scale block, got "
+            f"{tuple(packed.shape)}"
+        )
+    if tuple(scales.shape) != (out_rows, in_cols // block):
+        raise ValueError(
+            f"MXFP8 indexer retention: scales shape {tuple(scales.shape)} "
+            f"does not match ({out_rows}, {in_cols // block})"
+        )
+    return out_rows, in_cols
+
+
+def indexer_mxfp8_retain(
+    packed: "torch.Tensor",
+    scales: "torch.Tensor",
+    block: int = MINIMAX_MXFP8_BLOCK,
+) -> tuple["torch.Tensor", "torch.Tensor"]:
+    """Retain an indexer projection in its native MXFP8 checkpoint form.
+
+    The complement of :func:`dequant_minimax_indexer` for the
+    VLLM_EXL3_INDEXER_MXFP8 path: instead of decoding the payload to BF16,
+    keep it as the (F8_E4M3 payload, E8M0 block-32 scale) pair vLLM's
+    weight-only MXFP8 kernel consumes. The payload is bitcast (never
+    value-cast) to ``float8_e4m3fn`` -- the safetensors dtype the kernel
+    asserts -- and the scale bytes stay ``uint8`` row-major
+    ``[out, in // block]``, the layout the kernel's own
+    ``process_weights_after_loading`` expects before it repacks them into
+    its W8A16 GEMM format.
+    """
+    _validate_indexer_mxfp8_geometry(packed, scales, block)
+    if scales.dtype != torch.uint8:
+        raise ValueError(
+            "MXFP8 indexer retention: scales must be uint8 E8M0 exponent "
+            f"bytes, got {scales.dtype}"
+        )
+    payload_fp8 = (
+        packed.view(torch.uint8).view(torch.float8_e4m3fn).contiguous()
+        if packed.dtype != torch.float8_e4m3fn
+        else packed.contiguous()
+    )
+    return payload_fp8, scales.contiguous()
+
+
+def indexer_mxfp8_kernel(weight_shape: tuple[int, int]):
+    """Resolve vLLM's weight-only Marlin MXFP8 kernel, fail closed.
+
+    The run-1 GB10 receipt pinned the W8A8 route's failure: the FlashInfer
+    CUTLASS MXFP8 kernel that path bound quantizes the ACTIVATION to MXFP8
+    in-kernel, and the real indexer shards scored cosine ~0.9996 against
+    the BF16-dequant reference -- below the 0.9999 parity gate. The same
+    receipt's case D isolated the loss to that activation quantization:
+    the weight-only Marlin kernel scored 0.999999 on the same device.
+    The indexer drives top-k token selection, so the retained shards must
+    run a WEIGHT-ONLY (W8A16, bf16 activations) GEMM. This resolver binds
+    vLLM's own ``MarlinMxfp8LinearKernel`` and nothing else; both the
+    platform gate (``is_supported``) and the shape gate (``can_implement``)
+    must admit the shard. Anything else is a clear error naming the switch
+    -- never a BF16 fallback and never a silent return to a W8A8 kernel.
+    """
+    try:
+        from vllm.model_executor.kernels.linear.mxfp8.Mxfp8LinearKernel import (
+            Mxfp8LinearLayerConfig,
+        )
+        from vllm.model_executor.kernels.linear.mxfp8.marlin import (
+            MarlinMxfp8LinearKernel,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "VLLM_EXL3_INDEXER_MXFP8=1 requires vLLM's weight-only Marlin "
+            "MXFP8 (W8A16) linear kernel "
+            "(vllm.model_executor.kernels.linear.mxfp8.marlin) and it could "
+            f"not be imported: {exc!r}"
+        ) from exc
+    supported, reason = MarlinMxfp8LinearKernel.is_supported()
+    if not supported:
+        raise RuntimeError(
+            "VLLM_EXL3_INDEXER_MXFP8=1: vLLM's Marlin MXFP8 (W8A16) "
+            f"linear kernel is unavailable on this platform: {reason}"
+        )
+    config = Mxfp8LinearLayerConfig(weight_shape=tuple(weight_shape))
+    implementable, reason = MarlinMxfp8LinearKernel.can_implement(config)
+    if not implementable:
+        raise RuntimeError(
+            "VLLM_EXL3_INDEXER_MXFP8=1: vLLM's Marlin MXFP8 (W8A16) "
+            f"linear kernel refuses the indexer shard shape "
+            f"{tuple(weight_shape)}: {reason}"
+        )
+    return MarlinMxfp8LinearKernel(config)
+
+
+def make_indexer_mxfp8_shim(
+    payload_fp8: "torch.Tensor",
+    scales: "torch.Tensor",
+    params_dtype: "torch.dtype" = torch.bfloat16,
+):
+    """Build the parameter shim vLLM's Marlin MXFP8 kernel applies against.
+
+    The kernel's ``process_weights_after_loading`` / ``apply_weights`` read
+    ``weight`` (F8_E4M3, ``[N, K]``), ``weight_scale`` (uint8 E8M0,
+    ``[N, K // 32]`` row-major before its own repack), the shard's true
+    ``output_size_per_partition`` / ``input_size_per_partition``, and
+    ``bias``. ``params_dtype`` documents the activation/output dtype the
+    layer runs (bf16 -- the Marlin path is weight-only and never
+    quantizes the activation). The indexer shards are the only consumers,
+    so a shim per shard is kept instead of registering vLLM parameters on
+    the fused layer.
+    """
+    from types import SimpleNamespace
+
+    out_rows, in_cols = int(payload_fp8.shape[0]), int(payload_fp8.shape[1])
+    shim = SimpleNamespace()
+    shim.weight = torch.nn.Parameter(payload_fp8, requires_grad=False)
+    shim.weight_scale = torch.nn.Parameter(scales, requires_grad=False)
+    shim.output_size_per_partition = out_rows
+    shim.input_size_per_partition = in_cols
+    shim.bias = None
+    shim.params_dtype = params_dtype
+    return shim
+
+
+
+def _indexer_mxfp8_target_device(layer) -> "torch.device":
+    """Resolve the CUDA device the fused layer's parameters are on at load.
+
+    vLLM wraps every quant method's ``process_weights_after_loading`` in
+    ``device_loading_context``: the layer's REGISTERED parameters are
+    moved onto the global target device for the load-time processing and
+    restored to their (pinned-CPU / UVA) placement afterwards. The
+    retained indexer payloads/scales are stashed as plain list attributes,
+    never parameters, so nothing moves them: in the real serve they are
+    still on the CPU (the loader's mmap-backed source views) when the
+    Marlin repack runs -- the boot14 GB10 crash
+    (``_C::gptq_marlin_repack ... 'CPU' backend``). The default BF16
+    path never hits this because its dequant output is copied into the
+    staging parameter (``layer.weight.data[rows].copy_``), which IS on the
+    target device at this point, and the copy performs the transfer.
+
+    This resolver returns the one device the layer's parameters agree on
+    and fails closed -- naming the switch -- when they do not resolve to a
+    single CUDA device, instead of ever handing the Marlin repack
+    off-device tensors.
+    """
+    devices = set()
+    for name in ("weight", "trellis", "suh", "svh"):
+        param = getattr(layer, name, None)
+        if param is None:
+            continue
+        devices.add(param.device)
+    if len(devices) == 1:
+        device = next(iter(devices))
+        if device.type == "cuda":
+            return device
+    raise RuntimeError(
+        "VLLM_EXL3_INDEXER_MXFP8=1: the retained indexer shards must be "
+        "repacked on the fused layer's CUDA device, but the layer's "
+        "parameters resolve to "
+        f"{sorted(str(d) for d in devices) if devices else 'no device at all'} "
+        "at load processing (vLLM's device-loading context must have moved "
+        "them onto the target device); failing closed instead of running "
+        "the Marlin repack on off-device tensors"
+    )
+
+
+def _indexer_mxfp8_tensor_to_device(
+    tensor: "torch.Tensor", device: "torch.device"
+) -> "torch.Tensor":
+    return tensor.to(device)
+
+
+def indexer_mxfp8_move_to_device(
+    payload: "torch.Tensor",
+    scales: "torch.Tensor",
+    device: "torch.device",
+    shard_idx: int,
+) -> tuple["torch.Tensor", "torch.Tensor"]:
+    """Move one retained indexer shard onto the layer's device, fail closed.
+
+    The single placement fix for the boot14 real-serve crash: the stashed
+    payload/scales are CPU-resident (mmap-backed loader source views) at
+    load-processing time, and vLLM's Marlin repack only exists for the
+    CUDA backend. Both tensors must land exactly on ``device`` -- already
+    being there is fine (a future loader that streams straight to the
+    device) -- and anything else fails closed with an error naming the
+    switch. The consumed CPU source views are released (madvise + caller
+    drops every reference): on GB10 CPU and GPU share one physical memory
+    pool, so a lingering CPU copy of the payload would erase the ~218 MiB
+    unified-memory saving the switch exists for.
+    """
+    if payload.device == device and scales.device == device:
+        return payload, scales
+    if payload.device != scales.device:
+        raise RuntimeError(
+            f"VLLM_EXL3_INDEXER_MXFP8=1: indexer shard {shard_idx} payload "
+            f"({payload.device}) and scales ({scales.device}) are on "
+            "different devices; failing closed instead of running the "
+            "Marlin repack on mismatched tensors"
+        )
+    moved_payload = _indexer_mxfp8_tensor_to_device(payload, device)
+    moved_scales = _indexer_mxfp8_tensor_to_device(scales, device)
+    if moved_payload.device != device or moved_scales.device != device:
+        raise RuntimeError(
+            f"VLLM_EXL3_INDEXER_MXFP8=1: indexer shard {shard_idx} "
+            f"payload/scales did not land on the layer device {device}; "
+            "failing closed instead of running the Marlin repack on "
+            "off-device tensors"
+        )
+    # Release the consumed CPU source views' pages (safetensors mmap COW)
+    # before the caller drops them: the moved tensors are fresh device
+    # storages, the source must not linger on the UMA pool.
+    _madv_dontneed_cpu_tensor(payload)
+    _madv_dontneed_cpu_tensor(scales)
+    return moved_payload, moved_scales
 
 
 def moe_layer_is_gateless(layer: torch.nn.Module) -> bool:
@@ -1739,6 +2364,7 @@ def apply_exl3_python_loop(
     *,
     only_experts: set[int] | None = None,
     out: torch.Tensor | None = None,
+    act: int = MOE_ACT_SILU,
 ) -> torch.Tensor:
     """Unique-expert LinearEXL3 loop. `only_experts` is local ids (fat-expert fallback)."""
     tokens, hidden = x2d.shape
@@ -1762,18 +2388,56 @@ def apply_exl3_python_loop(
             up_out = pack["up"].forward(h.contiguous().half(), {}, out_dtype=torch.float32)
             if limit is not None and limit > 0:
                 up_out = up_out.clamp(min=-limit, max=limit)
-            act = torch.square(torch.relu(up_out))
+            act_out = torch.square(torch.relu(up_out))
+        elif act == MOE_ACT_SWIGLU_OAI:
+            # Clamped SwiGLU-OAI, the loop twin of the coop kernel's
+            # act_oai_swiglu (exl3_moe_coop_kernel.cuh:98-107): gate clamped
+            # from above only, up clamped symmetrically, alpha hardcoded 1.702,
+            # beta = 1.0 as the (up + 1) term.
+            gate = pack["gate"].forward(h.contiguous().half(), {}, out_dtype=torch.float32)
+            up = pack["up"].forward(h.contiguous().half(), {}, out_dtype=torch.float32)
+            if limit is not None and limit > 0:
+                gate = gate.clamp(max=limit)
+                up = up.clamp(min=-limit, max=limit)
+            act_out = (up + 1.0) * gate * torch.sigmoid(1.702 * gate)
         else:
             gate = pack["gate"].forward(h.contiguous().half(), {}, out_dtype=torch.float32)
             up = pack["up"].forward(h.contiguous().half(), {}, out_dtype=torch.float32)
             if limit is not None and limit > 0:
                 gate = gate.clamp(max=limit)
                 up = up.clamp(min=-limit, max=limit)
-            act = F.silu(gate) * up
-        down = pack["down"].forward(act.contiguous().half(), {}, out_dtype=torch.float32)
+            act_out = F.silu(gate) * up
+        down = pack["down"].forward(act_out.contiguous().half(), {}, out_dtype=torch.float32)
         scale = weights[token_idx, k_pos].unsqueeze(-1).to(dtype=torch.float32)
         out.index_add_(0, token_idx, down * scale)
     return out
+
+
+def _assert_mixedk_karrays_match_groups(k_gate, k_up, k_down, k_groups, n_exp, device):
+    """Fail closed: the unified kernel's per-expert K arrays and the grouped
+    launches' scalar K tuples are two spellings of the same load-time fact, so
+    they must agree per expert. The 3275819 units regression (arrays at 2*K)
+    sailed through every existing check because nothing cross-validated the
+    two spellings; this guard makes any future divergence a load-time error
+    instead of a silent wrong-bits launch."""
+    _kgrp = torch.zeros((n_exp, 3), dtype=torch.int32, device=device)
+    for _kt, _ids in k_groups:
+        _kgrp[torch.as_tensor(_ids, dtype=torch.long, device=device)] = (
+            torch.tensor(_kt, dtype=torch.int32, device=device)
+        )
+    if (
+        n_exp
+        and not (
+            bool(torch.equal(_kgrp[:, 0].long(), k_gate.long()))
+            and bool(torch.equal(_kgrp[:, 1].long(), k_up.long()))
+            and bool(torch.equal(_kgrp[:, 2].long(), k_down.long()))
+        )
+    ):
+        raise ValueError(
+            "EXL3 mixed-K K arrays disagree with the per-K-group tuples; "
+            "the unified kernel would launch with the wrong per-expert bit "
+            "width. Refusing to build the fused state."
+        )
 
 
 def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]]) -> None:
@@ -1868,29 +2532,43 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
     layer._exl3_fused_temps = temps
     layer._exl3_fused_concurrency = concurrency
     if mixed_k:
-        # Per-expert K arrays for exl3_moe_mixedk use half-bit units K2 = 2 * K (shape[-1] // 8).
+        # Per-expert K arrays for exl3_moe_mixedk carry the TRUE bit-width K =
+        # trellis.shape[-1] // 16, exactly like the scalar K tuple the grouped
+        # launch passes (below) and the fork engine's own caller
+        # (exllamav3/modules/block_sparse_mlp.py builds them from
+        # LinearEXL3.inner.K). The kernel consumes them as bits: it reads
+        # K_gate_arr[expert_idx] straight into moe_gemm_tile's runtime switch,
+        # whose cases 1..8 are the bits instances -- the same switch the
+        # uniform kernel's true-K scalar feeds
+        # (exllamav3_ext/quant/exl3_moe_kernel.cuh). Commit 3275819 briefly
+        # shipped shape[-1] // 8 = 2*K here ("half-bit units"); the doubled K
+        # selected the wrong bits instance and read past each trellis, which
+        # is the mixedk_unified cosine ~0 of GPU_JOB-2 run 5. (The older
+        # sm_121 illegal-memory-access reports predate this line and had a
+        # different, already-closed cause: the 3f3ed81-era tree already used
+        # // 16 here.)
         layer._exl3_k = None
         layer._exl3_mixedk_unified = True
         k_gate = (
             torch.tensor(
-                [int(pack["up"].trellis.shape[-1]) // 8 for pack in inners],
+                [int(pack["up"].trellis.shape[-1]) // 16 for pack in inners],
                 dtype=torch.int32,
                 device=device,
             )
             if gateless
             else torch.tensor(
-                [int(pack["gate"].trellis.shape[-1]) // 8 for pack in inners],
+                [int(pack["gate"].trellis.shape[-1]) // 16 for pack in inners],
                 dtype=torch.int32,
                 device=device,
             )
         )
         k_up = torch.tensor(
-            [int(pack["up"].trellis.shape[-1]) // 8 for pack in inners],
+            [int(pack["up"].trellis.shape[-1]) // 16 for pack in inners],
             dtype=torch.int32,
             device=device,
         )
         k_down = torch.tensor(
-            [int(pack["down"].trellis.shape[-1]) // 8 for pack in inners],
+            [int(pack["down"].trellis.shape[-1]) // 16 for pack in inners],
             dtype=torch.int32,
             device=device,
         )
@@ -1926,10 +2604,11 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
         layer._exl3_krank[layer._exl3_kdesc.long()] = torch.arange(
             layer._exl3_kdesc.numel(), dtype=torch.int32, device=device
         )
-        # Per-K-group dispatch (the GB10-qualified path): experts bucketed by
+        # Per-K-group dispatch (the A/B and fallback path): experts bucketed by
         # their integer (K_gate, K_up, K_down) tuple; each bucket runs one uniform-K
-        # exl3_moe launch. The unified mixedk kernel is known to fault on
-        # sm_121 (GB10) at layer 23; grouped dispatch avoids it entirely.
+        # exl3_moe launch. The unified mixedk launch is the default (see
+        # _exl3_mixedk_grouped_default); grouped stays selectable with
+        # VLLM_EXL3_MIXEDK_MODE=grouped.
         groups: dict[tuple[int, int, int], list[int]] = {}
         for e, pack in enumerate(inners):
             kg = int(pack["up"].trellis.shape[-1] if gateless else pack["gate"].trellis.shape[-1]) // 16
@@ -1939,6 +2618,11 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
         layer._exl3_k_groups = [
             (k_tuple, ids) for k_tuple, ids in sorted(groups.items())
         ]
+        # Fail closed (see _assert_mixedk_karrays_match_groups): the unified
+        # K arrays and the grouped scalar tuples must agree per expert.
+        _assert_mixedk_karrays_match_groups(
+            k_gate, k_up, k_down, layer._exl3_k_groups, n_exp, device
+        )
         if len(layer._exl3_k_groups) == 1:
             _kt = layer._exl3_k_groups[0][0]
             layer._exl3_k_tuple = _kt
@@ -2515,8 +3199,11 @@ def apply_exl3_fused_moe(
     except Exception:
         # Direct callers may use this helper without installing ExLlamaV3.
         # Keep the same graceful fallback contract as ``apply_exl3_experts``.
+        _moe_act = getattr(layer, "_exl3_moe_act", None)
+        if _moe_act is None:
+            _moe_act = resolve_moe_act(layer)
         return apply_exl3_python_loop(
-            x2d, ids, weights, inners, expert_map, limit
+            x2d, ids, weights, inners, expert_map, limit, act=_moe_act
         )
 
     ptrs = getattr(layer, "_exl3_ptrs", None)
@@ -2567,18 +3254,22 @@ def apply_exl3_fused_moe(
             # indexes pointer tables by raw sel. Plugin sentinels are
             # n_exp (non-local / EP). Pass [0, n_exp) so those routes
             # contribute zero instead of OOB.
+            moe_act = getattr(layer, "_exl3_moe_act", None)
+            if moe_act is None:
+                moe_act = resolve_moe_act(layer)
             exllamav3_ext.exl3_moe_coop(
                 xh, sel_c, rw_c, 0, int(n_exp), hidden,
                 ptrs["gate_trellis"], ptrs["gate_suh"], ptrs["gate_svh"],
                 ptrs["up_trellis"], ptrs["up_suh"], ptrs["up_svh"],
                 ptrs["down_trellis"], ptrs["down_suh"], ptrs["down_svh"],
                 None, None, None,
-                kg, ku, kd, mcg, mul1, MOE_ACT_SILU,
+                kg, ku, kd, mcg, mul1, moe_act,
                 float(limit) if (limit is not None and limit > 0) else 0.0,
                 True,
                 had_g, had_u, gu_g, gu_u, act_out, d_out, ctr, out,
                 None, None,
             )
+            layer._exl3_last_apply = "coop"
             return out
 
     flat_token = torch.arange(tokens, device=x2d.device, dtype=torch.long).repeat_interleave(topk)
@@ -2654,6 +3345,17 @@ def apply_exl3_fused_moe(
         use_grouped = (k_groups is not None) and (mode != "unified") and (
             mode == "grouped" or grouped_default
         )
+        # Name the mixed-K dispatch mode once: the serve's receipts and logs
+        # must show which kernel family carries production traffic. (Under a
+        # real vLLM install the logger carries info_once; the stdlib fallback
+        # in dev/test environments has only info.)
+        getattr(logger, "info_once", logger.info)(
+            "EXL3 mixed-K MoE dispatch mode: %s (%s)"
+            % (
+                "grouped" if use_grouped else "unified",
+                "VLLM_EXL3_MIXEDK_MODE=" + repr(mode) if mode else "env unset -> default",
+            )
+        )
         if use_grouped:
             # Per-K-group dispatch (GB10-qualified): one uniform-K exl3_moe
             # launch per distinct (K_gate, K_up, K_down) tuple. This is the
@@ -2702,6 +3404,9 @@ def apply_exl3_fused_moe(
                 ptr_tbl = ptrs
                 grp_ord = g_index[standard_local]
             for gi, ((kg, ku, kd), _ids) in enumerate(k_groups):
+                # Per-K-group dispatch is a distinct inner path: stamp it so a
+                # receipt names the kernel family that actually ran.
+                layer._exl3_last_apply = "mixedk_grouped"
                 if grp_ord is None:
                     _lo, _hi = layer._exl3_group_ranges[gi][1:]
                     grp_count = shared_count
@@ -2766,6 +3471,11 @@ def apply_exl3_fused_moe(
                     fn(*args_grp)
             if fat_possible and bool(fat.any().item()):
                 fat_order = local.argsort()
+                # The fat GEMM tier is a distinct inner path: append it to the
+                # base label so the receipt shows both families that ran.
+                layer._exl3_last_apply = (
+                    (layer._exl3_last_apply or "fused") + "+fat"
+                )
                 apply_exl3_batched_fat(
                     xh,
                     flat_token[fat_order],
@@ -2779,6 +3489,9 @@ def apply_exl3_fused_moe(
                 )
             return out
         # Unified mixed-K fused dispatch: per-expert K arrays instead of scalar K.
+        # A distinct inner path: stamp it so a receipt names the kernel family
+        # that actually ran (this is the default mixed-K path).
+        layer._exl3_last_apply = "mixedk_unified"
         fn_mk = exllamav3_ext.exl3_moe_mixedk
         args_mk = (
             xh,
@@ -2821,6 +3534,10 @@ def apply_exl3_fused_moe(
         else:
             fn_mk(*args_mk)
     else:
+        # Uniform-K expert-batched exl3_moe: a distinct inner path (the serve's
+        # prefill path for uniform-K packs); stamp it so a receipt names the
+        # kernel family that actually ran.
+        layer._exl3_last_apply = "batched"
         if k_tuple_single is not None:
             kg, ku, kd = int(k_tuple_single[0]), int(k_tuple_single[1]), int(k_tuple_single[2])
         else:
@@ -2863,6 +3580,11 @@ def apply_exl3_fused_moe(
 
     if fat_possible and bool(fat.any().item()):
         fat_order = local.argsort()
+        # The fat GEMM tier is a distinct inner path: append it to the base
+        # label so the receipt shows both families that ran.
+        layer._exl3_last_apply = (
+            (layer._exl3_last_apply or "fused") + "+fat"
+        )
         apply_exl3_batched_fat(
             xh,
             flat_token[fat_order],
@@ -2918,6 +3640,11 @@ def apply_exl3_experts(
     if not inners:
         raise RuntimeError("EXL3 experts were not built after weight load")
     tokens, hidden = x.shape[-2], x.shape[-1]
+    # Per-call dispatch label for diagnostics (the parity tool reads it).
+    # Inner paths stamp the truth: coop/native/loop/mixed_k_reference;
+    # the wrapper below only stamps the generic "fused" entry label when
+    # the inner call left it unset.
+    layer._exl3_last_apply = None
     x2d = x.reshape(tokens, hidden)
     ids = topk_ids.reshape(tokens, -1).to(torch.long)
     weights = topk_weights.reshape(tokens, -1)
@@ -2957,10 +3684,21 @@ def apply_exl3_experts(
         except Exception:
             use_fused = False
     if use_fused:
-        out = apply_exl3_fused_moe(x2d, ids, weights, layer, inners, expert_map, limit)
-        layer._exl3_last_apply = "fused"
+        try:
+            out = apply_exl3_fused_moe(x2d, ids, weights, layer, inners, expert_map, limit)
+        finally:
+            # The coop fast path and the native fallback inside the fused
+            # entry point stamp the real dispatch label; only stamp the
+            # generic entry label when they did not.
+            if getattr(layer, "_exl3_last_apply", None) is None:
+                layer._exl3_last_apply = "fused"
     else:
-        out = apply_exl3_python_loop(x2d, ids, weights, inners, expert_map, limit)
+        _moe_act = getattr(layer, "_exl3_moe_act", None)
+        if _moe_act is None:
+            _moe_act = resolve_moe_act(layer)
+        out = apply_exl3_python_loop(
+            x2d, ids, weights, inners, expert_map, limit, act=_moe_act
+        )
         layer._exl3_last_apply = "loop"
     return out.to(dtype=x.dtype)
 
@@ -3320,6 +4058,17 @@ class Exl3Config(QuantizationConfig):
                     len(derived.get("layers", {})),
                     derived.get("codebook"),
                 )
+        # MiniMax-M3 pack: no ledger anywhere (the public card is only
+        # {quant_method: exl3, version: 0.0.2}); the coverage comes from the
+        # architecture via the override_quantization_method marker instead.
+        if not inst.non_routed_exl3 and _MINIMAX_M3_PACK_REQUESTED:
+            derived = _derive_minimax_non_routed_coverage()
+            inst.non_routed_exl3 = derived
+            logger.info(
+                "EXL3 derived MiniMax-M3 non-routed coverage from the model "
+                "architecture: %d module families",
+                len(derived.get("modules", [])),
+            )
         return inst
 
     @classmethod
@@ -3331,6 +4080,11 @@ class Exl3Config(QuantizationConfig):
     ) -> str | None:
         method = str((hf_quant_cfg or {}).get("quant_method", "")).lower()
         if method == "exl3":
+            # Architecture-level MiniMax-M3 marker (see minimax_pack_detected):
+            # vLLM calls this at config time, strictly before from_config.
+            global _MINIMAX_M3_PACK_REQUESTED
+            if _hf_config_is_minimax_m3(hf_config):
+                _MINIMAX_M3_PACK_REQUESTED = True
             return "exl3"
         return None
 
@@ -3563,6 +4317,16 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
     def get_fused_moe_quant_config(self, layer: "RoutedExperts") -> FusedMoEQuantConfig | None:
         return None
+
+    @property
+    def is_monolithic(self) -> bool:
+        # vLLM's RoutedExperts.forward_modular asserts
+        # ``not quant_method.is_monolithic`` (routed_experts.py:1387) and the
+        # FusedMoEMethodBase property falls through to ``self.moe_kernel``
+        # (fused_moe_method_base.py:135-141), which EXL3 does not have. EXL3
+        # is a modular method: routing is selected by vLLM's runner and this
+        # method's apply() consumes (x, topk_weights, topk_ids).
+        return False
 
     def prepare_workspace(self, hidden_states, shared_workspace_size: int):
         """Reserve the shared-expert scratch; the EXL3 routed path needs none.
@@ -4144,6 +4908,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         n_exp = int(len(layer.gate_trellis))
         gateless = moe_layer_is_gateless(layer)
         layer._exl3_moe_act = resolve_moe_act(layer)
+        # Resolve (alpha, limit) at LOAD time so a bad alpha/beta fails the
+        # load instead of the first forward (resolve_moe_gate_params raises
+        # on any alpha != 1.702 or beta not in {None, 1.0}).
+        layer._exl3_swiglu_alpha, layer._exl3_swiglu_limit = (
+            resolve_moe_gate_params(layer)
+        )
         layer._exl3_gateless = gateless
         inners: list[dict[str, Any]] = []
         k_values: list[int] = []
@@ -4356,22 +5126,41 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         shared_experts: "SharedExperts | None",
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
+        # Shared experts are computed by vLLM's runner through the model's own
+        # MiniMaxM3MLP modules (each projection under Exl3LinearMethod), BEFORE
+        # this call (moe_runner.py:_maybe_apply_shared_experts -> SharedExperts
+        # .forward -> self._layer(input)), and are combined with the routed
+        # output exactly once at the model level (model.py MoEOutput(routed,
+        # shared_output)). This method therefore never computes, fuses or
+        # drops them: it returns the routed contribution only, and EXL3 never
+        # reports staged/fused shared experts.
         del shared_experts, shared_experts_input
-        raw_limit = getattr(self.moe, "swiglu_limit", None)
-        try:
-            parsed_limit = float(raw_limit)
-        except (TypeError, ValueError, OverflowError):
-            parsed_limit = None
-        limit = (
-            parsed_limit
-            if parsed_limit is not None
-            and math.isfinite(parsed_limit)
-            and parsed_limit > 0
-            else None
-        )
+        # resolve_moe_gate_params validates alpha (kernel-hardcoded 1.702 for
+        # act 3) and beta (must be None/1.0) and returns the clamp limit.
+        _alpha, limit = resolve_moe_gate_params(self._gate_param_source(layer))
+        del _alpha
         return apply_exl3_experts(
             x, topk_ids, topk_weights, layer, limit=limit
         )
+
+    def _gate_param_source(self, layer):
+        # vLLM invokes quant_method.apply(self.moe, ...), so `layer` and
+        # self.moe are the same object in production; accept either carrier
+        # for the gate attributes (the DSV4.1 harness sets them on .moe).
+        moe = getattr(self, "moe", None)
+        if moe is None or moe is layer:
+            return layer
+        gate_attrs = (
+            "moe_config", "_exl3_moe_act",
+            "swiglu_alpha", "swiglu_beta", "swiglu_limit",
+        )
+
+        def _carries(obj) -> bool:
+            return any(hasattr(obj, a) for a in gate_attrs)
+
+        if _carries(layer) or not _carries(moe):
+            return layer
+        return moe
 
 
 # ---------------------------------------------------------------------------
@@ -4830,14 +5619,27 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
 # n-gram lookup run behind vLLM custom ops, looked up by a stable layer name.
 # ---------------------------------------------------------------------------
 
+def _process_dict(holder: Any, attr: str) -> dict[str, Any]:
+    """Process-wide registry dict stored as a plain attribute of ``holder``.
+
+    Read through ``vars()``, never ``hasattr``/``getattr``: ``torch.ops``
+    (torch 2.14) materializes an ``_OpNamespace`` for ANY attribute name, so
+    the old ``hasattr(torch.ops, ...)`` guard was always true and the
+    "registry" was an op namespace that rejects item assignment.
+    """
+    reg = vars(holder).get(attr)
+    if not isinstance(reg, dict):
+        reg = {}
+        setattr(holder, attr, reg)
+    return reg
+
+
 if _TORCH_AVAILABLE and torch is not None:
-    if not hasattr(torch.ops, "_exl3_opaque_layers"):
-        setattr(torch.ops, "_exl3_opaque_layers", {})
-    if not hasattr(torch.ops, "_exl3_opaque_methods"):
-        setattr(torch.ops, "_exl3_opaque_methods", {})
-    _EXL3_OPAQUE_LAYERS: dict[str, Any] = getattr(torch.ops, "_exl3_opaque_layers")
-    _EXL3_OPAQUE_METHODS: dict[str, Any] = getattr(torch.ops, "_exl3_opaque_methods")
-    _EXL3_OPS_READY = bool(getattr(torch.ops, "_exl3_ops_ready", False))
+    # Stored on the torch module (a process singleton) so every import of this
+    # module, under any package path, shares one registry.
+    _EXL3_OPAQUE_LAYERS: dict[str, Any] = _process_dict(torch, "_exl3_opaque_layers")
+    _EXL3_OPAQUE_METHODS: dict[str, Any] = _process_dict(torch, "_exl3_opaque_methods")
+    _EXL3_OPS_READY = vars(torch).get("_exl3_ops_ready") is True
 else:
     _EXL3_OPAQUE_LAYERS = {}
     _EXL3_OPAQUE_METHODS = {}
@@ -4942,7 +5744,7 @@ def _exl3_register_custom_ops() -> bool:
         return False
     _EXL3_OPS_READY = True
     if _TORCH_AVAILABLE and torch is not None:
-        setattr(torch.ops, "_exl3_ops_ready", True)
+        setattr(torch, "_exl3_ops_ready", True)
     return True
 
 
@@ -5030,6 +5832,20 @@ class Exl3LinearMethod(LinearMethodBase):
         self.bits = int(bits) if bits is not None else quant_config.bits
         self._logged = False
 
+    def _indexer_shards(self, layer, n_shards: int) -> tuple[int, ...]:
+        """BF16-staging shard indices of the MiniMax-M3 MSA indexer projections.
+
+        Only MinimaxM3QKVParallelLinearWithIndexer carries them, as the last
+        two of its five fused shards ([q | k | v | index_q | index_k],
+        vllm linear.py:1365); any other layer gets none.
+        """
+        if (
+            n_shards != len(MINIMAX_INDEXER_SHARDS) + 3
+            or type(layer).__name__ != "MinimaxM3QKVParallelLinearWithIndexer"
+        ):
+            return ()
+        return (n_shards - len(MINIMAX_INDEXER_SHARDS), n_shards - 1)
+
     def create_weights(
         self,
         layer,
@@ -5072,6 +5888,29 @@ class Exl3LinearMethod(LinearMethodBase):
                 raise RuntimeError(
                     f"EXL3 bf16 shards are not supported with TP size > 1; tp_size={tp_size}"
                 )
+
+        # MiniMax-M3 fused qkv+indexer: shards 3/4 (index_q/index_k) are
+        # MXFP8 (F8_E4M3 + E8M0 block-32 scales), not EXL3 trellis. They are
+        # stashed at load and dequantized into the BF16 staging rows in
+        # process_weights_after_loading, then run as a plain BF16 GEMM whose
+        # output slice lands in the fused [q | k | v | index_q | index_k]
+        # layout (vllm linear.py MinimaxM3QKVParallelLinearWithIndexer).
+        indexer_shards = self._indexer_shards(layer, n_shards)
+        if indexer_shards:
+            _, tp_size = _resolve_tp_geometry(layer)
+            if tp_size > 1:
+                raise RuntimeError(
+                    "EXL3 MiniMax indexer shards are not supported with "
+                    f"TP size > 1; tp_size={tp_size}"
+                )
+        # Unified BF16-staging shard list: config bf16 shards plus the
+        # dequantized indexer shards, in ascending order (the apply-side row
+        # offsets and the staging allocation must agree on this ordering).
+        # With VLLM_EXL3_INDEXER_MXFP8=1 the indexer shards stay MXFP8 and
+        # run vLLM's own MXFP8 linear kernel instead, so they must NOT enter
+        # the BF16 staging (neither its allocation nor its apply-side rows).
+        if indexer_shards and not _indexer_mxfp8_enabled():
+            bf16_shards = sorted(set(bf16_shards) | set(indexer_shards))
 
         # K words per shard
         k_words = self.bits * 16
@@ -5205,6 +6044,26 @@ class Exl3LinearMethod(LinearMethodBase):
             is_qkv_parallel,
         )
 
+        # MiniMax indexer MXFP8 staging: the F8 payload (shard ids
+        # index_q/index_k) arrives through the "weight" loader and the E8M0
+        # scale block through a dedicated "weight_scale" parameter (the
+        # model's load_weights rewrites the checkpoint's weight_scale_inv to
+        # weight_scale before the params_dict lookup, nvidia/model.py
+        # stacked_params_mapping); both are stashed per shard and
+        # dequantized in process_weights_after_loading.
+        if indexer_shards:
+            indexer_scale_param = Parameter(
+                torch.empty(0, dtype=torch.uint8), requires_grad=False
+            )
+            layer.register_parameter("weight_scale", indexer_scale_param)
+            set_weight_attrs(indexer_scale_param, extra)
+            indexer_scale_param.weight_loader = self._make_indexer_scale_loader(
+                indexer_shards, output_partition_sizes, layer
+            )
+            layer._exl3_indexer_payloads = [None] * len(indexer_shards)
+            layer._exl3_indexer_scales = [None] * len(indexer_shards)
+            layer._exl3_indexer_shards = tuple(indexer_shards)
+
         # Store metadata
         layer._exl3_linear_n_shards = n_shards
         layer._exl3_linear_output_partition_sizes = output_partition_sizes
@@ -5300,8 +6159,16 @@ class Exl3LinearMethod(LinearMethodBase):
             shard_idx = 0
             if loaded_shard_id is not None:
                 if isinstance(loaded_shard_id, str):
-                    # "q", "k", "v" for QKV layers
+                    # "q", "k", "v" for QKV layers; the MiniMax fused
+                    # qkv+indexer layer adds "index_q"/"index_k" as shards 3/4.
                     shard_map = {"q": 0, "k": 1, "v": 2}
+                    if n_shards == len(MINIMAX_INDEXER_SHARDS) + 3:
+                        shard_map.update(
+                            {
+                                name: 3 + i
+                                for i, name in enumerate(MINIMAX_INDEXER_SHARDS)
+                            }
+                        )
                     if loaded_shard_id not in shard_map:
                         raise ValueError(
                             f"unknown shard_id={loaded_shard_id} for EXL3 linear"
@@ -5313,6 +6180,25 @@ class Exl3LinearMethod(LinearMethodBase):
                 raise ValueError(
                     f"shard_idx={shard_idx} out of range for n_shards={n_shards}"
                 )
+
+            # MiniMax indexer MXFP8 payload: stash per shard (the E8M0 scale
+            # block arrives through the weight_scale loader); dequantized
+            # into the BF16 staging rows in process_weights_after_loading.
+            indexer_shards = getattr(layer, "_exl3_indexer_shards", ())
+            if shard_idx in indexer_shards:
+                if suffix != "weight":
+                    raise ValueError(
+                        f"EXL3 indexer shard {shard_idx} payload arrived via "
+                        f"suffix {suffix!r}, expected 'weight'"
+                    )
+                slot = indexer_shards.index(shard_idx)
+                payload = loaded_weight.detach().contiguous()
+                if layer._exl3_indexer_payloads[slot] is not None:
+                    raise RuntimeError(
+                        f"EXL3 indexer shard {shard_idx} payload loaded twice"
+                    )
+                layer._exl3_indexer_payloads[slot] = payload
+                return
 
             # Special handling for weight (bf16 staging) and markers
             if suffix in ("weight", "mcg", "mul1"):
@@ -5436,6 +6322,45 @@ class Exl3LinearMethod(LinearMethodBase):
 
         return weight_loader
 
+    def _make_indexer_scale_loader(
+        self,
+        indexer_shards: tuple[int, ...],
+        output_partition_sizes: list[int],
+        layer=None,
+    ):
+        """Loader for the MiniMax indexer E8M0 scale block (weight_scale).
+
+        The checkpoint stores one U8 exponent byte per 32-wide input slice
+        (weight_scale_inv, renamed weight_scale by the model's load_weights);
+        each shard's block is stashed for the load-time dequant and never
+        becomes a model parameter.
+        """
+
+        def scale_loader(
+            param: Parameter,
+            loaded_weight: torch.Tensor,
+            loaded_shard_id: str | int | None = None,
+        ) -> None:
+            shard_idx = None
+            if isinstance(loaded_shard_id, str):
+                if loaded_shard_id in MINIMAX_INDEXER_SHARDS:
+                    shard_idx = 3 + MINIMAX_INDEXER_SHARDS.index(loaded_shard_id)
+            elif isinstance(loaded_shard_id, int):
+                shard_idx = loaded_shard_id
+            if shard_idx not in indexer_shards:
+                raise ValueError(
+                    f"EXL3 indexer scale shard_id={loaded_shard_id!r} is not an "
+                    f"indexer shard {indexer_shards}"
+                )
+            slot = indexer_shards.index(shard_idx)
+            if layer._exl3_indexer_scales[slot] is not None:
+                raise RuntimeError(
+                    f"EXL3 indexer shard {shard_idx} scale loaded twice"
+                )
+            layer._exl3_indexer_scales[slot] = loaded_weight.detach().contiguous()
+
+        return scale_loader
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if not hasattr(layer, "trellis"):
             return
@@ -5444,13 +6369,19 @@ class Exl3LinearMethod(LinearMethodBase):
         n_shards = int(layer._exl3_linear_n_shards)
         output_sizes = layer._exl3_linear_output_partition_sizes
         bf16_shards = getattr(layer, "_exl3_linear_bf16_shards", [])
+        # VLLM_EXL3_INDEXER_MXFP8=1 keeps the indexer shards MXFP8 (payload +
+        # E8M0 scales handed to vLLM's own MXFP8 linear kernel); the default
+        # path dequantizes them into the BF16 staging rows as before.
+        indexer_shards = getattr(layer, "_exl3_indexer_shards", ())
+        indexer_mxfp8 = bool(indexer_shards) and _indexer_mxfp8_enabled()
 
         mcg_vals = layer.mcg.reshape(-1)
         mul1_vals = layer.mul1.reshape(-1)
 
         for i in range(n_shards):
             # Skip marker checks for bf16 shards - they don't use LinearEXL3
-            if i in bf16_shards:
+            # (and for retained-MXFP8 indexer shards, which are not EXL3).
+            if i in bf16_shards or (indexer_mxfp8 and i in indexer_shards):
                 continue
             mcg_is_set = mcg_vals[i].item() != 0
             mul1_is_set = mul1_vals[i].item() != 0
@@ -5484,6 +6415,10 @@ class Exl3LinearMethod(LinearMethodBase):
             n_shards > 1
             and not bf16_shards
             and not padded
+            # The retained-MXFP8 indexer shards are not EXL3 and must keep
+            # their per-shard slots (one kernel shim each), so the fused
+            # qkv+indexer layer never coalesces on this path either.
+            and not indexer_mxfp8
             and os.environ.get("VLLM_EXL3_COALESCE_SHARDS", "1") != "0"
         )
         linears = []
@@ -5543,6 +6478,11 @@ class Exl3LinearMethod(LinearMethodBase):
                     # bf16 shards don't use LinearEXL3; store None as placeholder
                     linears.append(None)
                     continue
+                if indexer_mxfp8 and i in indexer_shards:
+                    # Retained-MXFP8 indexer shards run vLLM's MXFP8 kernel
+                    # (one shim per shard, built below); no LinearEXL3.
+                    linears.append(None)
+                    continue
                 trellis_shard = layer._exl3_shard_trellis[i].detach().contiguous()
                 if trellis_shard.numel() == 0:
                     raise RuntimeError(
@@ -5564,6 +6504,16 @@ class Exl3LinearMethod(LinearMethodBase):
         layer._exl3_opaque_name = _exl3_register_opaque_layer(layer, "linear", self)
 
         # Keep bf16 weights if present, remove weight staging param if all loaded
+        # MiniMax indexer shards first: either dequantized into the BF16
+        # staging rows (default) or retained in MXFP8 for vLLM's own kernel
+        # (VLLM_EXL3_INDEXER_MXFP8=1); the bf16 handling below then carries
+        # the default path's rows into _exl3_bf16_weight and apply() runs
+        # the plain BF16 GEMM for those two slices of the fused
+        # [q | k | v | index_q | index_k] output.
+        if indexer_shards:
+            self._process_indexer_shards(
+                layer, output_sizes, bf16_shards, indexer_shards, indexer_mxfp8
+            )
         if bf16_shards and hasattr(layer, "weight"):
             bf16_rows = sum(output_sizes[i] for i in bf16_shards)
             if bf16_rows > 0:
@@ -5582,7 +6532,7 @@ class Exl3LinearMethod(LinearMethodBase):
                 pass
 
         # Free fused parameters to avoid memory doubling
-        for param_name in ("trellis", "suh", "svh", "mcg", "mul1"):
+        for param_name in ("trellis", "suh", "svh", "mcg", "mul1", "weight_scale"):
             if hasattr(layer, param_name):
                 try:
                     delattr(layer, param_name)
@@ -5594,6 +6544,99 @@ class Exl3LinearMethod(LinearMethodBase):
                 delattr(layer, "_exl3_shard_trellis")
             except Exception:
                 pass
+
+    def _process_indexer_shards(
+        self,
+        layer,
+        output_sizes,
+        bf16_shards,
+        indexer_shards,
+        indexer_mxfp8,
+    ) -> None:
+        """Finish the MiniMax MSA indexer shards at load end.
+
+        Default (switch off): dequantize the stashed MXFP8 payloads
+        (F8_E4M3 + E8M0 block-32 scales) into their BF16 staging rows --
+        byte-identical to the pre-switch loader. With
+        VLLM_EXL3_INDEXER_MXFP8=1: retain each shard in its native MXFP8
+        form (payload fp8 + E8M0 scales in the layout the kernel expects)
+        and bind vLLM's own weight-only Marlin MXFP8 kernel (W8A16, bf16
+        activations), failing closed if the kernel is unavailable; the
+        stash is freed either way.
+        """
+        if indexer_mxfp8:
+            shims = []
+            kernel_names = []
+            # The real-serve placement fix (boot14): the stashed payload and
+            # scales are CPU-resident loader source views here -- vLLM's
+            # device-loading context moves only REGISTERED parameters --
+            # so they must be moved onto the layer's CUDA device before
+            # the Marlin repack, and the CPU copies released (GB10 UMA:
+            # a lingering CPU copy would erase the saving).
+            target_device = _indexer_mxfp8_target_device(layer)
+            for slot, shard_idx in enumerate(indexer_shards):
+                payload = layer._exl3_indexer_payloads[slot]
+                scales = layer._exl3_indexer_scales[slot]
+                if payload is None or scales is None:
+                    raise RuntimeError(
+                        f"EXL3 indexer shard {shard_idx} incomplete at load end "
+                        f"(payload={'set' if payload is not None else 'missing'}, "
+                        f"scales={'set' if scales is not None else 'missing'})"
+                    )
+                moved_payload, moved_scales = indexer_mxfp8_move_to_device(
+                    payload, scales, target_device, shard_idx
+                )
+                # Drop every reference to the CPU-side stash immediately:
+                # the moved tensors are fresh device storages and the
+                # source views must not linger on the shared UMA pool.
+                layer._exl3_indexer_payloads[slot] = None
+                layer._exl3_indexer_scales[slot] = None
+                payload = None
+                scales = None
+                payload_fp8, scales_u8 = indexer_mxfp8_retain(
+                    moved_payload, moved_scales
+                )
+                kernel = indexer_mxfp8_kernel(tuple(payload_fp8.shape))
+                shim = make_indexer_mxfp8_shim(payload_fp8, scales_u8)
+                # The kernel's own load-time step: it repacks the fp8
+                # payload and the E8M0 scale block into its weight-only
+                # (W8A16) GEMM format -- a byte-preserving permutation at
+                # these shard shapes, so the retained footprint does not
+                # grow. The repack transient is per shard: the kernel's
+                # load step replaces the shim's payload/scale parameters
+                # with the repacked tensors, releasing the retained fp8
+                # form in the same step.
+                kernel.process_weights_after_loading(shim)
+                shims.append((kernel, shim))
+                kernel_names.append(type(kernel).__name__)
+            layer._exl3_indexer_mxfp8 = shims
+            layer._exl3_indexer_mxfp8_kernels = kernel_names
+            return
+        staging_in = int(layer.weight.data.shape[1])
+        for slot, shard_idx in enumerate(indexer_shards):
+            payload = layer._exl3_indexer_payloads[slot]
+            scales = layer._exl3_indexer_scales[slot]
+            if payload is None or scales is None:
+                raise RuntimeError(
+                    f"EXL3 indexer shard {shard_idx} incomplete at load end "
+                    f"(payload={'set' if payload is not None else 'missing'}, "
+                    f"scales={'set' if scales is not None else 'missing'})"
+                )
+            if payload.dtype != torch.uint8:
+                payload = payload.view(torch.uint8)
+            weight_bf16 = dequant_minimax_indexer(payload, scales)
+            bf16_idx = bf16_shards.index(shard_idx)
+            row_start = sum(output_sizes[j] for j in bf16_shards[:bf16_idx])
+            row_end = row_start + output_sizes[shard_idx]
+            if tuple(weight_bf16.shape) != (row_end - row_start, staging_in):
+                raise RuntimeError(
+                    f"EXL3 indexer shard {shard_idx} dequant shape "
+                    f"{tuple(weight_bf16.shape)} does not match its staging "
+                    f"rows ({row_end - row_start}, {staging_in})"
+                )
+            layer.weight.data[row_start:row_end].copy_(weight_bf16)
+            layer._exl3_indexer_payloads[slot] = None
+            layer._exl3_indexer_scales[slot] = None
 
     def apply(
         self,
@@ -5642,10 +6685,21 @@ class Exl3LinearMethod(LinearMethodBase):
         output_sizes = layer._exl3_linear_output_partition_sizes
         n_shards = len(linears)
 
+        # Retained-MXFP8 indexer shards (VLLM_EXL3_INDEXER_MXFP8=1): one
+        # (kernel, shim) pair per shard; their GEMM is vLLM's own MXFP8
+        # linear kernel and the output slice lands in the same fused
+        # [q | k | v | index_q | index_k] layout with the same dtype.
+        indexer_mxfp8 = getattr(layer, "_exl3_indexer_mxfp8", None)
+        indexer_shard_ids = getattr(layer, "_exl3_indexer_shards", ())
+
         # Run each shard in declared order
         outputs = []
         for i in range(n_shards):
-            if i in bf16_shards:
+            if indexer_mxfp8 is not None and i in indexer_shard_ids:
+                kernel, shim = indexer_mxfp8[indexer_shard_ids.index(i)]
+                out = kernel.apply_weights(shim, x_2d).to(dtype=torch.float32)
+                outputs.append(out)
+            elif i in bf16_shards:
                 # BF16 shard: use dense linear
                 if bf16_weight is None:
                     raise RuntimeError(
