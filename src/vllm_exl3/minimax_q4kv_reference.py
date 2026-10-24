@@ -38,6 +38,7 @@ against the upstream decision boundaries.
 
 from __future__ import annotations
 
+import bisect
 import itertools
 import math
 import os
@@ -776,6 +777,299 @@ def dequant_pool_pages(pool_flat: torch.Tensor) -> torch.Tensor:
 
 
 _DEQUANT_LUT_CACHE: dict = {}
+
+
+# ---------------------------------------------------------------------------
+# Single-pass prefill dequant (fast path)
+#
+# The milestone-1 dequant above is a chain of ~30 elementwise kernels on
+# int32/float32 operands: ``data & 0xF`` / ``data >> 4`` on an int32 view
+# (4 bytes per packed byte), two ``e2m1_decode`` calls of ~8 passes each,
+# ``torch.stack`` to interleave the nibbles, ``repeat_interleave(16)`` to
+# expand the group scales, an fp32 multiply, then ``to(bf16)`` on two
+# *strided* views and two strided ``copy_`` into the staging buffer. It
+# moves ~8 MiB of intermediate traffic per 72 KiB pool page (measured fit
+# in lanes/research/q4-prefill-notes.md section 1.4: ~10.5 GB/s effective
+# at 2-page granularity, which is what makes q4 prefill slow down with
+# prefix length -- the whole prefix is restaged on every chunk).
+#
+# The fast path below is the same arithmetic with the intermediates
+# removed: one 256-entry byte -> (low nibble, high nibble) bf16 table,
+# group scales broadcast through a 5-D view instead of materialized by
+# ``repeat_interleave``, and an fp32 multiply rounded once to bf16 --
+# which is bit-identical to ``values * scales`` then ``.to(bf16)``
+# because the e2m1 ladder and the e4m3 scales are exactly representable
+# in bf16, so both sides compute round_bf16(exact product).
+# ---------------------------------------------------------------------------
+
+_BYTE_PAIR_LUT_CACHE: dict = {}
+
+
+def byte_pair_lut(device: torch.device | None = None) -> torch.Tensor:
+    """[256, 2] bf16 table: byte -> (low nibble value, high nibble value).
+
+    ``data byte j`` of a token holds elements ``(2j, 2j+1)`` as e2m1
+    nibbles, low nibble = even element, so a single gather over the byte
+    grid produces both interleaved halves with no ``stack`` and no shift.
+    """
+    dev = device if device is not None else torch.device("cpu")
+    key = dev
+    lut = _BYTE_PAIR_LUT_CACHE.get(key)
+    if lut is None:
+        codes = torch.arange(16, dtype=torch.int64, device=dev).to(torch.uint8)
+        ladder = e2m1_decode(codes).to(torch.bfloat16)  # [16], exact in bf16
+        table = torch.empty(256, 2, dtype=torch.bfloat16, device=dev)
+        table[:, 0] = ladder[torch.arange(256, device=dev) & 0xF]
+        table[:, 1] = ladder[(torch.arange(256, device=dev) >> 4) & 0xF]
+        _BYTE_PAIR_LUT_CACHE[key] = table
+        lut = table
+    return lut
+
+
+def scale_offset_table_2d(device: torch.device | None = None) -> torch.Tensor:
+    """[2, 128, 8] int32 (side, token, group) -> offset in the 1024-B block."""
+    dev = device if device is not None else torch.device("cpu")
+    key = ("2d", dev)
+    cached = _DEQUANT_LUT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    table = torch.stack(
+        (
+            _scale_offset_table(0, POOL_BLOCK_SIZE, device=dev),
+            _scale_offset_table(1, POOL_BLOCK_SIZE, device=dev),
+        )
+    ).to(torch.int32)
+    _DEQUANT_LUT_CACHE[key] = table
+    return table
+
+
+def _dequant_side_bf16(
+    flat: torch.Tensor,  # [n, 2H, SLOT_REGION] uint8
+    pages: torch.Tensor,  # [n] page ids
+    side: int,
+) -> torch.Tensor:
+    """[n, H, 128, 128] bf16: one pool side of ``pages``, single pass."""
+    slots = flat.shape[1]
+    n = int(pages.numel())
+    heads = slots // 2
+    dev = flat.device
+    data = flat[pages][:, side::2, :DATA_REGION].reshape(
+        n * heads, POOL_BLOCK_SIZE, DATA_BYTES
+    )
+    # int32 indices: this torch treats a uint8 index tensor as a boolean
+    # mask, and int64 would double the index traffic (the gather is the
+    # dominant term of this fallback path).
+    pair = byte_pair_lut(dev)[data.to(torch.int32)]  # [n*H,128,64,2]
+    vals = pair.reshape(n, heads, POOL_BLOCK_SIZE, HEAD_DIM)
+    stored = (
+        flat[pages][:, side::2, DATA_REGION:]
+        .reshape(n * heads, SCALE_REGION)
+        .gather(
+            1,
+            scale_offset_table_2d(dev)[side]
+            .reshape(1, SCALE_REGION)
+            .expand(n * heads, -1)
+            .to(torch.int64),
+        )
+        .reshape(n, heads, POOL_BLOCK_SIZE, NUM_GROUPS)
+    )
+    scales = e4m3_decode(stored).to(torch.bfloat16)
+    return (
+        vals.view(n, heads, POOL_BLOCK_SIZE, NUM_GROUPS, GROUP_SIZE)
+        * scales.view(n, heads, POOL_BLOCK_SIZE, NUM_GROUPS, 1)
+    ).reshape(n, heads, POOL_BLOCK_SIZE, HEAD_DIM)
+
+
+def dequant_pool_pages_bf16(pool_flat: torch.Tensor) -> torch.Tensor:
+    """Flat pool [pages, 2H, 9216] -> values [pages, 2H, 128, 128] bf16.
+
+    Single-pass equivalent of :func:`dequant_pool_pages` followed by a
+    bf16 cast: bit-identical (the ladder and the e4m3 scales are exact in
+    bf16, and both paths round one fp32 product), at ~1/8 the traffic.
+    """
+    pages, slots, region = pool_flat.shape
+    if region != SLOT_REGION:
+        raise ValueError("pool flat regions are 9216 bytes")
+    ids = torch.arange(pages, dtype=torch.int64, device=pool_flat.device)
+    k = _dequant_side_bf16(pool_flat, ids, 0)
+    v = _dequant_side_bf16(pool_flat, ids, 1)
+    out = torch.empty(
+        pages, slots, POOL_BLOCK_SIZE, HEAD_DIM,
+        dtype=torch.bfloat16, device=pool_flat.device,
+    )
+    out[:, 0::2] = k
+    out[:, 1::2] = v
+    return out
+
+
+# Pages dequantized per transient allocation in the fast staging fill.
+# Bounds the transient at 32 * 0.5 MiB = 16 MiB regardless of the slice
+# size, while keeping the per-launch work large enough to stay off the
+# launch-overhead floor (the legacy path uses 2).
+_FAST_STAGING_CHUNK_PAGES = 32
+
+
+def fill_staging_buffer_fast(
+    buffer: torch.Tensor,  # bf16 [capacity, H, 128, 2*HEAD_DIM]
+    pool: torch.Tensor,  # bound uint8 [nb, 2H, 128, 72]
+    pages: torch.Tensor,  # sorted unique physical page ids (may be empty)
+    chunk_pages: int | None = None,
+) -> int:
+    """Dequant ``pages`` into ``buffer[:n]`` in one pass per side.
+
+    Same output bytes as :func:`fill_staging_buffer` (bit-identical), at
+    ~8x less memory traffic: the K and V halves are gathered straight
+    into the staging rows instead of being materialized as fp32 and
+    copied through strided views.
+    """
+    nb, slots, tokens, width = pool.shape
+    if slots % 2 or tokens != POOL_BLOCK_SIZE or width != ROW_BYTES:
+        raise ValueError("pool must be [nb, 2*num_kv_heads, 128, 72]")
+    n = int(pages.numel())
+    if n > buffer.shape[0] - 1:
+        raise ValueError(
+            f"staging buffer holds {buffer.shape[0] - 1} pages, need {n}"
+        )
+    heads = slots // 2
+    step = chunk_pages if chunk_pages is not None else _FAST_STAGING_CHUNK_PAGES
+    flat = pool.reshape(nb, slots, SLOT_REGION)
+    for lo in range(0, n, step):
+        hi = min(lo + step, n)
+        sel = pages[lo:hi].to(torch.int64)
+        k = _dequant_side_bf16(flat, sel, 0)
+        v = _dequant_side_bf16(flat, sel, 1)
+        buffer[lo:hi, :, :, :HEAD_DIM].copy_(k)
+        buffer[lo:hi, :, :, HEAD_DIM:].copy_(v)
+    buffer[n].zero_()
+    return n
+
+
+def _first_row_at_or_after(bitmap: torch.Tensor, a: int) -> torch.Tensor:
+    """[nb] int64: first row index >= ``a`` that is True, else ``nrows``."""
+    nrows = bitmap.shape[0]
+    sub = bitmap[a:]
+    rows = torch.arange(a, nrows, dtype=torch.int64, device=bitmap.device)
+    return torch.where(sub, rows.view(-1, 1), torch.full_like(
+        rows.view(-1, 1), nrows
+    )).amin(0)
+
+
+def _union_curve(bitmap: torch.Tensor, a: int) -> list:
+    """Exact union size of ``bitmap[a : a + k]`` for every ``k``.
+
+    ``cov[k] = #{p : p selected by some row in [a, a+k)}``. A page is
+    covered by the range iff its FIRST occurrence at or after ``a`` is
+    ``< a + k``, so the curve is a searchsorted over the sorted
+    first-occurrence indices: exact, and a single host transfer per
+    slice (the legacy planner paid one host sync per row, i.e. up to
+    1024 per layer per chunk at 32K).
+    """
+    nrows = bitmap.shape[0]
+    first = _first_row_at_or_after(bitmap, a)
+    ordered = torch.sort(first).values
+    bs = torch.arange(a, nrows + 1, dtype=torch.int64, device=bitmap.device)
+    return torch.searchsorted(ordered, bs, right=False).tolist()
+
+
+def _greedy_row_slices_fast(bitmap: torch.Tensor, max_pages: int) -> list:
+    """Same partition as :func:`_greedy_row_slices`, without per-row syncs."""
+    nrows = bitmap.shape[0]
+    ranges: list = []
+    start = 0
+    while start < nrows:
+        cov = _union_curve(bitmap, start)  # cov[k] = union of [start, start+k)
+        k = bisect.bisect_right(cov, max_pages) - 1
+        if k <= 0:
+            k = 1  # hard floor: one row alone exceeds the cap
+        ranges.append((start, start + k))
+        start += k
+    return ranges
+
+
+def plan_prefill_slices_fast(
+    pool: torch.Tensor,  # bound uint8 [nb, 2H, 128, 72]
+    block_table: torch.Tensor,  # [num_reqs, max_blocks]
+    topk_idx: torch.Tensor,  # [nkv, total_q, topk] logical block ids
+    cu_seqlens_q: torch.Tensor,  # [num_reqs + 1]
+    num_kv_heads: int,
+    max_pages: int,
+) -> list[dict]:
+    """Same slice plan as :func:`plan_prefill_slices`, one sync per slice.
+
+    The plan is identical (same greedy, same tie-breaks, same hard
+    floor); only the union-size evaluation changes -- from one host sync
+    per row to one host transfer per slice. Pinned against the legacy
+    planner on CPU in tests/test_minimax_q4kv.py.
+    """
+    nb, slots, tokens, width = pool.shape
+    if (
+        slots != 2 * num_kv_heads
+        or tokens != POOL_BLOCK_SIZE
+        or width != ROW_BYTES
+    ):
+        raise ValueError("pool must be [nb, 2*num_kv_heads, 128, 72] uint8")
+    if max_pages < 1:
+        raise ValueError("max_pages must be >= 1")
+    dev = pool.device
+    req_bitmap, phys, _ = _selected_page_bitmap(
+        pool, block_table, topk_idx, cu_seqlens_q
+    )
+    cu = cu_seqlens_q.to(torch.int64).tolist()
+    total_q = topk_idx.shape[1]
+    if (
+        cu[0] != 0
+        or cu[-1] != total_q
+        or any(b < a for a, b in zip(cu, cu[1:]))
+    ):
+        raise ValueError(
+            "cu_seqlens_q must start at 0, be non-decreasing, and cover "
+            f"the {total_q}-query axis of topk_idx"
+        )
+
+    def row_union(bitmap: torch.Tensor, lo: int, hi: int) -> torch.Tensor:
+        return (
+            bitmap[lo:hi].any(0).nonzero().reshape(-1).to(torch.int64)
+        )
+
+    slices: list[dict] = []
+    for rs, re_ in _greedy_row_slices_fast(req_bitmap, max_pages):
+        pages = row_union(req_bitmap, rs, re_)
+        if re_ - rs == 1 and int(pages.numel()) > max_pages:
+            # One request's own union exceeds the cap: split IT along the
+            # query axis, exactly as the legacy planner does.
+            r = rs
+            lo, hi = cu[r], cu[r + 1]
+            q_bitmap = torch.zeros(
+                (hi - lo, nb), dtype=torch.bool, device=dev
+            )
+            sel = phys[:, lo:hi, :]
+            rows = (
+                torch.arange(hi - lo, dtype=torch.int64, device=dev)
+                .view(1, -1, 1)
+                .expand_as(sel)
+                .reshape(-1)
+            )
+            m = sel.reshape(-1) >= 0
+            q_bitmap[rows[m], sel.reshape(-1)[m]] = True
+            for qs, qe in _greedy_row_slices_fast(q_bitmap, max_pages):
+                slices.append(
+                    {
+                        "reqs": [r],
+                        "q": (lo + qs, lo + qe),
+                        "pages": row_union(q_bitmap, qs, qe),
+                    }
+                )
+        else:
+            slices.append(
+                {
+                    "reqs": list(range(rs, re_)),
+                    "q": (cu[rs], cu[re_]),
+                    "pages": pages,
+                }
+            )
+    for s in slices:
+        s["n"] = int(s["pages"].numel())
+    return slices
 
 
 def build_prefill_staging(

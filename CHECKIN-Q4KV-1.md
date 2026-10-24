@@ -1059,3 +1059,145 @@ CUDA graph), whether the production scale tensors are the same object
 across warm-up and capture on GB10 (pinned from the vllm-image source:
 per-layer attributes set once by `set_default_quant_scales`, but
 observed only at a real boot), and the end-to-end serve.
+
+## Post-boot21: q4 prefill cost model + fast staging (this commit)
+
+Measured (receipts/boot21, 32K q4 production, GB10, `mnbt=1024`):
+prefill **338 / 324 / 276 tok/s** at 6,532 / 12,071 / 24,798 prompt
+tokens (TTFT 19.3 / 37.2 / 89.8 s) against **~380 tok/s flat** for fp8.
+Excess per 1024-token chunk: **+0.335 / +0.466 / +1.015 s**.
+
+### Cost model (lanes/research/q4-prefill-notes.md)
+
+Per layer per chunk, `_make_prefill_wrapper` (`minimax_q4kv.py:524`)
+restages the selected pages with `plan_prefill_slices` +
+`fill_staging_buffer`, then calls the vendor prefill kernel. Two facts
+follow from the code and reproduce the measurement:
+
+1. **The staged union is the whole prefix.** With `topk_blocks=16` per
+   query per KV head and 1024 queries per chunk, the union of the
+   selected physical pages saturates: `U = nb = ceil(prefix/128)`
+   (52 / 95 / 192 pages at the three lengths; the 25K point crosses the
+   48 MiB = 96-page cap and runs as 2 slices, hence 192). Measured on
+   the shipped planner by
+   `/root/.hermes/cache/scratch/q4_prefill_plan_count.py`.
+2. **Each page costs ~8 MiB of intermediate traffic.** `dequant_pool_pages`
+   (`minimax_q4kv_reference.py:734`) runs `data & 0xF` / `data >> 4` on
+   an int32 view, two `e2m1_decode` calls of ~8 passes each, a
+   `torch.stack`, a `repeat_interleave(16)` scale expansion, an fp32
+   multiply, then `to(bf16)` on two strided views and two strided
+   `copy_` — ~30 elementwise kernels over 72 KiB of pool. At
+   `_STAGING_DEQUANT_CHUNK_PAGES = 2` (`:853`) they are launch-bound.
+
+`delta = L·U·T_page/BW` with `L = 60` layers and `T_page = 8 MiB` gives
+**BW = 8.9 / 11.7 / 10.8 GB/s** at the three lengths: one constant,
+±14 %, over a 3x range of prefix length. The model therefore explains
+both the magnitude and the length dependence — the prefix is
+re-dequantized from scratch on every chunk, so the cost is linear in
+prompt length. Extrapolated to 32K (U = 288 under the cap) it predicts
+260 tok/s.
+
+A third defect compounds it: `_greedy_row_slices`
+(`minimax_q4kv_reference.py:938`) evaluates its cap with
+`int(u.sum())` **once per row**, i.e. up to 1024 host syncs per layer
+per chunk (61k per chunk) once a request's union exceeds the cap.
+
+### Fix — `VLLM_EXL3_Q4KV_PREFILL_FAST` (default off)
+
+- **`q4_stage_pages` / `_q4_stage_kernel`** (`minimax_q4kv_kernels.py`):
+  one Triton launch per slice, one program per (page, head, 32-token
+  tile), both sides via `static_range`. Reads the 64 data bytes + 8
+  scale bytes of each token row and writes the bf16 staging row
+  directly — 72 KiB read + 256 KiB write per page, no int32
+  intermediate, no `stack`, no `repeat_interleave`, no strided `copy_`.
+- **`fill_staging_buffer_fast` / `dequant_pool_pages_bf16`**
+  (`minimax_q4kv_reference.py`): the same single-pass math in pure torch
+  (256-entry byte→(lo,hi) bf16 LUT, group scales broadcast through a 5-D
+  view, one `mul_`). The CPU-testable oracle and the no-triton fallback.
+- **`plan_prefill_slices_fast` / `_union_curve`**: exact union sizes via
+  `searchsorted` over per-page first-occurrence indices — **one host
+  transfer per slice** instead of one sync per row.
+- Memory is **unchanged**: same grow-once 48 MiB staging buffer, no new
+  allocation, transient ≤ 32 pages × 0.5 MiB = 16 MiB.
+
+**Bit-identity is the safety argument.** The e2m1 ladder
+`{0,±.5,±1,±1.5,±2,±3,±4,±6}` and the e4m3 group scales are exactly
+representable in bf16, so an fp32 multiply rounded once to bf16 is what
+both `values * scales` then `.to(bf16)` and the fused kernel compute. All
+three new pieces are pinned to the legacy result bit for bit (including
+NaN positions) on real packed pool bytes.
+
+Rejected: a persistent bf16 prefix-page cache (would remove a further
+12.5x, but costs `nb·L·256 KiB` = **3.84 GiB at 32K**, which the memory
+budget cannot take), fp8 staging (half the traffic, but adds a 2^-4
+relative rounding to K/V), and a full R1 fused attention reader (zero
+staging traffic, but a new attention kernel; unnecessary once the staging
+traffic is <1 % of the chunk).
+
+### Predicted (model, not measured)
+
+| | today | fast (Triton) | fast (torch fallback) |
+|---|---|---|---|
+| traffic / page | ~8 MiB | 0.33 MiB | ~1.2 MiB |
+| 32K delta / chunk | 1.26 s | ~17 ms | ~60 ms |
+| 32K tok/s | 260 | **~377** | ~371 |
+| extra memory | — | 0 | 0 |
+
+i.e. parity with fp8 (380 tok/s); the residual is the 328 KiB/page
+staging write that the fp8 path does not pay at all.
+
+### Tests (red venv)
+
+15 new (83/83 green in `tests/test_minimax_q4kv.py`): fast dequant and
+fast staging fill are bit-identical to the fp32 chain (and
+chunk-size-invariant, and refuse an over-capacity selection); the fast
+planner reproduces the legacy plan exactly on six synthetic selection
+patterns (including the over-cap and 194-page cases) and on the packed
+multi-request fixture at four caps, and still enforces the
+`cu_seqlens_q` contract; the fast planner performs **zero** boolean
+`sum()` syncs where the legacy planner performs at least one per query
+row; the knob defaults off, parses the documented spellings, and fails
+closed on garbage; the wrapper's fast dispatch changes neither the call
+sequence nor a single staged byte; the staging wrapper carries no
+`item/tolist/cpu/synchronize` (prefill is never captured under
+`FULL_DECODE_ONLY` — `config/compilation.py:62-67` with
+`cudagraph_utils.py:264-266` — but the call site is sync-free anyway);
+the transient bound and the harness/frontend-check registration.
+Full suite: **685 passed, 39 skipped, the same 8 pre-existing
+failures** (`test_compact_safetensors*.py`,
+`test_compact_source_verification_window.py`).
+
+### GB10 harness
+
+`--cpu-dry-run`: **PASS (11/11)** including the new
+`dry/8-prefill-fast-structure`. Two new GPU units:
+
+- **6/prefill-fast-staging** — `VLLM_EXL3_Q4KV_PREFILL_FAST=1` vs `=0`
+  on the case-5 fixture: `torch.equal(fast, legacy)`,
+  cos(fast, vendor-bf16) >= 0.995, cos(oracle, vendor-bf16) >= 0.999
+  (ORACLE DRIFT), finite.
+- **7/prefill-timing** — per-layer, per-chunk prefill time at 8K / 16K /
+  30K prefixes (`long_prefill_inputs`, one request, `topk_blocks=16`,
+  1024-token chunk) for legacy, fast, and the no-staging reference (the
+  ORIGINAL kernel on an unquantized bf16 pool); reports the model-wide
+  per-chunk seconds and projected tok/s at `MODEL_LAYERS = 60`. Gates:
+  fast faster than legacy at every length, staged bytes identical, and
+  fast within 5 % of the no-staging reference at 30K.
+
+`tools/q4kv_triton_frontend_check.py` now also frontend-compiles the
+staging kernel for sm_121 (int64 and int32 page-id variants) before any
+GPU case, so a frontend break dies fast.
+
+```
+docker run <minimax-m3.1-flash vllm image, vLLM 0.1.dev23341+g8744dd2fb> \
+  -v <this worktree>:/plugin:ro -v <receipts dir>:/receipts \
+  -w /plugin -e PYTHONPATH=/plugin/src \
+  python3 tools/gb10_q4kv_parity.py --json /receipts/val10/q4kv.json
+```
+
+Unverified on this VPS (no GPU, no triton): the sm_121 compile of
+`_q4_stage_kernel` and its real bandwidth, every number in the predicted
+table above, and the end-to-end 32K serve. The 0.33 MiB/page traffic
+figure is exact from the kernel's loads/stores; the 377 tok/s is a
+bandwidth model. Turn the knob on for a boot only after unit 7 reports
+`tok_s_fast` within 5 % of `tok_s_no_staging`.

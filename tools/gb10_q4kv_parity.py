@@ -110,7 +110,9 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -1028,6 +1030,187 @@ def unit_5() -> dict:
     }
 
 
+def unit_6() -> dict:
+    """Fast prefill staging (VLLM_EXL3_Q4KV_PREFILL_FAST=1) accuracy.
+
+    The fast path must be OBSERVABLY IDENTICAL to the milestone-1 staged
+    path: same slice plan, same staged bf16 bytes, therefore the same
+    attention output bit for bit. Gates:
+      - torch.equal(fast, legacy) over the full output buffer;
+      - cos(fast, vendor-bf16 ground truth) >= 0.995 (tighter than case
+        5's 0.99: this leg must not add any error at all);
+      - cos(fp32 oracle, vendor-bf16) >= 0.999 (ORACLE DRIFT);
+      - finite output.
+    """
+    inp = hi.prefill_inputs()
+    hi.validate_prefill_inputs(inp)
+    from vllm.models.minimax_m3.common.ops.sparse_attn import (
+        minimax_m3_sparse_attn as original,
+    )
+    from vllm_exl3 import minimax_q4kv as q4ov
+
+    overlay = q4ov._make_prefill_wrapper(original)
+    out_truth = _run_vendor(original, "prefill", inp, "bf16_pool", "cuda")
+    os.environ["VLLM_EXL3_Q4KV_PREFILL_FAST"] = "0"
+    try:
+        out_legacy = _run_vendor(overlay, "prefill", inp, "pool", "cuda")
+    finally:
+        os.environ.pop("VLLM_EXL3_Q4KV_PREFILL_FAST", None)
+    os.environ["VLLM_EXL3_Q4KV_PREFILL_FAST"] = "1"
+    try:
+        out_fast = _run_vendor(overlay, "prefill", inp, "pool", "cuda")
+    finally:
+        os.environ.pop("VLLM_EXL3_Q4KV_PREFILL_FAST", None)
+    oracle = ref.reference_prefill_attention(
+        inp["q"].to(torch.float32), inp["k_vals"].contiguous(),
+        inp["v_vals"].contiguous(), inp["block_table"], inp["topk"],
+        inp["cu_seqlens_q"], inp["seq_lens"], inp["prefix_lens"],
+        inp["sm_scale"],
+    )
+    bit_equal = bool(torch.equal(out_fast, out_legacy))
+    finite = bool(torch.isfinite(out_fast).all())
+    cos_fast_truth = _cos(out_fast, out_truth)
+    cos_oracle_truth = _cos(oracle, out_truth)
+    oracle_drift = cos_oracle_truth >= 0.999
+    passed = (
+        bit_equal and finite and oracle_drift and cos_fast_truth >= 0.995
+    )
+    return {
+        "passed": passed,
+        "fast_equals_legacy_bitwise": bit_equal,
+        "cos_fast_vs_vendor_bf16_truth": cos_fast_truth,
+        "cos_oracle_vs_vendor_bf16_truth": cos_oracle_truth,
+        "oracle_drift": oracle_drift,
+        "output_finite": finite,
+        "summary": (
+            f"fast==legacy bit-identical={bit_equal}; "
+            f"cos(fast, vendor-bf16)={cos_fast_truth:.6f}; "
+            f"cos(oracle, vendor-bf16)={cos_oracle_truth:.6f}; "
+            + ("ORACLE DRIFT; " if not oracle_drift else "")
+            + f"finite={finite}"
+        ),
+    }
+
+
+# Prefix lengths of the measured serve (receipts/boot21: 6,532 / 12,071 /
+# 24,798 prompt tokens -> 338 / 324 / 276 tok/s) rounded up to whole
+# 128-token pages, plus the 32K production limit.
+TIMING_PAGES = (64, 128, 240)  # 8K / 16K / 30K tokens
+TIMING_REPS = 3
+MODEL_LAYERS = 60  # boot21: layers 0..59
+CHUNK_TOKENS = 1024  # max_num_batched_tokens
+
+
+def _time_ms(fn, reps: int = TIMING_REPS) -> float:
+    """Best-of-``reps`` wall time of ``fn`` in ms (sync around each)."""
+    best = float("inf")
+    for _ in range(reps):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        fn()
+        torch.cuda.synchronize()
+        best = min(best, (time.perf_counter() - t0) * 1e3)
+    return best
+
+
+def unit_7() -> dict:
+    """Per-chunk prefill time, legacy vs fast, at 8K / 16K / 30K prefixes.
+
+    One layer of one 1024-token chunk per measurement (the harness has no
+    engine); the receipt reports the per-layer time and the model-wide
+    per-chunk figure using ``MODEL_LAYERS`` layers, plus the projected
+    prefill tok/s. The reference leg is the ORIGINAL kernel on an
+    UNQUANTIZED bf16 pool -- the no-staging cost, i.e. what the fp8 path
+    pays (slightly conservative: bf16 K/V reads are 2x the fp8 bytes).
+
+    Gates: fast is faster than legacy at every length AND within 5 % of
+    the no-staging reference at 30K (the measured slowdown endpoint);
+    staged bytes are bit-identical (re-checked here per length).
+    """
+    from vllm.models.minimax_m3.common.ops.sparse_attn import (
+        minimax_m3_sparse_attn as original,
+    )
+    from vllm_exl3 import minimax_q4kv as q4ov
+
+    overlay = q4ov._make_prefill_wrapper(original)
+    rows = []
+    problems = []
+    for nb in TIMING_PAGES:
+        inp = hi.long_prefill_inputs(nb, chunk=CHUNK_TOKENS)
+        ref_ms = _time_ms(
+            lambda: _run_vendor(original, "prefill", inp, "bf16_pool", "cuda")
+        )
+
+        def run_legacy():
+            os.environ["VLLM_EXL3_Q4KV_PREFILL_FAST"] = "0"
+            try:
+                return _run_vendor(overlay, "prefill", inp, "pool", "cuda")
+            finally:
+                os.environ.pop("VLLM_EXL3_Q4KV_PREFILL_FAST", None)
+
+        def run_fast():
+            os.environ["VLLM_EXL3_Q4KV_PREFILL_FAST"] = "1"
+            try:
+                return _run_vendor(overlay, "prefill", inp, "pool", "cuda")
+            finally:
+                os.environ.pop("VLLM_EXL3_Q4KV_PREFILL_FAST", None)
+
+        legacy_ms = _time_ms(run_legacy)
+        fast_ms = _time_ms(run_fast)
+        same = bool(torch.equal(run_fast(), run_legacy()))
+        row = {
+            "prefix_tokens": nb * 128,
+            "pages": nb,
+            "slices": len(
+                ref.plan_prefill_slices_fast(
+                    inp["pool"].to("cuda"), inp["block_table"].to("cuda"),
+                    inp["topk"].to("cuda"), inp["cu_seqlens_q"].to("cuda"),
+                    NKV, ref.staging_max_pages(NKV),
+                )
+            ),
+            "layer_ms_no_staging": ref_ms,
+            "layer_ms_legacy": legacy_ms,
+            "layer_ms_fast": fast_ms,
+            "chunk_s_legacy": legacy_ms * MODEL_LAYERS / 1e3,
+            "chunk_s_fast": fast_ms * MODEL_LAYERS / 1e3,
+            "tok_s_legacy": CHUNK_TOKENS / (legacy_ms * MODEL_LAYERS / 1e3),
+            "tok_s_fast": CHUNK_TOKENS / (fast_ms * MODEL_LAYERS / 1e3),
+            "tok_s_no_staging": CHUNK_TOKENS / (ref_ms * MODEL_LAYERS / 1e3),
+            "staged_bytes_identical": same,
+        }
+        rows.append(row)
+        if not same:
+            problems.append(f"{nb} pages: staged bytes differ")
+        if fast_ms >= legacy_ms:
+            problems.append(
+                f"{nb} pages: fast {fast_ms:.3f} ms is not faster than "
+                f"legacy {legacy_ms:.3f} ms"
+            )
+    top = rows[-1]
+    if top["layer_ms_fast"] > 1.05 * top["layer_ms_no_staging"]:
+        problems.append(
+            f"32K-equivalent: fast {top['layer_ms_fast']:.3f} ms exceeds "
+            f"1.05x the no-staging reference "
+            f"{top['layer_ms_no_staging']:.3f} ms"
+        )
+    return {
+        "passed": not problems,
+        "rows": rows,
+        "problems": problems,
+        "summary": (
+            "; ".join(
+                f"{r['prefix_tokens']}tok: {r['layer_ms_legacy']:.2f} -> "
+                f"{r['layer_ms_fast']:.2f} ms/layer "
+                f"({r['tok_s_legacy']:.0f} -> {r['tok_s_fast']:.0f} tok/s, "
+                f"no-staging {r['tok_s_no_staging']:.0f})"
+                for r in rows
+            )
+            if not problems
+            else "; ".join(problems)
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Runner: every unit runs to completion; one line per unit; JSON receipt;
 # non-zero exit if anything failed.
@@ -1898,6 +2081,87 @@ def _dry_decode_step_audit() -> dict:
     }
 
 
+def _dry_prefill_fast_audit() -> dict:
+    """CPU audit of the fast prefill staging path (unit 6/7 structure).
+
+    No triton, no GPU: builds the long-prefix fixture, checks the fast
+    planner against the legacy planner at the timing lengths (the plan
+    must be identical or the staged bytes differ), checks the fast
+    dequant is bit-identical to the fp32 chain on real pool bytes, and
+    pins the harness structure (both legs set the knob, both restore it,
+    and unit 7's gates are the 5 %-of-no-staging and faster-than-legacy
+    pair).
+    """
+    problems: list[str] = []
+    for nb in (64, 128, 240):
+        inp = hi.long_prefill_inputs(nb, chunk=CHUNK_TOKENS)
+        cap = ref.staging_max_pages(NKV)
+        legacy = ref.plan_prefill_slices(inp["pool"], inp["block_table"],
+                                        inp["topk"], inp["cu_seqlens_q"],
+                                        NKV, cap)
+        fast = ref.plan_prefill_slices_fast(inp["pool"], inp["block_table"],
+                                           inp["topk"], inp["cu_seqlens_q"],
+                                           NKV, cap)
+        if len(fast) != len(legacy):
+            problems.append(f"{nb} pages: {len(fast)} != {len(legacy)} slices")
+            continue
+        for a, b in zip(legacy, fast):
+            if a["q"] != b["q"] or not torch.equal(a["pages"], b["pages"]):
+                problems.append(f"{nb} pages: plan differs at {a['q']}")
+                break
+    # dequant bit-identity on the fixture's real packed bytes
+    inp = hi.long_prefill_inputs(8, chunk=64)
+    flat = inp["pool"].reshape(8, 2 * NKV, ref.SLOT_REGION)
+    legacy_vals = ref.dequant_pool_pages(flat).to(torch.bfloat16)
+    fast_vals = ref.dequant_pool_pages_bf16(flat)
+    nan = torch.isnan(legacy_vals)
+    if not torch.equal(nan, torch.isnan(fast_vals)) or not torch.equal(
+        legacy_vals[~nan], fast_vals[~nan]
+    ):
+        problems.append("fast dequant is not bit-identical on fixture bytes")
+    # an unvalidated fixture must fail closed
+    bad = hi.long_prefill_inputs(8, chunk=64)
+    bad["topk"] = bad["topk"].clone()
+    bad["topk"][0, 0, 0] = 10_000
+    try:
+        hi.validate_long_prefill_inputs(bad)
+    except ValueError:
+        pass
+    else:
+        problems.append("out-of-range topk was not refused")
+    src = Path(__file__).read_text()
+    for pin in (
+        'os.environ["VLLM_EXL3_Q4KV_PREFILL_FAST"] = "1"',
+        'os.environ.pop("VLLM_EXL3_Q4KV_PREFILL_FAST", None)',
+        "1.05 * top[\"layer_ms_no_staging\"]",
+        "fast_ms >= legacy_ms",
+        "torch.equal(out_fast, out_legacy)",
+    ):
+        if pin not in src:
+            problems.append(f"harness pin missing: {pin}")
+    # the knob defaults off and the wrapper dispatches on it
+    import vllm_exl3.minimax_q4kv as q4ov
+
+    saved = os.environ.pop("VLLM_EXL3_Q4KV_PREFILL_FAST", None)
+    try:
+        if q4ov._prefill_fast_enabled() is not False:
+            problems.append("VLLM_EXL3_Q4KV_PREFILL_FAST is not default-off")
+    finally:
+        if saved is not None:
+            os.environ["VLLM_EXL3_Q4KV_PREFILL_FAST"] = saved
+    return {
+        "passed": not problems,
+        "problems": problems,
+        "summary": (
+            "fast planner == legacy planner at 8K/16K/30K, fast dequant "
+            "bit-identical on real pool bytes, fixture fails closed, "
+            "knob default-off, unit 6/7 gates pinned"
+            if not problems
+            else "; ".join(problems)
+        ),
+    }
+
+
 def cpu_dry_run() -> int:
     units = [
         ("dry/0-w1-reference-runs", _dry_w1_reference),
@@ -1910,6 +2174,7 @@ def cpu_dry_run() -> int:
         ("dry/5-prefill-staging", _dry_prefill),
         ("dry/6-vendor-invocation-structure", _dry_vendor_args_audit),
         ("dry/7-decode-step-structure", _dry_decode_step_audit),
+        ("dry/8-prefill-fast-structure", _dry_prefill_fast_audit),
     ]
     return run_units(
         units,
@@ -1973,6 +2238,8 @@ def main() -> None:
         ("3/pool-bytes", unit_3),
         ("4/cuda-graph-replay", unit_4),
         ("5/prefill-staging", unit_5),
+        ("6/prefill-fast-staging", unit_6),
+        ("7/prefill-timing", unit_7),
     ]
     sys.exit(
         run_units(

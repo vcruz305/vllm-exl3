@@ -843,3 +843,87 @@ def validate_prefill_inputs(inp: dict) -> None:
             "q4 KV harness prefill input data inconsistent (fix the harness "
             "data, not the kernel): " + "; ".join(errors)
         )
+
+
+# ---------------------------------------------------------------------------
+# Long-prefix single-request fixture (the 32K production shape: max_num_seqs
+# 1, max_num_batched_tokens 1024, topk_blocks 16). Used by the prefill
+# timing unit and by the fast-staging correctness unit, which need the
+# prefix lengths where the measured q4 slowdown appears (338 -> 276 tok/s).
+# ---------------------------------------------------------------------------
+
+LONG_TOPK = 16  # container.log: topk_blocks=16
+
+
+def long_prefill_inputs(
+    nb_pages: int, chunk: int = 1024, seed: int = 5150
+) -> dict:
+    """One request, ``nb_pages`` cached pages, a ``chunk``-token prefill.
+
+    The layout mirrors :func:`prefill_inputs` (real packer, vendor K/V
+    order, per-(kv head, query) top-k with causal sentinels) for a single
+    sequence whose chunk starts at ``nb_pages * BLOCK - chunk``, i.e. the
+    last chunk of an ``nb_pages * BLOCK``-token prompt. Built on CPU.
+    """
+    nkv = NKV
+    prefix = nb_pages * BLOCK - chunk
+    if prefix < 0:
+        raise ValueError("chunk must not exceed the prefix capacity")
+    g = torch.Generator().manual_seed(seed)
+    k_vals = torch.randn((nb_pages, nkv, BLOCK, 128), generator=g) * 0.5
+    v_vals = torch.randn((nb_pages, nkv, BLOCK, 128), generator=g) * 0.5
+    flat = torch.zeros((nb_pages, 2 * nkv, ref.SLOT_REGION), dtype=torch.uint8)
+    for page in range(nb_pages):
+        for head in range(nkv):
+            flat[page, 2 * head] = ref.pack_slot_region_side(
+                k_vals[page, head], 0
+            )
+            flat[page, 2 * head + 1] = ref.pack_slot_region_side(
+                v_vals[page, head], 1
+            )
+    pool = flat.reshape(nb_pages, 2 * nkv, BLOCK, 72)
+    fp8_pool = torch.cat((k_vals, v_vals), dim=-1).to(torch.float8_e4m3fn)
+    bf16_pool = torch.cat((k_vals, v_vals), dim=-1).to(torch.bfloat16)
+    block_table = torch.arange(nb_pages, dtype=torch.int32).view(1, nb_pages)
+    # top-k: distinct valid logical blocks per (kv head, query); -1 above
+    # the query's causal valid-block count, exactly as the indexer emits.
+    q_abs = torch.arange(prefix, prefix + chunk, dtype=torch.int64)
+    valid_blocks = torch.clamp((q_abs + BLOCK) // BLOCK, max=nb_pages)
+    scores = torch.rand((nkv, chunk, nb_pages), generator=g)
+    order = scores.argsort(dim=-1, descending=True)
+    topk = torch.full((nkv, chunk, LONG_TOPK), -1, dtype=torch.int32)
+    for i in range(chunk):
+        real = min(LONG_TOPK, int(valid_blocks[i]))
+        if real > 0:
+            topk[:, i, :real] = order[:, i, :real].to(torch.int32)
+    q = (torch.randn((chunk, NQ, 128), generator=g) * 0.5).to(torch.bfloat16)
+    inp = dict(
+        q=q, pool=pool, fp8_pool=fp8_pool, bf16_pool=bf16_pool,
+        k_vals=k_vals, v_vals=v_vals, block_table=block_table, topk=topk,
+        cu_seqlens_q=torch.tensor([0, chunk], dtype=torch.int32),
+        seq_lens=torch.tensor([prefix + chunk], dtype=torch.int32),
+        prefix_lens=torch.tensor([prefix], dtype=torch.int32),
+        sm_scale=1.0 / math.sqrt(128.0),
+        max_query_len=chunk,
+    )
+    validate_long_prefill_inputs(inp)
+    return inp
+
+
+def validate_long_prefill_inputs(inp: dict) -> None:
+    """Fail closed on any out-of-range index in the long-prefix fixture."""
+    nb, slots, tokens, width = inp["pool"].shape
+    if slots != 2 * NKV or tokens != BLOCK or width != 72:
+        raise ValueError("long fixture pool must be [nb, 2*nkv, 128, 72]")
+    total_q = inp["topk"].shape[1]
+    cu = inp["cu_seqlens_q"].tolist()
+    if cu[0] != 0 or cu[-1] != total_q:
+        raise ValueError("long fixture cu_seqlens_q must cover the query axis")
+    if inp["q"].shape[0] != total_q:
+        raise ValueError("long fixture q does not match the query axis")
+    if int(inp["topk"].max()) >= inp["block_table"].shape[1]:
+        raise ValueError("long fixture topk exceeds the block-table width")
+    if int(inp["block_table"].max()) >= nb:
+        raise ValueError("long fixture block_table exceeds the pool")
+    if int(inp["seq_lens"].max()) > nb * BLOCK:
+        raise ValueError("long fixture seq_lens exceeds the pool capacity")
