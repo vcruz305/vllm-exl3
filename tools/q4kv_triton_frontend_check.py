@@ -236,6 +236,25 @@ def _r2_variants() -> dict[str, dict]:
     }
 
 
+def _stage_variants() -> dict[str, dict]:
+    # Pointer order of _q4_stage_kernel (pinned by q4_stage_pages):
+    # pool_ptr, stage_ptr, pages_ptr, n_heads, BLOCK_T (constexpr).
+    base = {
+        "pool_ptr": "*u8",
+        "stage_ptr": "*bf16",
+        "pages_ptr": "*i64",
+        "n_heads": "i32",
+        "BLOCK_T": 32,
+    }
+    return {
+        # tools/gb10_q4kv_parity.py units 6/7 (torch defaults are int64;
+        # q4_stage_pages normalizes to int64 before the launch).
+        "R1stage/parity-harness": dict(base),
+        # int32 page ids are accepted by the wrapper and cast on device.
+        "R1stage/serving-i32": {**base, "pages_ptr": "*i32"},
+    }
+
+
 def main() -> None:
     print("q4 KV Triton frontend check (sm_121, no GPU needed)")
     try:
@@ -244,12 +263,18 @@ def main() -> None:
         _fail(f"triton is not importable ({exc}); the q4 kernels cannot "
               "be frontend-checked in this environment")
     w1, decode = q4k._kernels()
-    variants = [(w1, _w1_variants()), (decode, _r2_variants())]
+    stage = q4k._stage_kernel()
+    variants = [
+        (w1, _w1_variants()),
+        (decode, _r2_variants()),
+        (stage, _stage_variants()),
+    ]
     for fn, table in variants:
         for label, variant in table.items():
             _compile_variant(triton, fn, label, variant)
     print("q4 KV FRONTEND CHECK PASSED "
-          "(W1 + R2 compile for sm_121 in every host dtype variant)")
+          "(W1 + R2 + R1-stage compile for sm_121 in every host "
+          "dtype variant)")
 
 
 if __name__ == "__main__":

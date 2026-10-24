@@ -545,8 +545,10 @@ def test_decode_wrapper_dispatch(monkeypatch) -> None:
 
 def test_prefill_wrapper_stages_and_remaps(monkeypatch) -> None:
     # The CPU-only suite simulates the GPU boundary by patching the gate's
-    # device-type constant (the check itself is never weakened).
+    # device-type constant (the check itself is never weakened). This test
+    # covers the milestone-1 path, still reachable via the =0 opt-out.
     monkeypatch.setattr(q4kernels, "_REQUIRED_DEVICE_TYPE", "cpu")
+    monkeypatch.setenv("VLLM_EXL3_Q4KV_PREFILL_FAST", "0")
     calls = []
     orig = lambda *a, **k: calls.append(("orig", a, k))  # noqa: E731
     wrapper = q4kv._make_prefill_wrapper(orig)
@@ -920,6 +922,9 @@ def test_prefill_wrapper_slices_and_reuses_buffer(monkeypatch) -> None:
     """The overlay's sliced executor passes the derived per-slice
     arguments to the original kernel and reuses ONE grow-once buffer."""
     monkeypatch.setattr(q4kernels, "_REQUIRED_DEVICE_TYPE", "cpu")
+    # milestone-1 path (the =0 opt-out); the fast path's call sequence is
+    # pinned by test_prefill_wrapper_fast_path_feeds_the_kernel_identical_bytes
+    monkeypatch.setenv("VLLM_EXL3_Q4KV_PREFILL_FAST", "0")
     monkeypatch.setenv("VLLM_EXL3_Q4KV_STAGING_MAX_MB", "0.001")
     monkeypatch.setattr(q4kv, "_STAGING_BUFFERS", {})
     fx = _prefill_chunk_fixture()
@@ -2662,3 +2667,452 @@ def test_overlay_pins_the_vllm_capture_evidence() -> None:
         assert pin in src, f"overlay lost the capture-evidence pin {pin!r}"
     # the prefill slice metadata is documented as never captured.
     assert "never captured" in src
+
+
+# ---------------------------------------------------------------------------
+# Prefill fast path (VLLM_EXL3_Q4KV_PREFILL_FAST): single-pass staging
+#
+# The milestone-1 prefill path restages the whole prefix on every chunk
+# through a ~30-kernel int32/float32 chain (~8 MiB moved per 72 KiB pool
+# page) and pays one host sync per row in the slice planner. The fast
+# path is the same arithmetic with the intermediates removed; these tests
+# pin that it is OBSERVABLY IDENTICAL (same slice plan, same staged bf16
+# bytes) and that the sync count drops from O(rows) to O(slices).
+# ---------------------------------------------------------------------------
+
+
+def _packed_pool(num_pages: int = 5, seed: int = 11) -> torch.Tensor:
+    flat = torch.zeros((num_pages, 2 * NKV, ref.SLOT_REGION), dtype=torch.uint8)
+    for page in range(num_pages):
+        rows = _rand(2 * NKV * 128, seed=400 + page)
+        for slot in range(2 * NKV):
+            flat[page, slot] = ref.pack_slot_region_side(
+                rows[slot * 128:(slot + 1) * 128], slot % 2
+            )
+    return flat.reshape(num_pages, 2 * NKV, 128, 72)
+
+
+def _topk_for(nb: int, chunk: int, pattern: str, seed: int = 0) -> torch.Tensor:
+    """[NKV, chunk, 16] logical block ids over a `nb`-page prefix."""
+    g = torch.Generator().manual_seed(seed)
+    total = nb * 128
+    out = torch.full((NKV, chunk, 16), -1, dtype=torch.int32)
+    for qi, p in enumerate(range(total - chunk, total)):
+        avail = p // 128 + 1
+        k = min(16, avail)
+        if pattern == "window":
+            idx = list(range(avail - k, avail))
+        elif pattern == "scatter":
+            idx = torch.randperm(avail, generator=g)[:k].tolist()
+        else:
+            half = max(1, k // 2)
+            idx = list(range(avail - half, avail)) + torch.randperm(
+                max(1, avail - half), generator=g
+            )[: k - half].tolist()
+        out[:, qi, :k] = torch.tensor(idx, dtype=torch.int32)
+    return out
+
+
+def test_fast_dequant_is_bit_identical_to_the_fp32_chain() -> None:
+    """Single-pass bf16 dequant == the milestone-1 fp32 chain, bit for bit.
+
+    Bit-identity is the whole safety argument of the fast path: the e2m1
+    ladder and the e4m3 group scales are exactly representable in bf16,
+    so both sides compute round_bf16(exact product).
+    """
+    pool = _packed_pool()
+    flat = pool.reshape(pool.shape[0], 2 * NKV, ref.SLOT_REGION)
+    legacy = ref.dequant_pool_pages(flat).to(torch.bfloat16)
+    fast = ref.dequant_pool_pages_bf16(flat)
+    assert fast.dtype is torch.bfloat16
+    assert fast.shape == legacy.shape
+    assert torch.equal(torch.isnan(legacy), torch.isnan(fast))
+    fin = ~torch.isnan(legacy)
+    assert torch.equal(legacy[fin], fast[fin])
+    # and the ladder really is exact in bf16 (the premise above)
+    ladder = ref.e2m1_decode(torch.arange(16, dtype=torch.uint8))
+    assert torch.equal(ladder, ladder.to(torch.bfloat16).to(torch.float32))
+
+
+def test_fast_staging_fill_is_bit_identical_and_chunk_invariant() -> None:
+    pool = _packed_pool()
+    pages = torch.tensor([4, 0, 3, 1, 2], dtype=torch.int64)
+    ref_buf = torch.zeros(8, NKV, 128, 256, dtype=torch.bfloat16)
+    n_ref = ref.fill_staging_buffer(ref_buf, pool, pages)
+    for chunk in (1, 2, 3, 5, 32):
+        buf = torch.zeros(8, NKV, 128, 256, dtype=torch.bfloat16)
+        n = ref.fill_staging_buffer_fast(buf, pool, pages, chunk_pages=chunk)
+        assert n == n_ref == pages.numel()
+        assert torch.equal(buf, ref_buf), f"chunk_pages={chunk} changed bytes"
+    # the trailing zero page (the staging target of unselected blocks)
+    assert not ref_buf[n_ref].any()
+    # empty selection still zeroes page 0 and reports 0
+    buf = torch.ones(4, NKV, 128, 256, dtype=torch.bfloat16)
+    assert ref.fill_staging_buffer_fast(
+        buf, pool, torch.empty(0, dtype=torch.int64)
+    ) == 0
+    assert not buf[0].any()
+    # over-capacity selection fails closed
+    with pytest.raises(ValueError, match="staging buffer holds"):
+        ref.fill_staging_buffer_fast(
+            torch.zeros(2, NKV, 128, 256, dtype=torch.bfloat16), pool, pages
+        )
+
+
+@pytest.mark.parametrize(
+    "nb,pattern,chunk,cap",
+    [
+        (8, "window", 64, 4),
+        (8, "scatter", 64, 4),
+        (20, "hybrid", 256, 32),
+        (40, "scatter", 256, 20),
+        (64, "hybrid", 512, 48),
+        (194, "hybrid", 512, 96),
+    ],
+)
+def test_fast_planner_is_the_same_plan_as_the_legacy_planner(
+    nb: int, pattern: str, chunk: int, cap: int
+) -> None:
+    """Same greedy, same tie-breaks, same hard floor -- only the union
+    evaluation changes. Any plan difference would change the staged bytes
+    the vendor kernel sees on a sliced chunk."""
+    pool = torch.zeros(nb, 2 * NKV, 128, 72, dtype=torch.uint8)
+    bt = torch.arange(nb, dtype=torch.int32).view(1, nb)
+    topk = _topk_for(nb, chunk, pattern)
+    cu = torch.tensor([0, chunk], dtype=torch.int32)
+    legacy = ref.plan_prefill_slices(pool, bt, topk, cu, NKV, cap)
+    fast = ref.plan_prefill_slices_fast(pool, bt, topk, cu, NKV, cap)
+    assert len(fast) == len(legacy)
+    for a, b in zip(legacy, fast):
+        assert a["reqs"] == b["reqs"]
+        assert a["q"] == b["q"]
+        assert a["n"] == b["n"]
+        assert torch.equal(a["pages"], b["pages"])
+
+
+def test_fast_planner_matches_legacy_on_a_packed_multi_request_chunk() -> None:
+    fx = _prefill_chunk_fixture()
+    for cap in (1, 2, 3, 6):
+        legacy = ref.plan_prefill_slices(
+            fx["pool"], fx["bt"], fx["topk"], fx["cu"], NKV, cap
+        )
+        fast = ref.plan_prefill_slices_fast(
+            fx["pool"], fx["bt"], fx["topk"], fx["cu"], NKV, cap
+        )
+        assert len(fast) == len(legacy)
+        for a, b in zip(legacy, fast):
+            assert a["reqs"] == b["reqs"] and a["q"] == b["q"]
+            assert torch.equal(a["pages"], b["pages"])
+    # the qi/coverage contract is still enforced
+    with pytest.raises(ValueError, match="cu_seqlens_q must start at 0"):
+        ref.plan_prefill_slices_fast(
+            fx["pool"], fx["bt"], fx["topk"],
+            torch.tensor([1, 1 + fx["total_q"]], dtype=torch.int32), NKV, 2,
+        )
+
+
+def test_fast_planner_pays_one_sync_per_slice_not_per_row(monkeypatch) -> None:
+    """The legacy planner's ``int(u.sum())`` runs once per row (up to 1024
+    per layer per chunk at 32K); the fast planner reads the union curve
+    once per slice."""
+    nb, chunk, cap = 40, 256, 20
+    pool = torch.zeros(nb, 2 * NKV, 128, 72, dtype=torch.uint8)
+    bt = torch.arange(nb, dtype=torch.int32).view(1, nb)
+    topk = _topk_for(nb, chunk, "scatter")
+    cu = torch.tensor([0, chunk], dtype=torch.int32)
+
+    sums = [0]
+    orig_sum = torch.Tensor.sum
+
+    def counting_sum(self, *a, **kw):
+        if self.dtype == torch.bool and self.dim() == 1:
+            sums[0] += 1
+        return orig_sum(self, *a, **kw)
+
+    monkeypatch.setattr(torch.Tensor, "sum", counting_sum)
+    legacy = ref.plan_prefill_slices(pool, bt, topk, cu, NKV, cap)
+    legacy_syncs = sums[0]
+    sums[0] = 0
+    fast = ref.plan_prefill_slices_fast(pool, bt, topk, cu, NKV, cap)
+    fast_syncs = sums[0]
+    assert legacy_syncs >= chunk          # at least one per query row
+    assert fast_syncs == 0                # O(slices) transfers, zero sums
+    assert len(fast) == len(legacy)
+
+
+def test_long_prefill_fixture_is_production_shaped() -> None:
+    """The 8K/16K/30K timing fixture must stage the prefix a serve stages.
+
+    The measured serve (receipts/boot23, FAST=1) is FLAT at 378-381 tok/s
+    from 6.5K to 24.8K prompt tokens, which the fast staging traffic
+    (0.33 MiB/page at ~273 GB/s) reproduces only if a 1024-token chunk
+    stages ~nb pages in 1-2 slices. The fixture's original uniform-random
+    top-k (16 blocks per kv head per query, no sharing between queries)
+    instead stages ~56 new pages per query row, capping a 192-page slice
+    at ~5 rows: it exploded to 191 slices / 35,135 pages (146x the
+    prefix) at 30,720 tokens, which no measurement supports -- at that
+    amplification the 24.8K chunk would have taken ~360 s.
+    """
+    hi = _harness_inputs_module()
+    cap = ref.staging_max_pages(NKV)
+    assert cap == 192  # 48 MiB / 0.33 MiB per staged page
+    for nb, want_slices in ((52, 1), (95, 1), (192, 1), (194, 2),
+                            (240, 3), (256, 4)):
+        inp = hi.long_prefill_inputs(nb, chunk=1024)
+        slices = ref.plan_prefill_slices_fast(
+            inp["pool"], inp["block_table"], inp["topk"],
+            inp["cu_seqlens_q"], NKV, cap,
+        )
+        assert len(slices) == want_slices, f"nb={nb}"
+        staged = sum(s["n"] for s in slices)
+        assert 1.0 <= staged / nb <= 3.0, f"nb={nb}: {staged / nb:.2f}x"
+        # the chunk's union is the whole prefix (what the measured
+        # length-dependence of the legacy slowdown pins)
+        union = torch.unique(torch.cat([s["pages"] for s in slices]))
+        assert union.numel() == nb
+        # every slice stays under the cap and the slices partition q
+        assert all(s["n"] <= cap for s in slices)
+        assert [s["q"] for s in slices][0][0] == 0
+        assert [s["q"] for s in slices][-1][1] == 1024
+
+
+def test_long_prefill_staged_bytes_are_bit_identical_per_slice() -> None:
+    """Unit 7's gate: both staging paths, one slice at a time, over the
+    exact staged region ``[:n+1]`` (pages plus the trailing zero page) in
+    the plan's page order. Anything else (whole grow-once buffer, stale
+    tail beyond n, the attention output) is not the claim the fast path
+    makes and must not be compared."""
+    hi = _harness_inputs_module()
+    cap = ref.staging_max_pages(NKV)
+    for nb in (64, 128, 240):
+        inp = hi.long_prefill_inputs(nb, chunk=1024)
+        legacy = ref.plan_prefill_slices(
+            inp["pool"], inp["block_table"], inp["topk"],
+            inp["cu_seqlens_q"], NKV, cap,
+        )
+        fast = ref.plan_prefill_slices_fast(
+            inp["pool"], inp["block_table"], inp["topk"],
+            inp["cu_seqlens_q"], NKV, cap,
+        )
+        assert len(fast) == len(legacy)
+        for a, b in zip(legacy, fast):
+            assert a["q"] == b["q"] and a["n"] == b["n"]
+            assert torch.equal(a["pages"], b["pages"])
+            ba = torch.zeros((cap + 1, NKV, 128, 256), dtype=torch.bfloat16)
+            bb = torch.zeros_like(ba)
+            ref.fill_staging_buffer(ba, inp["pool"], a["pages"])
+            ref.fill_staging_buffer_fast(bb, inp["pool"], b["pages"])
+            assert torch.equal(ba[: b["n"] + 1], bb[: b["n"] + 1])
+            # not vacuous: one bf16 element of one staged page is caught
+            mutated = bb.clone()
+            mutated[0, 0, 0, 0] = mutated[0, 0, 0, 0] + 1.0
+            assert not torch.equal(
+                ba[: b["n"] + 1], mutated[: b["n"] + 1]
+            )
+
+
+def test_unit7_gates_on_staged_bytes_and_controls_for_determinism() -> None:
+    """The timing unit must not report a staging failure for an output
+    difference: it compares the staged bytes per slice, and reports the
+    vendor output against a run-to-run determinism control."""
+    harness = _harness_module()
+    src = (Path(__file__).resolve().parents[1] / "tools"
+           / "gb10_q4kv_parity.py").read_text()
+    assert harness is not None
+    unit7 = src[src.index("def unit_7()"):]
+    unit7 = unit7[: unit7.index("\ndef ", 1)]
+    assert "_staged_bytes_identical(inp, cap, \"cuda\")" in unit7
+    assert "torch.equal(run_legacy(), run_legacy())" in unit7
+    assert "\"staged_bytes_identical\": same" in unit7
+    assert "staged_bytes_detail" in unit7
+    assert "staging_amplification" in unit7
+    # the no-staging gate is the documented 1.35x staging-overhead bound
+    # at the 30K row, not a parity claim
+    assert 'top["layer_ms_fast"] > 1.35 * top["layer_ms_no_staging"]' in unit7
+    assert "fast_ms >= legacy_ms" in unit7
+    # ... and the vendor determinism fields are reported, never gated
+    gate_block = unit7[unit7.index("top = rows[-1]"):unit7.index(
+        "return {", unit7.index("top = rows[-1]")
+    )]
+    assert "vendor_output_deterministic" not in gate_block
+    assert "vendor_outputs_identical" not in gate_block
+    helper = src[src.index("def _staged_bytes_identical"):]
+    helper = helper[: helper.index("\ndef ", 1)]
+    # the compared region is the staged one, page by page, in plan order
+    assert "ba[: b[\"n\"] + 1], bb[: b[\"n\"] + 1]" in helper
+    assert "fill_staging_buffer(ba" in helper
+    assert "q4_stage_pages(bb" in helper
+
+
+def test_prefill_fast_knob_defaults_on_and_fails_closed(monkeypatch) -> None:
+    """The GB10-validated fast path is the default; =0 is the opt-out."""
+    for unset in (None, "", "  ", "1", "true", "ON", " yes "):
+        if unset is None:
+            monkeypatch.delenv("VLLM_EXL3_Q4KV_PREFILL_FAST", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_EXL3_Q4KV_PREFILL_FAST", unset)
+        assert q4kv._prefill_fast_enabled() is True
+    for off in ("0", "false", "off", "no", " 0 "):
+        monkeypatch.setenv("VLLM_EXL3_Q4KV_PREFILL_FAST", off)
+        assert q4kv._prefill_fast_enabled() is False
+    monkeypatch.setenv("VLLM_EXL3_Q4KV_PREFILL_FAST", "yeah")
+    with pytest.raises(ValueError, match="must be unset or one of"):
+        q4kv._prefill_fast_enabled()
+
+
+def test_prefill_wrapper_dispatch_selects_the_documented_pair(
+    monkeypatch,
+) -> None:
+    """Unset selects the fast (plan, fill) pair; =0 selects the legacy
+    pair -- both halves, so a half-swapped dispatch cannot slip through."""
+    monkeypatch.setattr(q4kernels, "_REQUIRED_DEVICE_TYPE", "cpu")
+    monkeypatch.setenv("VLLM_EXL3_Q4KV_STAGING_MAX_MB", "0.001")
+    fx = _prefill_chunk_fixture()
+    called: list[str] = []
+    orig_plan_legacy = ref.plan_prefill_slices
+    orig_plan_fast = ref.plan_prefill_slices_fast
+    orig_fill_legacy = ref.fill_staging_buffer
+    orig_fill_fast = ref.fill_staging_buffer_fast
+
+    def plan_legacy(*a, **k):
+        called.append("plan_legacy")
+        return orig_plan_legacy(*a, **k)
+
+    def plan_fast(*a, **k):
+        called.append("plan_fast")
+        return orig_plan_fast(*a, **k)
+
+    def fill_legacy(buffer, pool, pages):
+        called.append("fill_legacy")
+        return orig_fill_legacy(buffer, pool, pages)
+
+    def fill_fast(buffer, pool, pages):
+        called.append("fill_fast")
+        return orig_fill_fast(buffer, pool, pages)
+
+    monkeypatch.setattr(ref, "plan_prefill_slices", plan_legacy)
+    monkeypatch.setattr(ref, "plan_prefill_slices_fast", plan_fast)
+    monkeypatch.setattr(ref, "fill_staging_buffer", fill_legacy)
+    monkeypatch.setattr(q4kernels, "q4_stage_pages", fill_fast, raising=False)
+    wrapper = q4kv._make_prefill_wrapper(lambda *a, **k: None)
+    out = torch.zeros(fx["total_q"], NQ, 128, dtype=torch.bfloat16)
+
+    def run():
+        monkeypatch.setattr(q4kv, "_STAGING_BUFFERS", {})
+        called.clear()
+        wrapper(
+            fx["q"], fx["pool"], fx["topk"], fx["bt"], fx["cu"], fx["seq"],
+            fx["prefix"], 6, NKV, fx["sm_scale"], out,
+        )
+        return set(called)
+
+    monkeypatch.delenv("VLLM_EXL3_Q4KV_PREFILL_FAST", raising=False)
+    assert run() == {"plan_fast", "fill_fast"}
+    monkeypatch.setenv("VLLM_EXL3_Q4KV_PREFILL_FAST", "0")
+    assert run() == {"plan_legacy", "fill_legacy"}
+
+
+def test_prefill_wrapper_fast_path_feeds_the_kernel_identical_bytes(
+    monkeypatch,
+) -> None:
+    """The wrapper's fast dispatch changes neither the call sequence nor a
+    single staged byte (the Triton kernel is stubbed by the torch
+    single-pass implementation: no triton on this VPS)."""
+    monkeypatch.setattr(q4kernels, "_REQUIRED_DEVICE_TYPE", "cpu")
+    monkeypatch.setenv("VLLM_EXL3_Q4KV_STAGING_MAX_MB", "0.001")
+    fx = _prefill_chunk_fixture()
+
+    def run(fast: bool):
+        monkeypatch.setenv(
+            "VLLM_EXL3_Q4KV_PREFILL_FAST", "1" if fast else "0"
+        )
+        monkeypatch.setattr(q4kv, "_STAGING_BUFFERS", {})
+        calls: list = []
+
+        def orig(*a, **k):
+            calls.append(tuple(a))
+
+        stub = lambda buffer, pool, pages: ref.fill_staging_buffer_fast(  # noqa: E731
+            buffer, pool, pages
+        )
+        monkeypatch.setattr(q4kernels, "q4_stage_pages", stub, raising=False)
+        wrapper = q4kv._make_prefill_wrapper(orig)
+        out = torch.zeros(fx["total_q"], NQ, 128, dtype=torch.bfloat16)
+        wrapper(
+            fx["q"], fx["pool"], fx["topk"], fx["bt"], fx["cu"], fx["seq"],
+            fx["prefix"], 6, NKV, fx["sm_scale"], out,
+        )
+        return calls
+
+    slow = run(False)
+    fast = run(True)
+    assert len(slow) == len(fast) > 1
+    for a, b in zip(slow, fast):
+        assert len(a) == len(b)
+        for x, y in zip(a, b):
+            if torch.is_tensor(x):
+                assert x.shape == y.shape and x.dtype == y.dtype
+                assert torch.equal(x, y)
+            else:
+                assert x == y
+
+
+def test_stage_kernel_and_wrapper_carry_no_host_sync() -> None:
+    """Capture-safety audit for the new call sites.
+
+    Prefill never runs under capture with vLLM's FULL_DECODE_ONLY mode
+    (``config/compilation.py:62-67`` + ``v1/worker/gpu/cudagraph_utils.py:
+    264-266`` build the capture set from decode descriptors only), but the
+    fast staging path is sync-free anyway: ``q4_stage_pages`` reads only
+    ``pages.numel()`` (a shape read) and every index is on device.
+    """
+    src = Path(q4kernels.__file__).read_text()
+    body = src[src.index("def q4_stage_pages("):]
+    for sync in (".item()", ".tolist()", ".cpu()", "synchronize"):
+        assert sync not in body, f"host sync {sync} on the staging path"
+    assert "pages.numel()" in body
+    assert "_device_gate(pool" in body
+    # the kernel reads page ids on device and takes no host scalar but
+    # the constexpr tile
+    ksrc = src[src.index("def _q4_stage_kernel("):src.index("return _q4_w1_kernel")]
+    assert "tl.load(pages_ptr + pid)" in ksrc
+    assert "static_range(2)" in ksrc
+    assert "BLOCK_T: tl.constexpr" in ksrc
+    # the capture evidence is cited at the call site
+    assert "FULL_DECODE_ONLY" in body
+    assert "cudagraph_utils.py:264-266" in body
+
+
+def test_fast_path_memory_bound_is_the_same_grow_once_buffer() -> None:
+    """No new allocation: the fast path writes into the SAME grow-once
+    staging buffer, and its transient is bounded by a page constant."""
+    assert ref._FAST_STAGING_CHUNK_PAGES * ref.staging_page_bytes(NKV) <= (
+        16 << 20
+    )
+    src = Path(q4kv.__file__).read_text()
+    body = src[src.index("def _make_prefill_wrapper("):]
+    assert "q4kernels.q4_stage_pages" in body
+    # both branches share the one buffer helper
+    assert body.count("buffer = _staging_buffer(") == 1
+
+
+def test_harness_registers_the_fast_prefill_units() -> None:
+    """Units 6 (fast-staging accuracy) and 7 (per-chunk timing) run in the
+    GB10 harness, the frontend check compiles the staging kernel, and the
+    dry run audits the structure -- a new unit that silently disappears
+    would leave the fast path unvalidated on hardware."""
+    root = Path(__file__).resolve().parents[1]
+    harness = (root / "tools" / "gb10_q4kv_parity.py").read_text()
+    assert '("6/prefill-fast-staging", unit_6)' in harness
+    assert '("7/prefill-timing", unit_7)' in harness
+    assert '("dry/8-prefill-fast-structure", _dry_prefill_fast_audit)' in harness
+    assert "TIMING_PAGES = (64, 128, 240)" in harness
+    assert "MODEL_LAYERS = 60" in harness
+    frontend = (root / "tools" / "q4kv_triton_frontend_check.py").read_text()
+    assert "_stage_variants()" in frontend
+    assert "q4k._stage_kernel()" in frontend
+    # the long-prefix fixture and its validator exist and are wired
+    inputs = (root / "tools" / "q4kv_harness_inputs.py").read_text()
+    assert "def long_prefill_inputs(" in inputs
+    assert "def validate_long_prefill_inputs(" in inputs
+    assert "LONG_TOPK = 16" in inputs

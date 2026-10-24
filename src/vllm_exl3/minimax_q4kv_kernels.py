@@ -505,18 +505,86 @@ def _build_kernels():
             mask=h_mask,
         )
 
-    return _q4_w1_kernel, _q4_decode_kernel
+    @triton.jit
+    def _q4_stage_kernel(
+        pool_ptr,  # uint8 [nb, 2H, 9216] flattened
+        stage_ptr,  # bf16 [cap, H, 128, 256]
+        pages_ptr,  # int64 [n] physical page ids of this slice
+        n_heads,
+        BLOCK_T: tl.constexpr,
+    ):
+        """Prefill staging: q4 pool page -> bf16 [128, 256] staging row.
+
+        One program per (page, head, BLOCK_T-token tile); both sides (K
+        then V) are produced in the same program via ``static_range``, so
+        the constexpr ``side`` keeps the two scale layouts apart. The
+        output bytes are bit-identical to
+        ``ref.dequant_pool_pages(...).to(bf16)``: the e2m1 ladder and the
+        e4m3 scales are exactly representable in bf16 and the single fp32
+        multiply is rounded once.
+
+        No host sync anywhere: ``pages`` is read on device, every index is
+        derived from program ids, and the only host-side value the wrapper
+        touches is ``pages.numel()`` (a shape read). Prefill is never
+        captured under FULL_DECODE_ONLY (config/compilation.py:62-67 with
+        cudagraph_utils.py:264-266), but this kernel would be capture-safe
+        anyway.
+        """
+        pid = tl.program_id(0)
+        head = tl.program_id(1)
+        tb = tl.program_id(2)
+        page = tl.load(pages_ptr + pid).to(tl.int64)
+        page_base = page * (2 * n_heads) * 9216
+        n = tb * BLOCK_T + tl.arange(0, BLOCK_T)
+        j = tl.arange(0, 64)
+        g = tl.arange(0, 8)
+        d = tl.arange(0, 128)
+        for side in tl.static_range(2):
+            base = pool_ptr + page_base + (2 * head + side) * 9216
+            u = tl.load(base + n[:, None] * 64 + j[None, :])  # [T, 64]
+            low = _e2m1_decode(u & 0xF)
+            high = _e2m1_decode(u >> 4)
+            vals = tl.reshape(tl.join(low, high), (BLOCK_T, 128))
+            if side == 1:
+                # SM100 trtllm-gen 4x4 token-quad swizzle (reference
+                # scale_block_offset side 1).
+                sw_t = (n[:, None] // 4) * 4 + g[None, :] // 2
+                sw_s = (g[None, :] % 2) * 4 + (n[:, None] % 4)
+                sb = tl.load(base + 8192 + sw_t * 8 + sw_s)
+            else:
+                sb = tl.load(base + 8192 + n[:, None] * 8 + g[None, :])
+            s = _e4m3_decode(sb)  # [T, 8]
+            out = vals * tl.reshape(_expand16(s), (BLOCK_T, 128))
+            tl.store(
+                stage_ptr
+                + pid * (n_heads * 128 * 256)
+                + head * (128 * 256)
+                + n[:, None] * 256
+                + side * 128
+                + d[None, :],
+                out.to(tl.bfloat16),
+            )
+
+    return _q4_w1_kernel, _q4_decode_kernel, _q4_stage_kernel
 
 
 _W1_KERNEL = None
 _DECODE_KERNEL = None
+_STAGE_KERNEL = None
+_STAGE_BLOCK_T = 32
 
 
 def _kernels():
-    global _W1_KERNEL, _DECODE_KERNEL
+    global _W1_KERNEL, _DECODE_KERNEL, _STAGE_KERNEL
     if _W1_KERNEL is None:
-        _W1_KERNEL, _DECODE_KERNEL = _build_kernels()
+        _W1_KERNEL, _DECODE_KERNEL, _STAGE_KERNEL = _build_kernels()
     return _W1_KERNEL, _DECODE_KERNEL
+
+
+def _stage_kernel():
+    """The prefill staging kernel alone (built with the others)."""
+    _kernels()
+    return _STAGE_KERNEL
 
 
 def _dtype_name(t: torch.Tensor) -> str:
@@ -807,3 +875,78 @@ def q4_sparse_decode(
         NUM_TOPK_CHUNKS=num_topk_chunks,
         USE_PDL=False,
     )
+
+
+def q4_stage_pages(
+    buffer: torch.Tensor,  # bf16 [capacity, H, 128, 256] staging rows
+    pool: torch.Tensor,  # bound uint8 [nb, 2H, 128, 72]
+    pages: torch.Tensor,  # int64 [n] physical page ids of this slice
+) -> int:
+    """Dequant ``pages`` of the q4 pool into ``buffer[:n]`` (single launch).
+
+    The fast prefill staging path: one launch per slice instead of one
+    launch group per 2 pages, and one pass over each page (72 KiB read,
+    256 KiB bf16 write) instead of the ~8 MiB of int32/float32
+    intermediate traffic the milestone-1 chain moves. Output bytes are
+    bit-identical to :func:`vllm_exl3.minimax_q4kv_reference.fill_staging_buffer`,
+    so the vendor prefill kernel sees exactly the same staged pool.
+
+    Host syncs: none. ``pages.numel()`` and the buffer geometry are shape
+    reads; every index is on device. Prefill batches are never captured
+    under ``FULL_DECODE_ONLY`` (vLLM ``config/compilation.py:62-67`` with
+    ``v1/worker/gpu/cudagraph_utils.py:264-266`` build the capture set
+    from decode descriptors only, so mixed/prefill runs eager), but this
+    call site would be capture-safe regardless.
+
+    Memory: no allocation beyond the caller's grow-once buffer; the
+    kernel writes in place. Refuses anything that is not a q4 container
+    with contiguous 9216-byte slot regions.
+    """
+    _device_gate(pool, "pool", (("buffer", buffer), ("pages", pages)))
+    if pool.dtype is not torch.uint8:
+        raise ValueError(
+            "q4 staging requires the pool as raw uint8 bytes, got "
+            f"{_dtype_name(pool)}; the overlay must re-view the container "
+            "before dispatch"
+        )
+    if pool.dim() != 4 or pool.shape[2] != 128 or pool.shape[3] != 72:
+        raise ValueError("q4 pool must be [nb, 2*num_kv_heads, 128, 72]")
+    if pool.stride(2) != 72 or pool.stride(1) != 9216 or pool.stride(3) != 1:
+        raise ValueError("q4 pool slot regions must be contiguous")
+    if buffer.dtype is not torch.bfloat16:
+        raise ValueError(
+            f"staging buffer must be bf16, got {_dtype_name(buffer)}"
+        )
+    if pages.dtype not in (torch.int64, torch.int32):
+        raise ValueError(
+            f"page ids must be int64/int32, got {_dtype_name(pages)}"
+        )
+    num_kv_heads = pool.shape[1] // 2
+    if (
+        buffer.dim() != 4
+        or buffer.shape[1] != num_kv_heads
+        or buffer.shape[2] != 128
+        or buffer.shape[3] != 256
+    ):
+        raise ValueError(
+            "staging buffer must be [capacity, num_kv_heads, 128, 256]"
+        )
+    n = int(pages.numel())
+    if n == 0:
+        buffer[0].zero_()
+        return 0
+    if n > buffer.shape[0] - 1:
+        raise ValueError(
+            f"staging buffer holds {buffer.shape[0] - 1} pages, need {n}"
+        )
+    stage_kernel = _stage_kernel()
+    grid = (n, num_kv_heads, 128 // _STAGE_BLOCK_T)
+    stage_kernel[grid](
+        pool.reshape(-1),
+        buffer,
+        pages.reshape(-1).to(torch.int64),
+        num_kv_heads,
+        BLOCK_T=_STAGE_BLOCK_T,
+    )
+    buffer[n].zero_()
+    return n
