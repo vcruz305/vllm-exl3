@@ -1113,6 +1113,49 @@ def _time_ms(fn, reps: int = TIMING_REPS) -> float:
     return best
 
 
+def _staged_bytes_identical(inp: dict, cap: int, device) -> tuple[bool, str]:
+    """Bit-compare the two staging paths on the exact bytes the vendor
+    kernel reads: per slice, over ``buffer[:n+1]`` (the staged pages plus
+    the trailing zero page), in the plan's page order.
+
+    This is the claim ``VLLM_EXL3_Q4KV_PREFILL_FAST`` actually makes, and
+    it is a claim about STAGED BYTES -- not about the attention output.
+    The old gate compared the vendor kernel's output instead, which
+    conflates three different things (slice plan, staged bytes, kernel
+    determinism) and reports a bytes failure for any of them. Both plans
+    are rebuilt here so a plan difference is also caught.
+    """
+    from vllm_exl3 import minimax_q4kv_kernels as q4k
+
+    pool = inp["pool"].to(device)
+    bt = inp["block_table"].to(device)
+    topk = inp["topk"].to(device)
+    cu = inp["cu_seqlens_q"].to(device)
+    legacy = ref.plan_prefill_slices(pool, bt, topk, cu, NKV, cap)
+    fast = ref.plan_prefill_slices_fast(pool, bt, topk, cu, NKV, cap)
+    if len(legacy) != len(fast):
+        return False, f"plan: {len(fast)} fast slices != {len(legacy)} legacy"
+    shape = (cap + 1, NKV, BLOCK, 2 * 128)
+    for i, (a, b) in enumerate(zip(legacy, fast)):
+        if a["q"] != b["q"] or a["n"] != b["n"]:
+            return False, f"slice {i}: q/n differ {a['q']}/{a['n']} vs {b['q']}/{b['n']}"
+        if not torch.equal(a["pages"], b["pages"]):
+            return False, f"slice {i}: page order differs"
+        ba = torch.zeros(shape, dtype=torch.bfloat16, device=device)
+        bb = torch.zeros(shape, dtype=torch.bfloat16, device=device)
+        ref.fill_staging_buffer(ba, pool, a["pages"])
+        q4k.q4_stage_pages(bb, pool, b["pages"])
+        if not torch.equal(ba[: b["n"] + 1], bb[: b["n"] + 1]):
+            bad = (ba[: b["n"] + 1] != bb[: b["n"] + 1]).nonzero()
+            return False, (
+                f"slice {i} (q={b['q']}, n={b['n']}): "
+                f"{bad.shape[0]} of {ba[: b['n'] + 1].numel()} bf16 "
+                f"elements differ, first at {tuple(bad[0].tolist())}"
+            )
+        del ba, bb
+    return True, f"{len(fast)} slices, {sum(s['n'] for s in fast)} pages staged"
+
+
 def unit_7() -> dict:
     """Per-chunk prefill time, legacy vs fast, at 8K / 16K / 30K prefixes.
 
@@ -1123,9 +1166,14 @@ def unit_7() -> dict:
     UNQUANTIZED bf16 pool -- the no-staging cost, i.e. what the fp8 path
     pays (slightly conservative: bf16 K/V reads are 2x the fp8 bytes).
 
-    Gates: fast is faster than legacy at every length AND within 5 % of
-    the no-staging reference at 30K (the measured slowdown endpoint);
-    staged bytes are bit-identical (re-checked here per length).
+    Gates: fast is faster than legacy at every length, within 5 % of the
+    no-staging reference at 30K (the measured slowdown endpoint), and the
+    staged bytes are bit-identical per slice (see
+    :func:`_staged_bytes_identical`). The vendor output is compared too,
+    but only against the kernel's own run-to-run determinism: if the
+    vendor kernel is not bit-reproducible at these shapes a fast/legacy
+    output difference says nothing about staging, so it is reported, not
+    gated.
     """
     from vllm.models.minimax_m3.common.ops.sparse_attn import (
         minimax_m3_sparse_attn as original,
@@ -1157,17 +1205,24 @@ def unit_7() -> dict:
 
         legacy_ms = _time_ms(run_legacy)
         fast_ms = _time_ms(run_fast)
-        same = bool(torch.equal(run_fast(), run_legacy()))
+        cap = ref.staging_max_pages(NKV)
+        slices = ref.plan_prefill_slices_fast(
+            inp["pool"].to("cuda"), inp["block_table"].to("cuda"),
+            inp["topk"].to("cuda"), inp["cu_seqlens_q"].to("cuda"),
+            NKV, cap,
+        )
+        same, bytes_detail = _staged_bytes_identical(inp, cap, "cuda")
+        # Control: two independent legacy runs. If the vendor kernel is not
+        # bit-reproducible at this shape, fast-vs-legacy output equality
+        # says nothing about staging and must not gate.
+        deterministic = bool(torch.equal(run_legacy(), run_legacy()))
+        outputs_identical = bool(torch.equal(run_fast(), run_legacy()))
         row = {
             "prefix_tokens": nb * 128,
             "pages": nb,
-            "slices": len(
-                ref.plan_prefill_slices_fast(
-                    inp["pool"].to("cuda"), inp["block_table"].to("cuda"),
-                    inp["topk"].to("cuda"), inp["cu_seqlens_q"].to("cuda"),
-                    NKV, ref.staging_max_pages(NKV),
-                )
-            ),
+            "slices": len(slices),
+            "pages_staged": sum(s["n"] for s in slices),
+            "staging_amplification": sum(s["n"] for s in slices) / nb,
             "layer_ms_no_staging": ref_ms,
             "layer_ms_legacy": legacy_ms,
             "layer_ms_fast": fast_ms,
@@ -1177,14 +1232,23 @@ def unit_7() -> dict:
             "tok_s_fast": CHUNK_TOKENS / (fast_ms * MODEL_LAYERS / 1e3),
             "tok_s_no_staging": CHUNK_TOKENS / (ref_ms * MODEL_LAYERS / 1e3),
             "staged_bytes_identical": same,
+            "staged_bytes_detail": bytes_detail,
+            "vendor_output_deterministic": deterministic,
+            "vendor_outputs_identical": outputs_identical,
         }
         rows.append(row)
         if not same:
-            problems.append(f"{nb} pages: staged bytes differ")
+            problems.append(f"{nb} pages: staged bytes differ ({bytes_detail})")
         if fast_ms >= legacy_ms:
             problems.append(
                 f"{nb} pages: fast {fast_ms:.3f} ms is not faster than "
                 f"legacy {legacy_ms:.3f} ms"
+            )
+        if deterministic and not outputs_identical:
+            problems.append(
+                f"{nb} pages: staged bytes match but the vendor output "
+                "differs (deterministic kernel, so this is a real "
+                "invocation difference)"
             )
     top = rows[-1]
     if top["layer_ms_fast"] > 1.05 * top["layer_ms_no_staging"]:
@@ -1202,7 +1266,15 @@ def unit_7() -> dict:
                 f"{r['prefix_tokens']}tok: {r['layer_ms_legacy']:.2f} -> "
                 f"{r['layer_ms_fast']:.2f} ms/layer "
                 f"({r['tok_s_legacy']:.0f} -> {r['tok_s_fast']:.0f} tok/s, "
-                f"no-staging {r['tok_s_no_staging']:.0f})"
+                f"no-staging {r['tok_s_no_staging']:.0f}, "
+                f"{r['slices']} slices/"
+                f"{r['staging_amplification']:.2f}x staged"
+                + (
+                    ""
+                    if r["vendor_output_deterministic"]
+                    else ", vendor kernel NOT bit-reproducible"
+                )
+                + ")"
                 for r in rows
             )
             if not problems
@@ -2093,7 +2165,11 @@ def _dry_prefill_fast_audit() -> dict:
     pair).
     """
     problems: list[str] = []
-    for nb in (64, 128, 240):
+    # Production slice counts at the timing lengths (cap 192 pages from the
+    # 48 MiB default, 128-token pages): 8K/16K fit one slice, 30K needs a
+    # few. A fixture that explodes into ~191 slices (the old uniform-random
+    # top-k) is not measuring the serve -- it staged 146x the prefix.
+    for nb, want_slices in ((64, 1), (128, 1), (240, 3)):
         inp = hi.long_prefill_inputs(nb, chunk=CHUNK_TOKENS)
         cap = ref.staging_max_pages(NKV)
         legacy = ref.plan_prefill_slices(inp["pool"], inp["block_table"],
@@ -2105,10 +2181,38 @@ def _dry_prefill_fast_audit() -> dict:
         if len(fast) != len(legacy):
             problems.append(f"{nb} pages: {len(fast)} != {len(legacy)} slices")
             continue
-        for a, b in zip(legacy, fast):
+        if len(fast) != want_slices:
+            problems.append(
+                f"{nb} pages: {len(fast)} slices, production shape is "
+                f"{want_slices} (fixture selection model drifted)"
+            )
+        staged = sum(s["n"] for s in fast)
+        if not 1.0 <= staged / nb <= 3.0:
+            problems.append(
+                f"{nb} pages: staging amplification {staged / nb:.2f}x is "
+                "not production-shaped (must stay a small multiple)"
+            )
+        for i, (a, b) in enumerate(zip(legacy, fast)):
             if a["q"] != b["q"] or not torch.equal(a["pages"], b["pages"]):
                 problems.append(f"{nb} pages: plan differs at {a['q']}")
                 break
+            # every slice's staged bytes, over the exact staged region
+            ba = torch.zeros((cap + 1, NKV, BLOCK, 2 * 128),
+                             dtype=torch.bfloat16)
+            bb = torch.zeros_like(ba)
+            ref.fill_staging_buffer(ba, inp["pool"], a["pages"])
+            ref.fill_staging_buffer_fast(bb, inp["pool"], b["pages"])
+            if not torch.equal(ba[: b["n"] + 1], bb[: b["n"] + 1]):
+                problems.append(f"{nb} pages: slice {i} staged bytes differ")
+                break
+        # the byte gate must not be vacuous: one flipped bf16 element in
+        # one staged page has to be detected
+        ba = torch.zeros((cap + 1, NKV, BLOCK, 2 * 128), dtype=torch.bfloat16)
+        ref.fill_staging_buffer_fast(ba, inp["pool"], fast[0]["pages"])
+        mutated = ba.clone()
+        mutated[0, 0, 0, 0] = mutated[0, 0, 0, 0] + 1.0
+        if torch.equal(ba[: fast[0]["n"] + 1], mutated[: fast[0]["n"] + 1]):
+            problems.append(f"{nb} pages: the staged-byte gate is vacuous")
     # dequant bit-identity on the fixture's real packed bytes
     inp = hi.long_prefill_inputs(8, chunk=64)
     flat = inp["pool"].reshape(8, 2 * NKV, ref.SLOT_REGION)
@@ -2136,6 +2240,12 @@ def _dry_prefill_fast_audit() -> dict:
         "1.05 * top[\"layer_ms_no_staging\"]",
         "fast_ms >= legacy_ms",
         "torch.equal(out_fast, out_legacy)",
+        # unit 7 gates on STAGED BYTES, not on the attention output, and
+        # carries a run-to-run determinism control for the vendor kernel
+        "_staged_bytes_identical(inp, cap, \"cuda\")",
+        "torch.equal(run_legacy(), run_legacy())",
+        "vendor_output_deterministic",
+        "vendor_outputs_identical",
     ):
         if pin not in src:
             problems.append(f"harness pin missing: {pin}")
@@ -2153,9 +2263,12 @@ def _dry_prefill_fast_audit() -> dict:
         "passed": not problems,
         "problems": problems,
         "summary": (
-            "fast planner == legacy planner at 8K/16K/30K, fast dequant "
-            "bit-identical on real pool bytes, fixture fails closed, "
-            "knob default-off, unit 6/7 gates pinned"
+            "fast planner == legacy planner at 8K/16K/30K on a "
+            "production-shaped fixture (1/1/3 slices, <=3x staged), every "
+            "slice's staged bytes bit-identical over [:n+1], the byte gate "
+            "is not vacuous, fast dequant bit-identical on real pool "
+            "bytes, fixture fails closed, knob default-off, unit 6/7 "
+            "gates pinned"
             if not problems
             else "; ".join(problems)
         ),

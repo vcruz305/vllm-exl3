@@ -2835,6 +2835,100 @@ def test_fast_planner_pays_one_sync_per_slice_not_per_row(monkeypatch) -> None:
     assert len(fast) == len(legacy)
 
 
+def test_long_prefill_fixture_is_production_shaped() -> None:
+    """The 8K/16K/30K timing fixture must stage the prefix a serve stages.
+
+    The measured serve (receipts/boot23, FAST=1) is FLAT at 378-381 tok/s
+    from 6.5K to 24.8K prompt tokens, which the fast staging traffic
+    (0.33 MiB/page at ~273 GB/s) reproduces only if a 1024-token chunk
+    stages ~nb pages in 1-2 slices. The fixture's original uniform-random
+    top-k (16 blocks per kv head per query, no sharing between queries)
+    instead stages ~56 new pages per query row, capping a 192-page slice
+    at ~5 rows: it exploded to 191 slices / 35,135 pages (146x the
+    prefix) at 30,720 tokens, which no measurement supports -- at that
+    amplification the 24.8K chunk would have taken ~360 s.
+    """
+    hi = _harness_inputs_module()
+    cap = ref.staging_max_pages(NKV)
+    assert cap == 192  # 48 MiB / 0.33 MiB per staged page
+    for nb, want_slices in ((52, 1), (95, 1), (192, 1), (194, 2),
+                            (240, 3), (256, 4)):
+        inp = hi.long_prefill_inputs(nb, chunk=1024)
+        slices = ref.plan_prefill_slices_fast(
+            inp["pool"], inp["block_table"], inp["topk"],
+            inp["cu_seqlens_q"], NKV, cap,
+        )
+        assert len(slices) == want_slices, f"nb={nb}"
+        staged = sum(s["n"] for s in slices)
+        assert 1.0 <= staged / nb <= 3.0, f"nb={nb}: {staged / nb:.2f}x"
+        # the chunk's union is the whole prefix (what the measured
+        # length-dependence of the legacy slowdown pins)
+        union = torch.unique(torch.cat([s["pages"] for s in slices]))
+        assert union.numel() == nb
+        # every slice stays under the cap and the slices partition q
+        assert all(s["n"] <= cap for s in slices)
+        assert [s["q"] for s in slices][0][0] == 0
+        assert [s["q"] for s in slices][-1][1] == 1024
+
+
+def test_long_prefill_staged_bytes_are_bit_identical_per_slice() -> None:
+    """Unit 7's gate: both staging paths, one slice at a time, over the
+    exact staged region ``[:n+1]`` (pages plus the trailing zero page) in
+    the plan's page order. Anything else (whole grow-once buffer, stale
+    tail beyond n, the attention output) is not the claim the fast path
+    makes and must not be compared."""
+    hi = _harness_inputs_module()
+    cap = ref.staging_max_pages(NKV)
+    for nb in (64, 128, 240):
+        inp = hi.long_prefill_inputs(nb, chunk=1024)
+        legacy = ref.plan_prefill_slices(
+            inp["pool"], inp["block_table"], inp["topk"],
+            inp["cu_seqlens_q"], NKV, cap,
+        )
+        fast = ref.plan_prefill_slices_fast(
+            inp["pool"], inp["block_table"], inp["topk"],
+            inp["cu_seqlens_q"], NKV, cap,
+        )
+        assert len(fast) == len(legacy)
+        for a, b in zip(legacy, fast):
+            assert a["q"] == b["q"] and a["n"] == b["n"]
+            assert torch.equal(a["pages"], b["pages"])
+            ba = torch.zeros((cap + 1, NKV, 128, 256), dtype=torch.bfloat16)
+            bb = torch.zeros_like(ba)
+            ref.fill_staging_buffer(ba, inp["pool"], a["pages"])
+            ref.fill_staging_buffer_fast(bb, inp["pool"], b["pages"])
+            assert torch.equal(ba[: b["n"] + 1], bb[: b["n"] + 1])
+            # not vacuous: one bf16 element of one staged page is caught
+            mutated = bb.clone()
+            mutated[0, 0, 0, 0] = mutated[0, 0, 0, 0] + 1.0
+            assert not torch.equal(
+                ba[: b["n"] + 1], mutated[: b["n"] + 1]
+            )
+
+
+def test_unit7_gates_on_staged_bytes_and_controls_for_determinism() -> None:
+    """The timing unit must not report a staging failure for an output
+    difference: it compares the staged bytes per slice, and reports the
+    vendor output against a run-to-run determinism control."""
+    harness = _harness_module()
+    src = (Path(__file__).resolve().parents[1] / "tools"
+           / "gb10_q4kv_parity.py").read_text()
+    assert harness is not None
+    unit7 = src[src.index("def unit_7()"):]
+    unit7 = unit7[: unit7.index("\ndef ", 1)]
+    assert "_staged_bytes_identical(inp, cap, \"cuda\")" in unit7
+    assert "torch.equal(run_legacy(), run_legacy())" in unit7
+    assert "\"staged_bytes_identical\": same" in unit7
+    assert "staged_bytes_detail" in unit7
+    assert "staging_amplification" in unit7
+    helper = src[src.index("def _staged_bytes_identical"):]
+    helper = helper[: helper.index("\ndef ", 1)]
+    # the compared region is the staged one, page by page, in plan order
+    assert "ba[: b[\"n\"] + 1], bb[: b[\"n\"] + 1]" in helper
+    assert "fill_staging_buffer(ba" in helper
+    assert "q4_stage_pages(bb" in helper
+
+
 def test_prefill_fast_knob_defaults_off_and_fails_closed(monkeypatch) -> None:
     monkeypatch.delenv("VLLM_EXL3_Q4KV_PREFILL_FAST", raising=False)
     assert q4kv._prefill_fast_enabled() is False

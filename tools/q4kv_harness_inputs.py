@@ -854,6 +854,26 @@ def validate_prefill_inputs(inp: dict) -> None:
 
 LONG_TOPK = 16  # container.log: topk_blocks=16
 
+# How fast a query's top-k block SET drifts across the chunk, in newly
+# selected pages per query row. The indexer's selection is not IID: for a
+# run of neighbouring queries the same blocks dominate, so the union of a
+# 1024-query chunk grows slowly and saturates at the whole prefix.
+#
+# Calibrated from the measured serve (receipts/boot23, FAST=1): prefill is
+# FLAT at 378.2 / 381.5 / 379.0 tok/s for 6,533 / 12,070 / 24,798 prompt
+# tokens. With the q4 fast staging traffic of 0.33 MiB/page and ~273 GB/s
+# of HBM, a chunk of 1024 tokens costs
+#    60 layers * pages_staged * 0.33 MiB / 273 GB/s
+# = 3.7 / 7.0 / 29 ms for 52 / 95 / 384 pages staged, i.e. the 24.8K point
+# is 2 slices * 192-page cap = 384 pages (nb = 194), and 6.5K/12K are one
+# slice of nb. That is 384 pages over 1024 rows ~ 0.19 new pages per row.
+# A uniform-random top-k (this fixture's original model) instead brings ~56
+# new pages per row (4 KV heads x 16 blocks), which caps a 192-page slice
+# at ~5 rows and explodes a 1024-row chunk into ~191 slices -- a 146x
+# amplification no measurement of the real serve supports (it would have
+# been 360 s per chunk at 24.8K).
+PREFILL_NEW_PAGES_PER_QUERY = 0.19
+
 
 def long_prefill_inputs(
     nb_pages: int, chunk: int = 1024, seed: int = 5150
@@ -887,15 +907,31 @@ def long_prefill_inputs(
     block_table = torch.arange(nb_pages, dtype=torch.int32).view(1, nb_pages)
     # top-k: distinct valid logical blocks per (kv head, query); -1 above
     # the query's causal valid-block count, exactly as the indexer emits.
+    # Selection locality: per head, a stable block preference order, with
+    # the query's 16 picks sliding along it at PREFILL_NEW_PAGES_PER_QUERY
+    # new pages per row (see the constant). Neighbouring queries therefore
+    # share almost their whole selection and the chunk's union saturates at
+    # the prefix, which is what the measured serve shows.
     q_abs = torch.arange(prefix, prefix + chunk, dtype=torch.int64)
     valid_blocks = torch.clamp((q_abs + BLOCK) // BLOCK, max=nb_pages)
-    scores = torch.rand((nkv, chunk, nb_pages), generator=g)
-    order = scores.argsort(dim=-1, descending=True)
-    topk = torch.full((nkv, chunk, LONG_TOPK), -1, dtype=torch.int32)
-    for i in range(chunk):
-        real = min(LONG_TOPK, int(valid_blocks[i]))
-        if real > 0:
-            topk[:, i, :real] = order[:, i, :real].to(torch.int32)
+    if nb_pages > LONG_TOPK:
+        order = torch.rand((nkv, nb_pages), generator=g).argsort(dim=-1)
+        pos = (
+            torch.arange(chunk, dtype=torch.float64)
+            * PREFILL_NEW_PAGES_PER_QUERY
+        ).round().to(torch.int64).clamp(max=nb_pages - LONG_TOPK)
+        topk = order[:, pos[:, None] + torch.arange(LONG_TOPK)].to(torch.int32)
+        topk = topk.permute(0, 1, 2).contiguous()
+    else:
+        topk = torch.full((nkv, chunk, LONG_TOPK), -1, dtype=torch.int32)
+        order = torch.rand((nkv, nb_pages), generator=g).argsort(dim=-1)
+        topk[:, :, :nb_pages] = order.unsqueeze(1).expand(
+            nkv, chunk, nb_pages
+        )
+    keep = torch.arange(LONG_TOPK).view(1, 1, LONG_TOPK) < valid_blocks.view(
+        1, chunk, 1
+    )
+    topk = torch.where(keep, topk, torch.full_like(topk, -1))
     q = (torch.randn((chunk, NQ, 128), generator=g) * 0.5).to(torch.bfloat16)
     inp = dict(
         q=q, pool=pool, fp8_pool=fp8_pool, bf16_pool=bf16_pool,
