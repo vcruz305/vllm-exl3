@@ -1,0 +1,702 @@
+{
+  "mechanism-comparison-r3": {
+    "result_sha256": "c4a83f4fd614792934f4cba5b10927ccbddde56e7a46e2ae09a39f4585baecd1",
+    "manifest": {
+      "manifest_sha256": "78b4b9160330b38e9cfc26e20e5dd7bda9ac1b780b690c2811a449eaa3b6fb72",
+      "manifest_file_sha256": "26d3ff15c1472b6762af060b0744ef219acce3f2980c248404ac67a6b392d633",
+      "files_verified": 3
+    },
+    "scope": "One fresh deployment per mode with identical request order, prompt, 80 GiB cache, 32K limit and original environment. Not statistical confirmation, practical acceptance or promotion.",
+    "runs": {
+      "full-grouped-reference-r1": {
+        "mode": "reference",
+        "quality_passed": true,
+        "decode": {
+          "coding": {
+            "tokens_per_second": 2.7309433425256677,
+            "ttft_seconds": 19.16891279211268,
+            "completion_tokens": 135
+          },
+          "long_form": {
+            "tokens_per_second": 4.893245297410584,
+            "ttft_seconds": 11.966882792068645,
+            "completion_tokens": 512
+          }
+        },
+        "32k_ttft_seconds": 181.651096874848
+      },
+      "full-grouped-candidate-r1": {
+        "mode": "grouped",
+        "quality_passed": true,
+        "decode": {
+          "coding": {
+            "tokens_per_second": 2.6567808907125503,
+            "ttft_seconds": 20.34359116712585,
+            "completion_tokens": 135
+          },
+          "long_form": {
+            "tokens_per_second": 5.018693006809786,
+            "ttft_seconds": 12.081441499991342,
+            "completion_tokens": 512
+          }
+        },
+        "32k_ttft_seconds": 172.46821595798247
+      },
+      "full-grouped-prefetch-r1": {
+        "mode": "prefetch",
+        "quality_passed": true,
+        "decode": {
+          "coding": {
+            "tokens_per_second": 2.5453465619352866,
+            "ttft_seconds": 12.468035999918357,
+            "completion_tokens": 135
+          },
+          "long_form": {
+            "tokens_per_second": 4.895573094787202,
+            "ttft_seconds": 7.6076616670470685,
+            "completion_tokens": 512
+          }
+        },
+        "32k_ttft_seconds": 157.24521275004372
+      },
+      "full-grouped-engram-r1": {
+        "mode": "engram",
+        "quality_passed": true,
+        "decode": {
+          "coding": {
+            "tokens_per_second": 2.62486299415002,
+            "ttft_seconds": 11.97464254195802,
+            "completion_tokens": 135
+          },
+          "long_form": {
+            "tokens_per_second": 4.956999360344849,
+            "ttft_seconds": 7.452966749900952,
+            "completion_tokens": 512
+          }
+        },
+        "32k_ttft_seconds": 137.99148141709156
+      },
+      "full-grouped-heterogeneous-r1": {
+        "mode": "heterogeneous",
+        "quality_passed": true,
+        "decode": {
+          "coding": {
+            "tokens_per_second": 2.6543043607412957,
+            "ttft_seconds": 12.328355707926676,
+            "completion_tokens": 135
+          },
+          "long_form": {
+            "tokens_per_second": 5.365244930572485,
+            "ttft_seconds": 7.316160708898678,
+            "completion_tokens": 512
+          }
+        },
+        "32k_ttft_seconds": 139.19054245902225
+      }
+    }
+  },
+  "prefill-comparison-r1": {
+    "result_sha256": "ea7dd36d4a0f7901f639b92f6252951c83cdbc0216c3119b209de30f65ba7e90",
+    "manifest": {
+      "manifest_sha256": "edcce6af069a88ed5fc3a6333259a1b374148ff9d4168732748508cd05c1f7ab",
+      "manifest_file_sha256": "297d12a84e5497f8250c520af00ea9cc3ddc57bdc4074f23a28142572fe94fe6",
+      "files_verified": 3
+    },
+    "scope": "One fresh deployment each; same mixed-K checkpoint and fixed workload order. CLI chunk128->512; isolated child additionally installs a disabled tail hook and one-time live KV audit. Not statistical confirmation or practical acceptance. No prefix reuse.",
+    "runs": {
+      "full-grouped-heterogeneous-r1": {
+        "chunk": 128,
+        "decode": {
+          "coding": {
+            "tokens_per_second": 2.6543043607412957,
+            "ttft_seconds": 12.328355707926676,
+            "completion_tokens": 135
+          },
+          "long_form": {
+            "tokens_per_second": 5.365244930572485,
+            "ttft_seconds": 7.316160708898678,
+            "completion_tokens": 512
+          }
+        },
+        "32k_ttft_seconds": 139.19054245902225
+      },
+      "full-tail-control-r3": {
+        "chunk": 512,
+        "decode": {
+          "coding": {
+            "tokens_per_second": 2.6290829385157983,
+            "ttft_seconds": 12.311574790859595,
+            "completion_tokens": 135
+          },
+          "long_form": {
+            "tokens_per_second": 5.242787741991382,
+            "ttft_seconds": 7.5462837079539895,
+            "completion_tokens": 512
+          }
+        },
+        "32k_ttft_seconds": 73.4634544160217
+      }
+    }
+  },
+  "decode-baseline-r1": {
+    "result_sha256": "4e5a0370845c689a9c1c5a2363b657f224a85ed4b51ab0c7f6f598897e2d1d69",
+    "manifest": {
+      "manifest_sha256": "5dd7b09e0bd5aea14510c0c4b88a283cb0d1e843d4e33ca7eec70aacad4b957d",
+      "manifest_file_sha256": "d2b04f21cd3df9e0fad57094e5463788b653dacc566145f9e1b0f461ba6b52fd",
+      "files_verified": 51
+    },
+    "passed": true,
+    "cases": [
+      {
+        "name": "coding",
+        "repetition": 1,
+        "usage": {
+          "prompt_tokens": 44,
+          "total_tokens": 179,
+          "completion_tokens": 135,
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        "metrics": {
+          "seconds": 25.531258166069165,
+          "ttft_seconds": 1.9435611660592258,
+          "decode_tokens_per_second": 5.680941926157339
+        }
+      },
+      {
+        "name": "long_form",
+        "repetition": 1,
+        "usage": {
+          "prompt_tokens": 50,
+          "total_tokens": 562,
+          "completion_tokens": 512,
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        "metrics": {
+          "seconds": 102.86823108396493,
+          "ttft_seconds": 4.40630783396773,
+          "decode_tokens_per_second": 5.189842061265438
+        }
+      },
+      {
+        "name": "coding",
+        "repetition": 2,
+        "usage": {
+          "prompt_tokens": 44,
+          "total_tokens": 179,
+          "completion_tokens": 135,
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        "metrics": {
+          "seconds": 33.85758391697891,
+          "ttft_seconds": 3.3734186668880284,
+          "decode_tokens_per_second": 4.395741860137424
+        }
+      },
+      {
+        "name": "long_form",
+        "repetition": 2,
+        "usage": {
+          "prompt_tokens": 50,
+          "total_tokens": 562,
+          "completion_tokens": 512,
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        "metrics": {
+          "seconds": 92.78501150012016,
+          "ttft_seconds": 2.8353034171741456,
+          "decode_tokens_per_second": 5.680964406940688
+        }
+      },
+      {
+        "name": "coding",
+        "repetition": 3,
+        "usage": {
+          "prompt_tokens": 44,
+          "total_tokens": 179,
+          "completion_tokens": 135,
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        "metrics": {
+          "seconds": 33.85908599989489,
+          "ttft_seconds": 3.40580500010401,
+          "decode_tokens_per_second": 4.400202873471277
+        }
+      },
+      {
+        "name": "long_form",
+        "repetition": 3,
+        "usage": {
+          "prompt_tokens": 50,
+          "total_tokens": 562,
+          "completion_tokens": 512,
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        "metrics": {
+          "seconds": 90.83746512513608,
+          "ttft_seconds": 3.033451084047556,
+          "decode_tokens_per_second": 5.819788404170867
+        }
+      }
+    ],
+    "decode": {
+      "coding": {
+        "repetitions": 3,
+        "decode_tps": [
+          5.680941926157339,
+          4.395741860137424,
+          4.400202873471277
+        ],
+        "median_decode_tps": 4.400202873471277,
+        "min_decode_tps": 4.395741860137424,
+        "max_decode_tps": 5.680941926157339,
+        "ttft_seconds": [
+          1.9435611660592258,
+          3.3734186668880284,
+          3.40580500010401
+        ],
+        "completion_tokens": [
+          135,
+          135,
+          135
+        ],
+        "content_sha256": [
+          "f1372d27d704363fda40ea20feff4e7d83f9f6acfca640ced4e15d1f7b0bcae2",
+          "f1372d27d704363fda40ea20feff4e7d83f9f6acfca640ced4e15d1f7b0bcae2",
+          "f1372d27d704363fda40ea20feff4e7d83f9f6acfca640ced4e15d1f7b0bcae2"
+        ],
+        "p95_inter_token_seconds": [
+          0.2937078255577944,
+          0.3634330772212706,
+          0.3595610441989265
+        ]
+      },
+      "long_form": {
+        "repetitions": 3,
+        "decode_tps": [
+          5.189842061265438,
+          5.680964406940688,
+          5.819788404170867
+        ],
+        "median_decode_tps": 5.680964406940688,
+        "min_decode_tps": 5.189842061265438,
+        "max_decode_tps": 5.819788404170867,
+        "ttft_seconds": [
+          4.40630783396773,
+          2.8353034171741456,
+          3.033451084047556
+        ],
+        "completion_tokens": [
+          512,
+          512,
+          512
+        ],
+        "content_sha256": [
+          "63d4ca1198f115877ff891f456166627b02255fad94c6477319cdf44b153d7aa",
+          "8b189f0fe4d59524be8fc0e060f8787ce8f1339ab96e16221d5f642af3293183",
+          "243f9ddbb820f2865bd479bc9325325788f156065bcd427d4b383804ec9ade90"
+        ],
+        "p95_inter_token_seconds": [
+          0.352823645924218,
+          0.30949956248514354,
+          0.28890712512657046
+        ]
+      }
+    },
+    "scope": "Unprofiled, fresh two-rank workers; unchanged eight-case quality suite as the sole warmup, then three coding/writing pairs. 32K capacity,512-token prefill,80GiB expert cache,tail off,prefix cache off,eager,no speculation. Writing is capped at512 generated tokens. No long-context qualification or numerical practical-usability threshold is implied."
+  },
+  "decode-baseline-system-r1": {
+    "result_sha256": "7f0c01923646501dc1abe5b6066d0a54c71bbe2a20562f025202d362072d6e0c",
+    "manifest": {
+      "manifest_sha256": "0729264c8385d8abd3ed79c648eb02a05a061d509bf8f7706aa4869f348c1c69",
+      "manifest_file_sha256": "fab046375e8aa971d0d54dcd1305ec114341bb4781e8f8f793bd1ef646c7a10d",
+      "files_verified": 51
+    },
+    "passed": true,
+    "cases": [
+      {
+        "name": "coding",
+        "repetition": 1,
+        "usage": {
+          "prompt_tokens": 44,
+          "total_tokens": 179,
+          "completion_tokens": 135,
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        "metrics": {
+          "seconds": 29.15453870780766,
+          "ttft_seconds": 2.32796883280389,
+          "decode_tokens_per_second": 4.995080389499907
+        }
+      },
+      {
+        "name": "long_form",
+        "repetition": 1,
+        "usage": {
+          "prompt_tokens": 50,
+          "total_tokens": 562,
+          "completion_tokens": 512,
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        "metrics": {
+          "seconds": 107.33965795789845,
+          "ttft_seconds": 5.351249000057578,
+          "decode_tokens_per_second": 5.010387232572135
+        }
+      },
+      {
+        "name": "coding",
+        "repetition": 2,
+        "usage": {
+          "prompt_tokens": 44,
+          "total_tokens": 179,
+          "completion_tokens": 135,
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        "metrics": {
+          "seconds": 37.21372741716914,
+          "ttft_seconds": 3.4368209580425173,
+          "decode_tokens_per_second": 3.9672382504674433
+        }
+      },
+      {
+        "name": "long_form",
+        "repetition": 2,
+        "usage": {
+          "prompt_tokens": 50,
+          "total_tokens": 562,
+          "completion_tokens": 512,
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        "metrics": {
+          "seconds": 102.51838208409026,
+          "ttft_seconds": 3.0060716250445694,
+          "decode_tokens_per_second": 5.135056134107992
+        }
+      },
+      {
+        "name": "coding",
+        "repetition": 3,
+        "usage": {
+          "prompt_tokens": 44,
+          "total_tokens": 179,
+          "completion_tokens": 135,
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        "metrics": {
+          "seconds": 39.14694841695018,
+          "ttft_seconds": 3.5434372921008617,
+          "decode_tokens_per_second": 3.7636923751957787
+        }
+      },
+      {
+        "name": "long_form",
+        "repetition": 3,
+        "usage": {
+          "prompt_tokens": 50,
+          "total_tokens": 562,
+          "completion_tokens": 512,
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        "metrics": {
+          "seconds": 106.17797762504779,
+          "ttft_seconds": 3.175624500028789,
+          "decode_tokens_per_second": 4.961065482026781
+        }
+      }
+    ],
+    "decode": {
+      "coding": {
+        "repetitions": 3,
+        "decode_tps": [
+          4.995080389499907,
+          3.9672382504674433,
+          3.7636923751957787
+        ],
+        "median_decode_tps": 3.9672382504674433,
+        "min_decode_tps": 3.7636923751957787,
+        "max_decode_tps": 4.995080389499907,
+        "ttft_seconds": [
+          2.32796883280389,
+          3.4368209580425173,
+          3.5434372921008617
+        ],
+        "completion_tokens": [
+          135,
+          135,
+          135
+        ],
+        "content_sha256": [
+          "f1372d27d704363fda40ea20feff4e7d83f9f6acfca640ced4e15d1f7b0bcae2",
+          "f1372d27d704363fda40ea20feff4e7d83f9f6acfca640ced4e15d1f7b0bcae2",
+          "f1372d27d704363fda40ea20feff4e7d83f9f6acfca640ced4e15d1f7b0bcae2"
+        ],
+        "p95_inter_token_seconds": [
+          0.31459038963075725,
+          0.39992092502070586,
+          0.4296232499880716
+        ]
+      },
+      "long_form": {
+        "repetitions": 3,
+        "decode_tps": [
+          5.010387232572135,
+          5.135056134107992,
+          4.961065482026781
+        ],
+        "median_decode_tps": 5.010387232572135,
+        "min_decode_tps": 4.961065482026781,
+        "max_decode_tps": 5.135056134107992,
+        "ttft_seconds": [
+          5.351249000057578,
+          3.0060716250445694,
+          3.175624500028789
+        ],
+        "completion_tokens": [
+          512,
+          512,
+          512
+        ],
+        "content_sha256": [
+          "17ed0b190b45c72deb0f1ed613288b9b8c9c8288c2f74ea015f8f540cc50fc33",
+          "1badea41d07228fcdcb77ae1e83bf7dbcf8d3eb35f0ac76c8f2d9eb9aa8d74e2",
+          "60fc71d75241e3d7d1f115f60062b60555cee1565c39628fd55ecb2cc137a62d"
+        ],
+        "p95_inter_token_seconds": [
+          0.37156002107076347,
+          0.3356665624305606,
+          0.367284020408988
+        ]
+      }
+    },
+    "scope": "Unprofiled, fresh two-rank workers; unchanged eight-case quality suite as the sole warmup, then three coding/writing pairs. 32K capacity,512-token prefill,80GiB expert cache,tail off,prefix cache off,eager,no speculation. Writing is capped at512 generated tokens. No long-context qualification or numerical practical-usability threshold is implied."
+  },
+  "decode-graph-native-r1": {
+    "result_sha256": "042ebd74322c83ce3af09a1dcd5fb81b3c81d1f0bc22fe931299b692b0927ba7",
+    "manifest": {
+      "manifest_sha256": "b5c07ed73865c1bea99a07e55e57cf356ec6a410a85a70c52a0844465fcf15c2",
+      "manifest_file_sha256": "f7c558414cfdbf9a15c784afd2c2aae24cf57ce0f7352e52f68860f68c39535b",
+      "files_verified": 54
+    },
+    "passed": true,
+    "cases": [
+      {
+        "name": "coding",
+        "repetition": 1,
+        "usage": {
+          "prompt_tokens": 44,
+          "total_tokens": 179,
+          "completion_tokens": 135,
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        "metrics": {
+          "seconds": 24.420622708006704,
+          "ttft_seconds": 2.50414916700538,
+          "decode_tokens_per_second": 6.114195223250414
+        }
+      },
+      {
+        "name": "long_form",
+        "repetition": 1,
+        "usage": {
+          "prompt_tokens": 50,
+          "total_tokens": 562,
+          "completion_tokens": 512,
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        "metrics": {
+          "seconds": 92.97973595800431,
+          "ttft_seconds": 5.099396958001307,
+          "decode_tokens_per_second": 5.814733815832497
+        }
+      },
+      {
+        "name": "coding",
+        "repetition": 2,
+        "usage": {
+          "prompt_tokens": 44,
+          "total_tokens": 179,
+          "completion_tokens": 135,
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        "metrics": {
+          "seconds": 32.42989191700326,
+          "ttft_seconds": 3.603422334002971,
+          "decode_tokens_per_second": 4.648542580213789
+        }
+      },
+      {
+        "name": "long_form",
+        "repetition": 2,
+        "usage": {
+          "prompt_tokens": 50,
+          "total_tokens": 562,
+          "completion_tokens": 512,
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        "metrics": {
+          "seconds": 86.52682383300271,
+          "ttft_seconds": 3.248896541997965,
+          "decode_tokens_per_second": 6.136090210328037
+        }
+      },
+      {
+        "name": "coding",
+        "repetition": 3,
+        "usage": {
+          "prompt_tokens": 44,
+          "total_tokens": 179,
+          "completion_tokens": 135,
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        "metrics": {
+          "seconds": 32.65308150000055,
+          "ttft_seconds": 3.518286166996404,
+          "decode_tokens_per_second": 4.599335567860574
+        }
+      },
+      {
+        "name": "long_form",
+        "repetition": 3,
+        "usage": {
+          "prompt_tokens": 50,
+          "total_tokens": 562,
+          "completion_tokens": 512,
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        "metrics": {
+          "seconds": 86.56050266699458,
+          "ttft_seconds": 3.027315166997141,
+          "decode_tokens_per_second": 6.117337012319659
+        }
+      }
+    ],
+    "decode": {
+      "coding": {
+        "repetitions": 3,
+        "decode_tps": [
+          6.114195223250414,
+          4.648542580213789,
+          4.599335567860574
+        ],
+        "median_decode_tps": 4.648542580213789,
+        "min_decode_tps": 4.599335567860574,
+        "max_decode_tps": 6.114195223250414,
+        "ttft_seconds": [
+          2.50414916700538,
+          3.603422334002971,
+          3.518286166996404
+        ],
+        "completion_tokens": [
+          135,
+          135,
+          135
+        ],
+        "content_sha256": [
+          "f1372d27d704363fda40ea20feff4e7d83f9f6acfca640ced4e15d1f7b0bcae2",
+          "f1372d27d704363fda40ea20feff4e7d83f9f6acfca640ced4e15d1f7b0bcae2",
+          "f1372d27d704363fda40ea20feff4e7d83f9f6acfca640ced4e15d1f7b0bcae2"
+        ],
+        "p95_inter_token_seconds": [
+          0.24939154834901273,
+          0.3283853272023407,
+          0.34499650605212073
+        ]
+      },
+      "long_form": {
+        "repetitions": 3,
+        "decode_tps": [
+          5.814733815832497,
+          6.136090210328037,
+          6.117337012319659
+        ],
+        "median_decode_tps": 6.117337012319659,
+        "min_decode_tps": 5.814733815832497,
+        "max_decode_tps": 6.136090210328037,
+        "ttft_seconds": [
+          5.099396958001307,
+          3.248896541997965,
+          3.027315166997141
+        ],
+        "completion_tokens": [
+          512,
+          512,
+          512
+        ],
+        "content_sha256": [
+          "393756d42117ac67b21cd1635d8659a6c3adbe0559f725bc65a3ccaebd6ccac6",
+          "c488144ec1ec3e323dc2b93579747053b9c544858fa1eb383d5e1e9340288612",
+          "226001c839a8aa08525b2a38aa7b5507bdd4fcbfff86d7c9b1d7799ae29f8f26"
+        ],
+        "p95_inter_token_seconds": [
+          0.3155876665005053,
+          0.26983458300310303,
+          0.2697276665021491
+        ]
+      }
+    },
+    "scope": "Unprofiled, fresh two-rank workers; unchanged eight-case quality suite as the sole warmup, then three coding/writing pairs. 32K capacity,512-token prefill,80GiB expert cache,tail off,prefix cache off,explicit recorded graph mode,no speculation. Writing is capped at512 generated tokens. No long-context qualification or numerical practical-usability threshold is implied."
+  },
+  "native-service-check-r2": {
+    "result_sha256": "7c518f13bb421622805b94a36e3e0807382282f763bf132b278c18530a3b40a6",
+    "manifest": {
+      "manifest_sha256": "1da980634de1a070474d48fcde240148621143f13e7382340c451ffc68fc7f55",
+      "manifest_file_sha256": "d0f65b5fd285b533d8d12283cfe321f584c6585fd83088d323c333c13d5cedb5",
+      "files_verified": 18
+    },
+    "passed": true
+  },
+  "dynamic-groups-check-r3": {
+    "result_sha256": "77e493b32936a124af48cd77c325f924bd63bb2465c923b06e75208dcbbbdc80",
+    "manifest": {
+      "manifest_sha256": "fe07341c8397d26fc25a0db5411c191ded5c756c49a3d6f8fe042fad1877751e",
+      "manifest_file_sha256": "e1e7a8568ca13725e3cf5f8c2380a36601043a51789a5803fb812b3a4384a359",
+      "files_verified": 125
+    },
+    "passed": true
+  },
+  "engram-check-graph-r3": {
+    "result_sha256": "a85461dd80e45e679870d2617324056d0cebc713dca15d18434f5e620bd3e4d9",
+    "manifest": {
+      "manifest_sha256": "1be103b00ab52f3f23504c62baa0b06f42263b2e9ee96419d5745833e67a568b",
+      "manifest_file_sha256": "d6388225ad85e73d32ea79781614c3ee33a3f8581d973345e85feea2d959b797",
+      "files_verified": 14
+    },
+    "passed": true
+  }
+}
