@@ -2743,11 +2743,11 @@ class Exl3Config(QuantizationConfig):
         self.non_routed_exl3: dict[str, Any] = dict(raw_nr_exl3) if raw_nr_exl3 else {}
         # Validate non-routed bits if present
         nr_bits = self.non_routed_exl3.get("bits")
-        if nr_bits is not None and nr_bits not in (2, 3, 4, 5, 6):
+        if nr_bits is not None and nr_bits not in (2, 3, 4, 5, 6, 7, 8):
             raise ValueError(f"unsupported non_routed_exl3 bits={nr_bits}")
         nr_layer_bits = self.non_routed_exl3.get("layer_bits", {})
         for suffix, k in (nr_layer_bits or {}).items():
-            if k not in (2, 3, 4, 5, 6):
+            if k not in (2, 3, 4, 5, 6, 7, 8):
                 raise ValueError(
                     f"unsupported non_routed_exl3 bits={k} for suffix {suffix}"
                 )
@@ -2759,7 +2759,7 @@ class Exl3Config(QuantizationConfig):
                     f"non_routed_exl3 layers[{prefix}] must be a dict, got {type(layer_cfg)}"
                 )
             layer_bits = layer_cfg.get("bits")
-            if layer_bits is not None and layer_bits not in (2, 3, 4, 5, 6):
+            if layer_bits is not None and layer_bits not in (2, 3, 4, 5, 6, 7, 8):
                 raise ValueError(
                     f"unsupported non_routed_exl3 layers[{prefix}] bits={layer_bits}"
                 )
