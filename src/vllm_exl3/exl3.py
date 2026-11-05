@@ -2880,6 +2880,14 @@ class Exl3Config(QuantizationConfig):
         """Get bf16 shard indices for a non_routed_exl3 layer from the layers dict."""
         if not self.non_routed_exl3:
             return []
+        # create_weights queries with the raw layer.prefix, which VL wrappers
+        # (glm5next) construct wrapper-prefixed (language_model.model.layers.N...)
+        # while coverage keys are inner-relative (model.layers.N...), exactly
+        # like the names the wrapper's load path yields after stripping.
+        # get_quant_method already normalizes this prefix away; strip it here
+        # too so the exact layers-dict lookup agrees with the routing decision.
+        if prefix.startswith("language_model."):
+            prefix = prefix[len("language_model."):]
         layers = self.non_routed_exl3.get("layers", {})
         if layers and prefix in layers:
             layer_cfg = layers[prefix]
