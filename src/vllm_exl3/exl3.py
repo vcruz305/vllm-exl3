@@ -4653,7 +4653,13 @@ class Exl3LinearMethod(LinearMethodBase):
         true_in = int(in_per_partition)
         true_out_sizes = [int(s) for s in output_partition_sizes]
         in_per_partition = _exl3_pad128(true_in)
-        output_partition_sizes = [_exl3_pad128(s) for s in true_out_sizes]
+        # Pad only the EXL3 shards: bf16_shards rows hold plain BF16
+        # weights and need no 128 alignment (GLM-5.3 KDA in_proj b/f_a/g_a
+        # shards are 64/128/128 rows).
+        output_partition_sizes = [
+            _exl3_pad128(s) if i not in bf16_shards else s
+            for i, s in enumerate(true_out_sizes)
+        ]
         padded = in_per_partition != true_in or output_partition_sizes != true_out_sizes
         if padded and (bf16_shards or n_shards > 1):
             raise NotImplementedError(
