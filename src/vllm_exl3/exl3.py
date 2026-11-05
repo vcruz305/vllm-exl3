@@ -3841,11 +3841,11 @@ class Exl3Config(QuantizationConfig):
         self.non_routed_exl3: dict[str, Any] = dict(raw_nr_exl3) if raw_nr_exl3 else {}
         # Validate non-routed bits if present
         nr_bits = self.non_routed_exl3.get("bits")
-        if nr_bits is not None and nr_bits not in (2, 3, 4, 5, 6):
+        if nr_bits is not None and nr_bits not in (2, 3, 4, 5, 6, 7, 8):
             raise ValueError(f"unsupported non_routed_exl3 bits={nr_bits}")
         nr_layer_bits = self.non_routed_exl3.get("layer_bits", {})
         for suffix, k in (nr_layer_bits or {}).items():
-            if k not in (2, 3, 4, 5, 6):
+            if k not in (2, 3, 4, 5, 6, 7, 8):
                 raise ValueError(
                     f"unsupported non_routed_exl3 bits={k} for suffix {suffix}"
                 )
@@ -3857,7 +3857,7 @@ class Exl3Config(QuantizationConfig):
                     f"non_routed_exl3 layers[{prefix}] must be a dict, got {type(layer_cfg)}"
                 )
             layer_bits = layer_cfg.get("bits")
-            if layer_bits is not None and layer_bits not in (2, 3, 4, 5, 6):
+            if layer_bits is not None and layer_bits not in (2, 3, 4, 5, 6, 7, 8):
                 raise ValueError(
                     f"unsupported non_routed_exl3 layers[{prefix}] bits={layer_bits}"
                 )
@@ -3988,6 +3988,14 @@ class Exl3Config(QuantizationConfig):
         """Get bf16 shard indices for a non_routed_exl3 layer from the layers dict."""
         if not self.non_routed_exl3:
             return []
+        # create_weights queries with the raw layer.prefix, which VL wrappers
+        # (glm5next) construct wrapper-prefixed (language_model.model.layers.N...)
+        # while coverage keys are inner-relative (model.layers.N...), exactly
+        # like the names the wrapper's load path yields after stripping.
+        # get_quant_method already normalizes this prefix away; strip it here
+        # too so the exact layers-dict lookup agrees with the routing decision.
+        if prefix.startswith("language_model."):
+            prefix = prefix[len("language_model."):]
         layers = self.non_routed_exl3.get("layers", {})
         if layers and prefix in layers:
             layer_cfg = layers[prefix]
@@ -5922,7 +5930,13 @@ class Exl3LinearMethod(LinearMethodBase):
         true_in = int(in_per_partition)
         true_out_sizes = [int(s) for s in output_partition_sizes]
         in_per_partition = _exl3_pad128(true_in)
-        output_partition_sizes = [_exl3_pad128(s) for s in true_out_sizes]
+        # Pad only the EXL3 shards: bf16_shards rows hold plain BF16
+        # weights and need no 128 alignment (GLM-5.3 KDA in_proj b/f_a/g_a
+        # shards are 64/128/128 rows).
+        output_partition_sizes = [
+            _exl3_pad128(s) if i not in bf16_shards else s
+            for i, s in enumerate(true_out_sizes)
+        ]
         padded = in_per_partition != true_in or output_partition_sizes != true_out_sizes
         if padded and (bf16_shards or n_shards > 1):
             raise NotImplementedError(
